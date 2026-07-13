@@ -1,0 +1,1 @@
+"""OpenWebUI adapter."""

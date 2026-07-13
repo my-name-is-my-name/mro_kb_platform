@@ -1,0 +1,1 @@
+"""Obsidian publish layer."""
