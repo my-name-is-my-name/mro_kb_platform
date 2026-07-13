@@ -58,7 +58,7 @@ def import_mro_documents(demo_data_root: Path) -> tuple[list[CaseSummary], list[
         payload = json.loads(path.read_text(encoding="utf-8"))
         digest.update(path.name.encode("utf-8"))
         digest.update(path.read_bytes())
-        case_id = f"WO-{_normalize_scalar(payload.get('work_order_id', ''))}"
+        case_id = f"MRO-{int(_normalize_scalar(payload.get('work_order_id', ''))):03d}"
         cases.append(
             CaseSummary(
                 case_id=case_id,

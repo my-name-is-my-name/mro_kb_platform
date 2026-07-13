@@ -7,7 +7,8 @@ from core.runtime_clients import ExternalReranker, OpenAICompatibleLLM, RuntimeS
 from storage.sqlite.store import SQLiteStore
 
 
-CASE_ID_RE = re.compile(r"\b(?:MP|WO)-\d+\b", flags=re.IGNORECASE)
+CASE_ID_RE = re.compile(r"\b(?:MRO|MP|WO|МР)-\d+\b", flags=re.IGNORECASE)
+BARE_CASE_ID_RE = re.compile(r"\b(?:заявк[аеуи]?|wo|mro|mp|мр|номер|№)\s*[-№#:]?\s*(\d{2,5})\b", flags=re.IGNORECASE)
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9.-]{3,}")
 RAW_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9.-]{1,}")
 LIST_QUERY_RE = re.compile(r"\b(в\s+каких\s+заявках|в\s+какой\s+заявке|где\s+упоминается|где\s+есть)\b", flags=re.IGNORECASE)
@@ -47,7 +48,7 @@ class RetrievalService:
     def chat(self, question: str, limit: int = 6) -> dict[str, object]:
         explicit_case_id = self._extract_case_id(question)
         case_payload = self.store.fetch_case(explicit_case_id) if explicit_case_id else None
-        hits = self._collect_candidates(question, limit=max(limit * 6, 36))
+        hits = self._collect_candidates(question, limit=max(limit * 6, 36), explicit_case_id=explicit_case_id)
         if not self._is_list_query(question):
             hits = self._rerank_hits(question, hits, limit=max(limit * 6, 36))
         hits = self._select_hits(question, hits, limit=limit)
@@ -60,11 +61,12 @@ class RetrievalService:
             snippet_limit = 5000 if self._is_procedural_hit(hit) else 1600
             sources.append(
                 {
-                    "title": source_label(str(hit["case_id"]), source_document_id, str(hit["section_title"] or "-")),
+                    "title": source_label(self._display_case_id(str(hit["case_id"])), source_document_id, str(hit["section_title"] or "-")),
                     "snippet": source_text[:snippet_limit],
                     "source_type": "document_chunk",
                     "source_descriptor": {
-                        "case_id": hit["case_id"],
+                        "case_id": self._display_case_id(str(hit["case_id"])),
+                        "internal_case_id": hit["case_id"],
                         "document_id": hit["document_id"],
                         "source_document_id": source_document_id,
                         "chunk_id": hit["chunk_id"],
@@ -111,13 +113,32 @@ class RetrievalService:
     @staticmethod
     def _extract_case_id(question: str) -> str | None:
         match = CASE_ID_RE.search(question or "")
-        return match.group(0).upper() if match else None
+        if match:
+            return RetrievalService._normalize_case_id(match.group(0))
+        bare_match = BARE_CASE_ID_RE.search(question or "")
+        if bare_match:
+            return f"MRO-{int(bare_match.group(1)):03d}"
+        return None
+
+    @staticmethod
+    def _normalize_case_id(value: str) -> str:
+        digits = re.findall(r"\d+", value or "")
+        if not digits:
+            return value.upper()
+        return f"MRO-{int(digits[0]):03d}"
+
+    @staticmethod
+    def _display_case_id(value: str) -> str:
+        digits = re.findall(r"\d+", value or "")
+        if not digits:
+            return value
+        return f"MRO-{int(digits[0]):03d}"
 
     def _build_answer(self, question: str, case_payload: dict[str, object] | None, sources: list[dict[str, object]]) -> str:
         lines = [f"Вопрос: {question.strip()}", ""]
         if case_payload:
             lines.append(
-                f"Контекст заявки: {case_payload['case_id']} / "
+                f"Контекст заявки: {self._display_case_id(str(case_payload['case_id']))} / "
                 f"{case_payload.get('aircraft_type') or '-'} / "
                 f"MSN {case_payload.get('msn') or '-'}"
             )
@@ -184,13 +205,16 @@ class RetrievalService:
         rescored.sort(key=lambda item: float(item.get("rerank_score", 0.0)), reverse=True)
         return rescored[:limit]
 
-    def _collect_candidates(self, question: str, limit: int) -> list[dict[str, object]]:
+    def _collect_candidates(self, question: str, limit: int, explicit_case_id: str | None = None) -> list[dict[str, object]]:
         per_query_limit = min(max(limit // 4, 8), 12)
         merged: dict[str, dict[str, object]] = {}
         case_ids: list[str] = []
         seen_cases: set[str] = set()
+        if explicit_case_id:
+            seen_cases.add(explicit_case_id)
+            case_ids.append(explicit_case_id)
         candidate_queries = self._candidate_queries(question)
-        for query in candidate_queries[:3]:
+        for query in ([] if explicit_case_id else candidate_queries[:3]):
             for doc in self.store.search_documents(query, limit=12):
                 case_id = str(doc["case_id"])
                 if case_id not in seen_cases:
@@ -202,6 +226,12 @@ class RetrievalService:
                     seen_cases.add(case_id)
                     case_ids.append(case_id)
         for query in candidate_queries[:3]:
+            if explicit_case_id:
+                for hit in self.store.search_text(query, limit=per_query_limit, case_ids=[explicit_case_id]):
+                    chunk_id = str(hit.get("chunk_id") or "")
+                    existing = merged.get(chunk_id)
+                    if existing is None or float(hit.get("lexical_score", 0.0)) > float(existing.get("lexical_score", 0.0)):
+                        merged[chunk_id] = hit
             for doc in self.store.search_documents_for_cases(query, case_ids[:18], limit=18 if case_ids else 8):
                 doc_score = float(doc.get("lexical_score", 0.0))
                 for chunk in self.store.fetch_document_chunks(str(doc["document_id"]), limit=12):
@@ -211,12 +241,21 @@ class RetrievalService:
                     existing = merged.get(chunk_id)
                     if existing is None or float(enriched.get("lexical_score", 0.0)) > float(existing.get("lexical_score", 0.0)):
                         merged[chunk_id] = enriched
-            if len(merged) < 6 and query in candidate_queries[:1]:
+            if not explicit_case_id and len(merged) < 6 and query in candidate_queries[:1]:
                 for hit in self.store.search_text(query, limit=per_query_limit):
                     chunk_id = str(hit.get("chunk_id") or "")
                     existing = merged.get(chunk_id)
                     if existing is None or float(hit.get("lexical_score", 0.0)) > float(existing.get("lexical_score", 0.0)):
                         merged[chunk_id] = hit
+        if explicit_case_id and not merged:
+            case_payload = self.store.fetch_case(explicit_case_id)
+            if case_payload:
+                for document in case_payload.get("documents", []):
+                    document_id = str(document.get("document_id") or "")
+                    for chunk in self.store.fetch_document_chunks(document_id, limit=10):
+                        chunk_id = str(chunk.get("chunk_id") or "")
+                        if chunk_id and chunk_id not in merged:
+                            merged[chunk_id] = chunk
         hits = list(merged.values())
         hits.sort(key=lambda item: float(item.get("lexical_score", 0.0)), reverse=True)
         selected: list[dict[str, object]] = []
@@ -346,6 +385,19 @@ class RetrievalService:
         add(question)
         if tokens:
             add(" ".join(tokens[:4]))
+        if any("огранич" in token or "limit" in token for token in tokens):
+            add("функции и ограничения ВС")
+            add("оценка влияния изменения на ВС")
+            add("не оказывает влияния на функции и ограничения")
+            add("ограничения летной годности")
+            add("airworthiness limitations")
+            add("instructions for continued airworthiness")
+            add("эксплуатация допускается")
+        if any("решен" in token or "финаль" in token or "итог" in token for token in tokens):
+            add("подтверждение выполнения ремонта")
+            add("результат классификации")
+            add("заключение")
+            add("repair confirmation")
         if any("корроз" in token for token in tokens):
             add("corrosion repair")
             add("corrosion removal")
@@ -461,6 +513,14 @@ class RetrievalService:
             bonus += 0.18
         if "балк" in text and any("балк" in token or "beam" in token or "floor" in token for token in tokens):
             bonus += 0.18
+        if any("огранич" in token or "limit" in token for token in tokens):
+            document_family = str(hit.get("document_family") or "").lower()
+            if document_family == "opi":
+                bonus += 1.2
+            if "оценка влияния" in section_title or "функции и ограничения" in haystack:
+                bonus += 1.4
+            if "не оказывает влияния" in haystack and "огранич" in haystack:
+                bonus += 1.0
         if matched >= 2:
             bonus += 0.15
         return bonus
@@ -515,6 +575,8 @@ class RetrievalService:
             penalty += 0.1
         if "part number" in text.lower() and "description" in text.lower() and len(text) < 260:
             penalty += 0.25
+        if "таблица соответствия" in lowered_title:
+            penalty += 1.2
         return penalty
 
     @staticmethod
@@ -546,7 +608,7 @@ class RetrievalService:
         if case_payload:
             lines.append(
                 "Контекст заявки:\n"
-                f"case_id={case_payload.get('case_id')}\n"
+                f"case_id={self._display_case_id(str(case_payload.get('case_id') or ''))}\n"
                 f"aircraft_type={case_payload.get('aircraft_type')}\n"
                 f"msn={case_payload.get('msn')}\n"
                 f"subject={case_payload.get('subject')}\n"

@@ -277,7 +277,7 @@ class SQLiteStore:
             ).fetchone()
             return dict(row) if row is not None else None
 
-    def search_text(self, query: str, limit: int = 8) -> list[dict[str, object]]:
+    def search_text(self, query: str, limit: int = 8, case_ids: list[str] | None = None) -> list[dict[str, object]]:
         tokens = self._search_terms(query)
         if not tokens:
             fallback = (query or "").strip().lower().replace("ё", "е")
@@ -333,6 +333,10 @@ class SQLiteStore:
             params.extend([like, like, like, like, like, like, like, like, like, like])
             params.extend([like, like, like, like, like, like, like, like, like, like])
             params.extend([like, like, like, like, like, like, like, like])
+        where_clauses = [f"({' OR '.join(conditions)})"]
+        if case_ids:
+            case_placeholders = ",".join("?" for _ in case_ids)
+            where_clauses.append(f"c.case_id IN ({case_placeholders})")
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
@@ -347,11 +351,11 @@ class SQLiteStore:
                 FROM chunks h
                 JOIN documents d ON d.document_id = h.document_id
                 JOIN cases c ON c.case_id = h.case_id
-                WHERE {" OR ".join(conditions)}
+                WHERE {' AND '.join(where_clauses)}
                 ORDER BY token_coverage DESC, lexical_score DESC, LENGTH(h.text) DESC
                 LIMIT ?
                 """,
-                (*params, limit),
+                (*params, *(case_ids or []), limit),
             ).fetchall()
             return [dict(row) for row in rows]
 
