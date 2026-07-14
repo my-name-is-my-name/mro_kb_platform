@@ -57,8 +57,8 @@ class RetrievalService:
             note_path = str(hit.get("vault_note_path") or "")
             block_id = str(hit.get("block_id") or "")
             source_document_id = str(hit.get("source_document_id") or hit["document_id"])
-            source_text = self._source_text_for_hit(hit)
-            snippet_limit = 5000 if self._is_procedural_hit(hit) else 1600
+            source_text = self._source_text_for_hit(hit, question)
+            snippet_limit = 5000 if len(source_text) > 1600 else 1600
             sources.append(
                 {
                     "title": source_label(self._display_case_id(str(hit["case_id"])), source_document_id, str(hit["section_title"] or "-")),
@@ -225,13 +225,15 @@ class RetrievalService:
                 if case_id not in seen_cases:
                     seen_cases.add(case_id)
                     case_ids.append(case_id)
-        for query in candidate_queries[:3]:
+        scoped_queries = candidate_queries[:8] if explicit_case_id else candidate_queries[:3]
+        for query in scoped_queries:
             if explicit_case_id:
                 for hit in self.store.search_text(query, limit=per_query_limit, case_ids=[explicit_case_id]):
                     chunk_id = str(hit.get("chunk_id") or "")
                     existing = merged.get(chunk_id)
                     if existing is None or float(hit.get("lexical_score", 0.0)) > float(existing.get("lexical_score", 0.0)):
                         merged[chunk_id] = hit
+                continue
             for doc in self.store.search_documents_for_cases(query, case_ids[:18], limit=18 if case_ids else 8):
                 doc_score = float(doc.get("lexical_score", 0.0))
                 for chunk in self.store.fetch_document_chunks(str(doc["document_id"]), limit=12):
@@ -260,8 +262,8 @@ class RetrievalService:
         hits.sort(key=lambda item: float(item.get("lexical_score", 0.0)), reverse=True)
         selected: list[dict[str, object]] = []
         per_case_counts: dict[str, int] = {}
-        max_per_case = 6
         target = max(limit, 24)
+        max_per_case = target if explicit_case_id else 6
         for hit in hits:
             case_id = str(hit.get("case_id") or "")
             if per_case_counts.get(case_id, 0) >= max_per_case:
@@ -334,17 +336,14 @@ class RetrievalService:
                 "text",
             )
         ).lower().replace("ё", "е")
-        if any("корроз" in token or "corrosion" in token for token in tokens):
-            if "корроз" not in haystack and "corrosion" not in haystack:
-                return False
-        if any("нервюр" in token or token == "rib" for token in tokens):
-            if "нервюр" not in haystack and "rib" not in haystack:
-                return False
-        numeric_tokens = [token for token in tokens if token.isdigit()]
-        for token in numeric_tokens:
+        for token in (token for token in tokens if token.isdigit()):
             if token not in haystack:
                 return False
-        return True
+        content_tokens = [token for token in tokens if not token.isdigit()]
+        if not content_tokens:
+            return True
+        matched = sum(1 for token in content_tokens if RetrievalService._token_in_text(token, haystack))
+        return matched >= min(2, len(content_tokens))
 
     @staticmethod
     def _query_tokens(question: str) -> list[str]:
@@ -375,37 +374,11 @@ class RetrievalService:
                 seen.add(cleaned)
                 ordered.append(cleaned)
 
-        if any("нервюр" in token for token in tokens):
-            add("gear rib corrosion repair")
-            if any("корроз" in token for token in tokens):
-                add("gear rib corrosion removal")
-                add("кронштейн опоры шасси коррозия ремонт")
-            add(question.replace("нервюры", "rib").replace("нервюра", "rib").replace("нервюре", "rib"))
-            add("rib corrosion repair")
         add(question)
         if tokens:
             add(" ".join(tokens[:4]))
-        if any("огранич" in token or "limit" in token for token in tokens):
-            add("функции и ограничения ВС")
-            add("оценка влияния изменения на ВС")
-            add("не оказывает влияния на функции и ограничения")
-            add("ограничения летной годности")
-            add("airworthiness limitations")
-            add("instructions for continued airworthiness")
-            add("эксплуатация допускается")
-        if any("решен" in token or "финаль" in token or "итог" in token for token in tokens):
-            add("подтверждение выполнения ремонта")
-            add("результат классификации")
-            add("заключение")
-            add("repair confirmation")
-        if any("корроз" in token for token in tokens):
-            add("corrosion repair")
-            add("corrosion removal")
-        if any(token.startswith("ремонт") for token in tokens):
-            add("repair accomplishment instruction")
-            add("ремонт repair")
         ranked_tokens = sorted(tokens, key=lambda token: (-len(token), token))
-        for token in ranked_tokens[:4]:
+        for token in ranked_tokens[:6]:
             add(token)
         for idx in range(len(raw_tokens) - 1):
             left = raw_tokens[idx]
@@ -422,14 +395,12 @@ class RetrievalService:
                 break
         return ordered[:8]
 
-    def _source_text_for_hit(self, hit: dict[str, object]) -> str:
+    def _source_text_for_hit(self, hit: dict[str, object], question: str) -> str:
         text = normalize_spaces(str(hit.get("text") or ""))
-        if not self._is_procedural_hit(hit):
-            return text
         section_title = str(hit.get("section_title") or "")
         document_id = str(hit.get("document_id") or "")
         if not section_title or not document_id:
-            return text
+            return self._focused_text(text, question)
         section_chunks = self.store.fetch_section_chunks(document_id, section_title, limit=80)
         section_texts: list[str] = []
         seen: set[str] = set()
@@ -439,26 +410,37 @@ class RetrievalService:
                 continue
             seen.add(chunk_text)
             section_texts.append(chunk_text)
-        return "\n".join(section_texts) or text
+        expanded = "\n".join(section_texts) or text
+        return self._focused_text(expanded, question)
 
     @staticmethod
-    def _is_procedural_hit(hit: dict[str, object]) -> bool:
-        haystack = " ".join(
-            [
-                str(hit.get("section_title") or ""),
-                str(hit.get("section_label") or ""),
-                str(hit.get("document_family") or ""),
-                str(hit.get("search_text") or ""),
-                str(hit.get("text") or ""),
-            ]
-        ).lower()
-        return (
-            "ремонт" in haystack
-            or "repair" in haystack
-            or "accomplishment" in haystack
-            or "инструкция по выполнению" in haystack
-            or "removal of corrosion" in haystack
-        )
+    def _focused_text(text: str, question: str, window: int = 4200) -> str:
+        if len(text) <= window:
+            return text
+        lowered = text.lower()
+        positions: list[int] = []
+        for token in RetrievalService._query_tokens(question):
+            if token.isdigit():
+                continue
+            position = lowered.find(token)
+            if position < 0 and token.isalpha() and len(token) >= 6:
+                position = lowered.find(token[:6])
+            if position >= 0:
+                positions.append(position)
+        if not positions:
+            return text[:window]
+        center = min(positions)
+        start = max(center - window // 3, 0)
+        end = min(start + window, len(text))
+        return text[start:end]
+
+    @staticmethod
+    def _token_in_text(token: str, text: str) -> bool:
+        if token in text:
+            return True
+        if token.isalpha() and len(token) >= 6:
+            return token[:6] in text
+        return False
 
     @staticmethod
     def _case_ids_from_sources(sources: list[dict[str, object]]) -> list[str]:
@@ -500,27 +482,6 @@ class RetrievalService:
         if any(token in section_title for token in tokens):
             bonus += 0.18
         bonus += self._phrase_bonus(tokens, haystack)
-        text = str(hit.get("text") or "").lower()
-        if "ремонт" in text and any(token in {"ремонт", "repair", "repairing", "ремонтировались"} for token in tokens):
-            bonus += 0.18
-        if "корроз" in text and any("корроз" in token or "corrosion" in token for token in tokens):
-            bonus += 0.18
-        if ("removal of corrosion" in haystack or "удал" in haystack and "корроз" in haystack) and any(
-            "корроз" in token or "corrosion" in token for token in tokens
-        ):
-            bonus += 0.45
-        if "предкрыл" in text and any("предкрыл" in token or "slat" in token for token in tokens):
-            bonus += 0.18
-        if "балк" in text and any("балк" in token or "beam" in token or "floor" in token for token in tokens):
-            bonus += 0.18
-        if any("огранич" in token or "limit" in token for token in tokens):
-            document_family = str(hit.get("document_family") or "").lower()
-            if document_family == "opi":
-                bonus += 1.2
-            if "оценка влияния" in section_title or "функции и ограничения" in haystack:
-                bonus += 1.4
-            if "не оказывает влияния" in haystack and "огранич" in haystack:
-                bonus += 1.0
         if matched >= 2:
             bonus += 0.15
         return bonus
@@ -551,32 +512,10 @@ class RetrievalService:
         chunk_kind = str(hit.get("chunk_kind") or "")
         if "<!-- image -->" in text and len(text) < 600:
             penalty += 0.8
-        if section_title == "document_intro":
-            penalty += 0.45
-        lowered_title = section_title.lower()
-        lowered_text = text.lower()
-        if "подтверждение выполнения ремонта" in lowered_title or "confirmation of repair" in lowered_text:
-            penalty += 0.65
-        if "mro@ikarcenter.ru" in lowered_text:
-            penalty += 0.45
-        if "инструкция разделена на шаги" in lowered_text or "implementation of the technical disposition is divided into steps" in lowered_text:
-            penalty += 0.9
-        if (
-            "в случае возникновения отклонений" in lowered_text
-            or "в случае обнаружения несоответствий" in lowered_text
-            or "форма оценки качества инструкции" in lowered_text
-            or "in case of deviations" in lowered_text
-            or "in case of discrepancies" in lowered_text
-        ):
-            penalty += 0.9
         if len(text) < 80:
             penalty += 0.2
         if chunk_kind == "table" and len(text) < 180:
             penalty += 0.1
-        if "part number" in text.lower() and "description" in text.lower() and len(text) < 260:
-            penalty += 0.25
-        if "таблица соответствия" in lowered_title:
-            penalty += 1.2
         return penalty
 
     @staticmethod
@@ -585,8 +524,6 @@ class RetrievalService:
         if not text:
             return True
         if "<!-- image -->" in text and len(text) < 600:
-            return True
-        if str(hit.get("section_title") or "") == "document_intro" and len(text) < 160:
             return True
         return False
 

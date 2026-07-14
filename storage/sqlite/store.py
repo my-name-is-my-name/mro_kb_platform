@@ -501,16 +501,6 @@ class SQLiteStore:
                 JOIN cases c ON c.case_id = h.case_id
                 WHERE h.document_id = ?
                 ORDER BY
-                    CASE
-                        WHEN lower(h.section_title) LIKE lower('%инструкция%') THEN 0
-                        WHEN lower(h.section_title) LIKE lower('%accomplishment%') THEN 0
-                        WHEN lower(h.search_text) LIKE lower('%removal of corrosion%') THEN 0
-                        WHEN lower(h.search_text) LIKE lower('%удал%корроз%') THEN 0
-                        ELSE 1
-                    END,
-                    CASE WHEN lower(h.section_title) LIKE lower('%подтверждение выполнения ремонта%') THEN 1 ELSE 0 END,
-                    CASE WHEN lower(h.section_title) LIKE lower('%confirmation of repair%') THEN 1 ELSE 0 END,
-                    CASE WHEN h.section_title = 'document_intro' THEN 1 ELSE 0 END,
                     CASE WHEN h.chunk_kind = 'table' THEN 1 ELSE 0 END,
                     LENGTH(COALESCE(NULLIF(h.search_text, ''), h.text)) DESC
                 LIMIT ?
