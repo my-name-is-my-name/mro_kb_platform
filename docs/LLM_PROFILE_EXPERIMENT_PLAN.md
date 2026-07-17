@@ -109,9 +109,10 @@ Runtime behavior:
 Quality gate rejects profiles with:
 
 - placeholder summaries such as `...`;
-- confidence below `0.4`;
 - source path/OCR plumbing noise such as `converted`, `pdf`, `ocr`, `page`, `.md`;
 - too little structured signal.
+
+Profiles with `confidence < 0.4` can still be accepted when they have a meaningful summary and useful commercial/technical terms. They are marked with `quality_warnings: ["low_confidence_accepted"]` so simple but real requests such as seat-cover, curtain, or carpet replacement are not lost.
 
 Implemented command surface:
 

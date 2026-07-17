@@ -938,9 +938,10 @@ class CommercialOffersService:
         )
         payload = self._parse_rewrite_json(self._llm.chat(system_prompt, user_prompt, allow_reasoning_fallback=True))
         profile = self._normalize_case_profile(payload)
-        errors = self._profile_quality_errors(profile)
+        errors, warnings = self._profile_quality_issues(profile)
         if errors:
             raise ValueError("profile_quality_failed: " + "; ".join(errors))
+        profile["quality_warnings"] = warnings
         return profile
 
     @staticmethod
@@ -959,6 +960,7 @@ class CommercialOffersService:
             "constraints_or_risks": CommercialOffersService._profile_string_list(payload.get("constraints_or_risks"), limit=12),
             "search_terms_ru_en": CommercialOffersService._profile_string_list(payload.get("search_terms_ru_en"), limit=32),
             "evidence_fields": CommercialOffersService._profile_string_list(payload.get("evidence_fields"), limit=16),
+            "quality_warnings": CommercialOffersService._profile_string_list(payload.get("quality_warnings"), limit=8),
             "confidence": 0.0,
         }
         try:
@@ -970,8 +972,9 @@ class CommercialOffersService:
         return profile
 
     @classmethod
-    def _profile_quality_errors(cls, profile: dict[str, object]) -> list[str]:
+    def _profile_quality_issues(cls, profile: dict[str, object]) -> tuple[list[str], list[str]]:
         errors: list[str] = []
+        warnings: list[str] = []
         summary = normalize_lookup(str(profile.get("problem_summary") or ""))
         work_type = normalize_lookup(str(profile.get("work_type") or ""))
         defect_type = normalize_lookup(str(profile.get("defect_type") or ""))
@@ -983,20 +986,31 @@ class CommercialOffersService:
             confidence = float(profile.get("confidence") or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
-        if confidence < 0.4:
-            errors.append("confidence_below_0_4")
         list_fields = ("ata", "components", "zones", "identifiers", "authority_path", "constraints_or_risks", "search_terms_ru_en")
         useful_values = []
         for key in list_fields:
             value = profile.get(key)
             if isinstance(value, list):
                 useful_values.extend(str(item) for item in value if str(item).strip())
-        if len(useful_values) < 3 and defect_type in {"", "unknown", "..."}:
+        has_meaningful_summary = len(summary) >= 8 and summary not in PROFILE_PLACEHOLDER_VALUES
+        has_commercial_signal = has_meaningful_summary and (
+            work_type not in {"", "...", "other", "unknown"} or len(useful_values) >= 2
+        )
+        if confidence < 0.4:
+            if has_commercial_signal:
+                warnings.append("low_confidence_accepted")
+            else:
+                errors.append("confidence_below_0_4")
+        if len(useful_values) < 2 and defect_type in {"", "unknown", "..."} and not has_commercial_signal:
             errors.append("not_enough_structured_signal")
         noisy = [value for value in useful_values if PROFILE_NOISE_RE.search(value)]
         if noisy:
             errors.append("profile_contains_source_path_noise")
-        return errors
+        return errors, warnings
+
+    @classmethod
+    def _profile_quality_errors(cls, profile: dict[str, object]) -> list[str]:
+        return cls._profile_quality_issues(profile)[0]
 
     def _fallback_case_profile(self, row: dict[str, str], source_text: str) -> dict[str, object]:
         summary = normalize_spaces(row.get("request_description", "")) or normalize_spaces(source_text[:500])
@@ -1044,6 +1058,7 @@ class CommercialOffersService:
             "constraints_or_risks": [],
             "search_terms_ru_en": source_terms,
             "evidence_fields": evidence_fields,
+            "quality_warnings": ["runtime_fallback_profile"],
             "confidence": 0.15 if summary or source_terms else 0.0,
         }
 
@@ -1155,6 +1170,9 @@ class CommercialOffersService:
         evidence_fields = profile.get("evidence_fields")
         if isinstance(evidence_fields, list) and evidence_fields:
             parts.append("evidence_fields: " + " ".join(str(item) for item in evidence_fields if str(item).strip()))
+        quality_warnings = profile.get("quality_warnings")
+        if isinstance(quality_warnings, list) and quality_warnings:
+            parts.append("quality_warnings: " + " ".join(str(item) for item in quality_warnings if str(item).strip()))
         return "\n".join(parts)[:1000]
 
     def _case_profile_for_row(self, row: dict[str, str]) -> dict[str, object]:
@@ -1754,6 +1772,32 @@ class CommercialOffersService:
             parts.append(f"reestr_zayavok: {strip_aircraft_terms(reestr_text)}")
         return "\n".join(parts)
 
+    def _case_rerank_text(self, row: dict[str, str]) -> str:
+        case_id = row.get("case_id", "")
+        parts = []
+        for key in (
+            "request_description",
+            "workscope_type",
+            "discipline_primary",
+            "bd_comments",
+            "certificate_scope_flag",
+            "status_normalized",
+        ):
+            value = normalize_spaces(strip_aircraft_terms(row.get(key, "")))
+            if value:
+                parts.append(f"{key}: {value[:500]}")
+        for label, text, limit in (
+            ("reestr", self._reestr_enrichment.get(case_id, ""), 500),
+            ("markdown", self._extra_search_texts.get(case_id, ""), 700),
+        ):
+            clean = self._clean_profile_source_fragment(strip_aircraft_terms(text))
+            if clean:
+                parts.append(f"{label}: {clean[:limit]}")
+        exact = exact_terms("\n".join(parts))
+        if exact:
+            parts.append("identifiers: " + " ".join(exact[:20]))
+        return "\n".join(parts)[:1500]
+
     def _load_reestr_enrichment(self) -> tuple[dict[str, str], dict[str, object]]:
         warnings: list[str] = []
         status: dict[str, object] = {"stale": False, "warnings": warnings}
@@ -2188,7 +2232,7 @@ class CommercialOffersService:
         if self._reranker is None:
             return candidates[:limit]
         rerank_query = strip_aircraft_terms(query)
-        pairs = [[rerank_query, self._case_similarity_text(item["case"])] for item in candidates]
+        pairs = [[rerank_query, self._case_rerank_text(item["case"])] for item in candidates]
         try:
             scores = self._reranker.compute_score(pairs, normalize=True)
         except Exception:

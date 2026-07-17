@@ -168,7 +168,14 @@ def _trusted_evidence_count(cases: list[dict[str, Any]], k: int) -> int:
     return count
 
 
-def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bool, max_case_number: int = 0) -> dict[str, Any]:
+def evaluate(
+    ground_truth_path: Path,
+    limit: int,
+    mode: str,
+    expand_base_ids: bool,
+    max_case_number: int = 0,
+    candidate_pool_limit: int = 100,
+) -> dict[str, Any]:
     service = CommercialOffersService()
     service._llm = None
     if max_case_number > 0:
@@ -190,7 +197,7 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
         if not expected:
             continue
         query = str(item["query"])
-        pool_limit = max(limit, 100)
+        pool_limit = max(limit, candidate_pool_limit) if candidate_pool_limit > 0 else limit
         pool_cases = _rank_cases(service, query, pool_limit, mode)
         cases = pool_cases[:limit]
         ids = [str(case.get("case_id") or "") for case in cases]
@@ -216,8 +223,9 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
     for k in (1, 3, 5, 10):
         capped_k = min(k, limit)
         metrics[f"hit_at_{k}"] = sum(1 for row in rows if row["rank"] and row["rank"] <= capped_k) / count
-    for k in (50, 100):
-        metrics[f"candidate_recall_at_{k}"] = sum(1 for row in rows if row["candidate_pool_rank"] and row["candidate_pool_rank"] <= k) / count
+    if candidate_pool_limit > 0:
+        for k in (50, 100):
+            metrics[f"candidate_recall_at_{k}"] = sum(1 for row in rows if row["candidate_pool_rank"] and row["candidate_pool_rank"] <= k) / count
     metrics["mrr"] = sum((1 / row["rank"]) if row["rank"] else 0.0 for row in rows) / count
     for k in (5, 10):
         capped_k = min(k, limit)
@@ -239,11 +247,14 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
         "mode": mode,
         "expand_base_case_ids": expand_base_ids,
         "max_case_number": max_case_number,
+        "candidate_pool_limit": candidate_pool_limit,
         "registry_case_count": len(registry_ids),
         "seconds": round(time.time() - started, 2),
         "metrics": {key: round(value, 4) for key, value in metrics.items()},
         "misses_top10": [row for row in rows if not row["rank"] or row["rank"] > 10],
-        "misses_candidate_pool_top100": [row for row in rows if not row["candidate_pool_rank"] or row["candidate_pool_rank"] > 100],
+        "misses_candidate_pool_top100": (
+            [row for row in rows if not row["candidate_pool_rank"] or row["candidate_pool_rank"] > 100] if candidate_pool_limit > 0 else []
+        ),
         "rank_gt5": [row for row in rows if row["rank"] and row["rank"] > 5],
         "rows": rows,
     }
@@ -276,6 +287,12 @@ def main() -> None:
         default=0,
         help="Evaluate against a temporal registry slice, e.g. 918 for the current ground-truth workbook",
     )
+    parser.add_argument(
+        "--candidate-pool-limit",
+        type=int,
+        default=100,
+        help="Wide pool size for candidate recall metrics; set 0 for fast top-N evaluation",
+    )
     args = parser.parse_args()
 
     report = evaluate(
@@ -284,6 +301,7 @@ def main() -> None:
         mode="fallback" if args.disable_vectors else args.mode,
         expand_base_ids=not args.no_expand_base_case_ids,
         max_case_number=args.max_case_number,
+        candidate_pool_limit=args.candidate_pool_limit,
     )
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
