@@ -84,7 +84,7 @@ python3 -m apps.api.server rebuild-com-offers-manifest
 python3 -m apps.api.server reindex-com-offers
 ```
 
-`publish-com-offer-registry` writes one Markdown dashboard page per commercial request. Similar-case answers link case IDs to these pages through `/api/com-offers/registry/{case_id}`:
+`publish-com-offer-registry` writes one Markdown dashboard page per commercial request. Similar-case answers link case IDs to browser-friendly HTML pages through `/api/com-offers/registry/{case_id}`; raw Markdown is available with `?format=md`:
 
 ```bash
 python3 -m apps.api.server publish-com-offer-registry

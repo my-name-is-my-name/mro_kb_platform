@@ -7,7 +7,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -103,10 +103,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             if parsed.path.startswith("/api/com-offers/registry/"):
                 case_id = parsed.path.rsplit("/", 1)[-1]
-                markdown = SERVICES.commercial_offers.registry_case_markdown(case_id)
-                if markdown is None:
+                query = parse_qs(parsed.query)
+                if query.get("format") == ["md"]:
+                    markdown = SERVICES.commercial_offers.registry_case_markdown(case_id)
+                    if markdown is None:
+                        return self._send_json({"ok": False, "error": "commercial offer case not found"}, status=404)
+                    return self._send_text(markdown, content_type="text/markdown; charset=utf-8")
+                html = SERVICES.commercial_offers.registry_case_html(case_id)
+                if html is None:
                     return self._send_json({"ok": False, "error": "commercial offer case not found"}, status=404)
-                return self._send_text(markdown, content_type="text/markdown; charset=utf-8")
+                return self._send_text(html, content_type="text/html; charset=utf-8")
             if parsed.path == "/api/cases":
                 return self._send_json({"ok": True, "cases": SERVICES.store.fetch_cases()})
             if parsed.path.startswith("/api/cases/"):

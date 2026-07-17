@@ -123,6 +123,8 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
                     {
                         "case_id": "MP-0429",
                         "similarity_reason_class": "same_identifier",
+                        "score": 1.23456,
+                        "rerank_score": 0.87654,
                         "customer": "АК Россия",
                         "aircraft_type": "A319",
                         "status_normalized": "accepted",
@@ -133,7 +135,7 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
                             "по исходному запросу: точный термин: RIB5",
                         ],
                         "check": ["сверить фактическую зону повреждения"],
-                        "cost_readiness": {"usable_for_estimate": True},
+                        "cost_readiness": {"usable_for_estimate": True, "score": 5},
                         "documents": [
                             {
                                 "source_type": "commercial_offer_document",
@@ -154,9 +156,11 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
                 ],
             )
 
-        self.assertIn("| Заявка | Статус/решение | Описание | Почему похожа | Что проверить | Cost | Документы |", answer)
+        self.assertIn("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Оценка стоимости | Документы |", answer)
         self.assertIn("[MP-0429](http://127.0.0.1:8121/api/com-offers/registry/MP-0429)", answer)
-        self.assertIn("file://", answer)
+        self.assertIn("1.235<br>R 0.877", answer)
+        self.assertIn("| годится (", answer)
+        self.assertIn("| есть 1 |", answer)
         self.assertIn("совпал точный идентификатор: RIB5", answer)
         self.assertIn("принята", answer)
         self.assertNotIn("### Источники", answer)
@@ -170,6 +174,14 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
         self.assertIn("# MP-0481", markdown or "")
         self.assertIn("не взяли / отменена", markdown or "")
         self.assertIn("Запрос более неактуален", markdown or "")
+
+    def test_registry_case_html_page_renders_for_browser(self) -> None:
+        html = self.service.registry_case_html("MP-0481")
+
+        self.assertIsNotNone(html)
+        self.assertIn("<!doctype html>", html or "")
+        self.assertIn("<h1>MP-0481", html or "")
+        self.assertIn("не взяли / отменена", html or "")
 
     def test_aircraft_prefixed_ground_truth_fixture_matches_workbook_order(self) -> None:
         rows = build_ground_truth(

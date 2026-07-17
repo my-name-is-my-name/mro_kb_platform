@@ -982,6 +982,13 @@ class CommercialOffersService:
         path = self._write_registry_case_page(row)
         return path.read_text(encoding="utf-8")
 
+    def registry_case_html(self, case_id: str) -> str | None:
+        markdown = self.registry_case_markdown(case_id)
+        if markdown is None:
+            return None
+        title = normalize_case_id(case_id)
+        return self._markdown_to_html_page(markdown, title=title)
+
     def _write_registry_case_page(self, row: dict[str, str]) -> Path:
         self.registry_pages_dir.mkdir(parents=True, exist_ok=True)
         path = self.registry_pages_dir / self._case_page_filename(row.get("case_id", ""))
@@ -1054,6 +1061,76 @@ class CommercialOffersService:
             lines.extend(["", "## Converted Markdown Search Text", "", "```text", extra[:2500], "```"])
         lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _markdown_to_html_page(markdown: str, title: str) -> str:
+        import html
+
+        body: list[str] = []
+        in_code = False
+        list_open = False
+        for raw_line in markdown.splitlines():
+            line = raw_line.rstrip()
+            if line == "---":
+                continue
+            if line.startswith("```"):
+                if list_open:
+                    body.append("</ul>")
+                    list_open = False
+                body.append("</code></pre>" if in_code else "<pre><code>")
+                in_code = not in_code
+                continue
+            if in_code:
+                body.append(html.escape(line))
+                continue
+            if not line:
+                if list_open:
+                    body.append("</ul>")
+                    list_open = False
+                continue
+            if line.startswith("# "):
+                if list_open:
+                    body.append("</ul>")
+                    list_open = False
+                body.append(f"<h1>{html.escape(line[2:])}</h1>")
+            elif line.startswith("## "):
+                if list_open:
+                    body.append("</ul>")
+                    list_open = False
+                body.append(f"<h2>{html.escape(line[3:])}</h2>")
+            elif line.startswith("- "):
+                if not list_open:
+                    body.append("<ul>")
+                    list_open = True
+                body.append(f"<li>{CommercialOffersService._inline_markdown_to_html(line[2:])}</li>")
+            else:
+                if list_open:
+                    body.append("</ul>")
+                    list_open = False
+                body.append(f"<p>{CommercialOffersService._inline_markdown_to_html(line)}</p>")
+        if in_code:
+            body.append("</code></pre>")
+        if list_open:
+            body.append("</ul>")
+        return (
+            "<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<title>{html.escape(title)}</title>"
+            "<style>"
+            "body{font-family:Segoe UI,Arial,sans-serif;max-width:1120px;margin:32px auto;padding:0 24px;line-height:1.5;color:#1f2937}"
+            "h1{font-size:28px;margin:0 0 18px}h2{font-size:18px;margin-top:28px;border-bottom:1px solid #e5e7eb;padding-bottom:6px}"
+            "ul{padding-left:22px}li{margin:5px 0}pre{white-space:pre-wrap;background:#f8fafc;border:1px solid #e5e7eb;padding:14px;border-radius:6px}"
+            "a{color:#075985;text-decoration:none}a:hover{text-decoration:underline}"
+            "</style></head><body>"
+            + "\n".join(body)
+            + "</body></html>"
+        )
+
+    @staticmethod
+    def _inline_markdown_to_html(text: str) -> str:
+        import html
+
+        escaped = html.escape(text)
+        return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
 
     def _case_profile_source_text(self, row: dict[str, str]) -> str:
         case_id = row.get("case_id", "")
@@ -2711,26 +2788,11 @@ class CommercialOffersService:
         if not cases:
             lines.append("Похожие коммерческие заявки не найдены.")
             return "\n".join(lines)
-        lines.append("| Заявка | Статус/решение | Описание | Почему похожа | Что проверить | Cost | Документы |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Оценка стоимости | Документы |")
+        lines.append("|---|---:|---|---|---|---|---|---|")
         for case in cases:
             docs = case.get("documents") if isinstance(case.get("documents"), list) else []
-            doc_links: list[str] = []
-            for doc in docs[:2]:
-                if doc.get("source_type") != "commercial_offer_document":
-                    warning = str(doc.get("quality_warning") or doc.get("snippet") or "документ не подтвержден")
-                    doc_links.append(self._markdown_cell(warning))
-                    continue
-                title = str(doc.get("document_id") or doc.get("path") or "документ")
-                link = self._document_link(doc)
-                status = str(doc.get("link_status") or "")
-                warning = str(doc.get("quality_warning") or "")
-                label = self._short_document_title(title)
-                if status:
-                    label = f"{label} ({status})"
-                if warning:
-                    label = f"{label}: {warning}"
-                doc_links.append(f"[{self._markdown_cell(label)}]({link})" if link else self._markdown_cell(label))
+            doc_summary = self._document_summary(docs)
             meta = [
                 str(case.get("similarity_reason_class", "")),
             ]
@@ -2743,16 +2805,42 @@ class CommercialOffersService:
             reasons = self._format_reasons(case.get("reasons", []))
             checks = self._markdown_cell("; ".join(str(item) for item in case.get("check", [])[:3]))
             cost = case.get("cost_readiness") if isinstance(case.get("cost_readiness"), dict) else {}
-            cost_label = "да" if cost.get("usable_for_estimate") else "нет"
+            cost_label = self._cost_label(cost)
             case_id = str(case.get("case_id", ""))
             case_label = self._markdown_cell(case_id)
             case_link = f"[{case_label}]({self._registry_case_url(case_id)})" if case_id else ""
             case_cell = "<br>".join([case_link, self._markdown_cell("<br>".join(meta))])
+            score_label = self._score_label(case)
             lines.append(
-                f"| {case_cell} | {status_summary} | {description} | {reasons} | "
-                f"{checks} | {cost_label} | {'<br>'.join(doc_links)} |"
+                f"| {case_cell} | {score_label} | {status_summary} | {description} | {reasons} | "
+                f"{checks} | {cost_label} | {doc_summary} |"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _score_label(case: dict[str, object]) -> str:
+        score = float(case.get("score") or 0.0)
+        rerank = float(case.get("rerank_score") or 0.0)
+        if rerank > 0:
+            return f"{score:.3f}<br>R {rerank:.3f}"
+        return f"{score:.3f}"
+
+    def _document_summary(self, docs: list[object]) -> str:
+        if not docs:
+            return "нет"
+        trusted = [doc for doc in docs if isinstance(doc, dict) and doc.get("source_type") == "commercial_offer_document"]
+        if trusted:
+            return self._markdown_cell(f"есть {len(trusted)}")
+        warnings = [str(doc.get("quality_warning") or "") for doc in docs if isinstance(doc, dict) and doc.get("quality_warning")]
+        if any("не найдены" in warning for warning in warnings):
+            return "нет"
+        return "проверить связь"
+
+    @staticmethod
+    def _cost_label(cost: dict[str, object]) -> str:
+        score = cost.get("score")
+        prefix = "годится" if cost.get("usable_for_estimate") else "только ориентир"
+        return f"{prefix} ({score}/6)" if isinstance(score, int) else prefix
 
     def _status_summary(self, case: dict[str, object]) -> str:
         status = normalize_lookup(str(case.get("status_normalized") or ""))
