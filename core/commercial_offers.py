@@ -79,6 +79,8 @@ STOP_TOKENS = {
 }
 EXACT_PATTERNS = (ATA_RE, RIB_RE, FRAME_RE, STGR_RE, PART_RE, MSN_RE, REG_RE, AD_RE, SB_RE, CASE_RE)
 CONVERTED_MARKDOWN_SCHEMA_VERSION = 1
+CASE_PROFILE_SCHEMA_VERSION = 1
+CASE_PROFILE_PROMPT_VERSION = 1
 CONVERTED_MARKDOWN_EXCLUDED_PARTS = {
     "archive",
     "archives",
@@ -156,6 +158,8 @@ class CommercialOffersService:
         vector_cache_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_vectors.json",
         converted_markdown_manifest_path: Path = DATA_RUNTIME_ROOT / "com_offers_converted_markdown_manifest.json",
         reindex_progress_path: Path = DATA_RUNTIME_ROOT / "com_offers_reindex_progress.json",
+        case_profile_cache_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profiles.jsonl",
+        case_profile_progress_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profile_progress.json",
     ) -> None:
         self.root = root
         self.artifacts = root / "pilot_artifacts"
@@ -166,6 +170,8 @@ class CommercialOffersService:
         self.vector_cache_path = vector_cache_path
         self.converted_markdown_manifest_path = converted_markdown_manifest_path
         self.reindex_progress_path = reindex_progress_path
+        self.case_profile_cache_path = case_profile_cache_path
+        self.case_profile_progress_path = case_profile_progress_path
         self.embedding_url = os.getenv("MRO_KB_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
         self.embedding_model = os.getenv("MRO_KB_EMBEDDING_MODEL", "bge-m3:latest")
         self.query_rewrite_enabled = os.getenv("MRO_KB_QUERY_REWRITE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -181,6 +187,7 @@ class CommercialOffersService:
         self._reestr_enrichment, self._reestr_status = self._load_reestr_enrichment()
         self._extra_search_texts, self._converted_markdown_status = self._read_converted_markdown_manifest()
         self._vectors, self._index_status = self._read_vector_cache()
+        self._case_profiles, self._case_profile_status = self._read_case_profile_cache()
         self._doc_frequency = self._build_doc_frequency()
 
     def health(self) -> dict[str, object]:
@@ -221,10 +228,156 @@ class CommercialOffersService:
                 "base_url": self.embedding_url,
                 "created_at": self._index_status.get("created_at", ""),
             },
+            "case_profiles": {
+                "experimental": True,
+                "ready": bool(self._case_profiles) and not bool(self._case_profile_status.get("stale")),
+                "count": len(self._case_profiles),
+                "expected_cases": len(self._registry),
+                "stale": bool(self._case_profile_status.get("stale")),
+                "partial": bool(self._case_profile_status.get("partial")),
+                "missing_count": self._case_profile_status.get("missing_count", 0),
+                "cache": str(self.case_profile_cache_path),
+                "prompt_version": CASE_PROFILE_PROMPT_VERSION,
+                "schema_version": CASE_PROFILE_SCHEMA_VERSION,
+                "created_at": self._case_profile_status.get("created_at", ""),
+                "warnings": self._case_profile_status.get("warnings", []),
+            },
             "warnings": warnings,
             "reranker": self._reranker.health() if self._reranker is not None else {"ok": False, "disabled": True},
             "llm": self._llm.health() if self._llm is not None else {"ok": False, "disabled": True},
         }
+
+    def build_case_profiles(self, limit: int = 0, force: bool = False) -> dict[str, object]:
+        if self._llm is None:
+            raise RuntimeError("LLM is disabled; set MRO_KB_LLM_ENABLED=1 to build commercial offer profiles")
+        existing = {} if force else self._load_reusable_case_profiles()
+        profiles = dict(existing)
+        failures: list[str] = []
+        started = time.time()
+        target_rows = self._registry if limit <= 0 else self._registry[:limit]
+        target_case_ids = {row.get("case_id", "") for row in target_rows if row.get("case_id")}
+        total = len(target_case_ids)
+        reused_count = len([case_id for case_id in profiles if case_id in target_case_ids])
+        built_count = 0
+        self._write_case_profile_progress(
+            {
+                "status": "running",
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "total": total,
+                "done": reused_count,
+                "reused": reused_count,
+                "built": 0,
+                "failure_count": 0,
+                "failures": [],
+                "current_case_id": "",
+                "cache": str(self.case_profile_cache_path),
+                "schema_version": CASE_PROFILE_SCHEMA_VERSION,
+                "prompt_version": CASE_PROFILE_PROMPT_VERSION,
+            }
+        )
+        for index, row in enumerate(target_rows, start=1):
+            case_id = row.get("case_id", "")
+            if not case_id:
+                continue
+            case_failed = False
+            source_text = self._case_profile_source_text(row)
+            source_hash = self._text_hash(source_text)
+            cached = profiles.get(case_id)
+            if (
+                isinstance(cached, dict)
+                and cached.get("source_hash") == source_hash
+                and cached.get("schema_version") == CASE_PROFILE_SCHEMA_VERSION
+                and cached.get("prompt_version") == CASE_PROFILE_PROMPT_VERSION
+            ):
+                continue
+            try:
+                profile = self._generate_case_profile(row, source_text)
+                profiles[case_id] = {
+                    "schema_version": CASE_PROFILE_SCHEMA_VERSION,
+                    "prompt_version": CASE_PROFILE_PROMPT_VERSION,
+                    "case_id": case_id,
+                    "source_hash": source_hash,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "profile": profile,
+                    "search_text": self._case_profile_search_text(profile),
+                    "metadata_text": self._case_profile_metadata_text(profile),
+                }
+                built_count += 1
+            except Exception as exc:
+                failures.append(f"{case_id}: {exc}")
+                case_failed = True
+            if index % 5 == 0 or index == len(target_rows) or case_failed:
+                self._write_case_profile_cache(profiles)
+                self._write_case_profile_progress(
+                    {
+                        "status": "running",
+                        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "total": total,
+                        "done": len([case_id for case_id in profiles if case_id in target_case_ids]),
+                        "reused": reused_count,
+                        "built": built_count,
+                        "failure_count": len(failures),
+                        "failures": failures[-20:],
+                        "current_case_id": case_id,
+                        "cache": str(self.case_profile_cache_path),
+                        "schema_version": CASE_PROFILE_SCHEMA_VERSION,
+                        "prompt_version": CASE_PROFILE_PROMPT_VERSION,
+                    }
+                )
+        self._write_case_profile_cache(profiles)
+        self._case_profiles, self._case_profile_status = self._read_case_profile_cache()
+        done = len([case_id for case_id in profiles if case_id in target_case_ids])
+        status = "complete" if done == total and not failures else "partial"
+        self._write_case_profile_progress(
+            {
+                "status": status,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "total": total,
+                "done": done,
+                "reused": reused_count,
+                "built": built_count,
+                "failure_count": len(failures),
+                "failures": failures[-50:],
+                "current_case_id": "",
+                "cache": str(self.case_profile_cache_path),
+                "schema_version": CASE_PROFILE_SCHEMA_VERSION,
+                "prompt_version": CASE_PROFILE_PROMPT_VERSION,
+                "seconds": round(time.time() - started, 2),
+            }
+        )
+        return {
+            "ok": True,
+            "status": status,
+            "cases": total,
+            "profiles": done,
+            "reused": reused_count,
+            "built": built_count,
+            "failure_count": len(failures),
+            "failures": failures[:20],
+            "cache": str(self.case_profile_cache_path),
+            "seconds": round(time.time() - started, 2),
+        }
+
+    def case_profiles_status(self) -> dict[str, object]:
+        try:
+            progress = json.loads(self.case_profile_progress_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            progress = {"status": "missing", "progress": str(self.case_profile_progress_path)}
+        except (OSError, ValueError) as exc:
+            progress = {"status": "unreadable", "error": repr(exc), "progress": str(self.case_profile_progress_path)}
+        progress["profile_cache"] = {
+            "cache": str(self.case_profile_cache_path),
+            "profiles": len(self._case_profiles),
+            "created_at": self._case_profile_status.get("created_at", ""),
+            "stale": bool(self._case_profile_status.get("stale")),
+            "partial": bool(self._case_profile_status.get("partial")),
+            "missing_count": self._case_profile_status.get("missing_count", 0),
+            "warnings": self._case_profile_status.get("warnings", []),
+        }
+        return progress
 
     def reindex_case_vectors(self) -> dict[str, object]:
         manifest = self.rebuild_converted_markdown_manifest()
@@ -400,6 +553,276 @@ class CommercialOffersService:
         tmp_path = self.reindex_progress_path.with_suffix(self.reindex_progress_path.suffix + ".tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(self.reindex_progress_path)
+
+    def _read_case_profile_cache(self) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+        warnings: list[str] = []
+        status: dict[str, object] = {"stale": False, "warnings": warnings}
+        if not self.case_profile_cache_path.exists():
+            return {}, status
+        profiles: dict[str, dict[str, object]] = {}
+        created_at = ""
+        try:
+            with self.case_profile_cache_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    item = json.loads(line)
+                    if not isinstance(item, dict):
+                        continue
+                    case_id = str(item.get("case_id") or "")
+                    if case_id:
+                        profiles[case_id] = item
+                    created_at = str(item.get("created_at") or created_at)
+        except (OSError, ValueError) as exc:
+            warnings.append(f"commercial_offer_case_profile_cache_unreadable: {exc}")
+            status["stale"] = True
+            return {}, status
+        valid: dict[str, dict[str, object]] = {}
+        missing: list[str] = []
+        for row in self._registry:
+            case_id = row.get("case_id", "")
+            item = profiles.get(case_id)
+            source_hash = self._text_hash(self._case_profile_source_text(row))
+            if (
+                isinstance(item, dict)
+                and item.get("schema_version") == CASE_PROFILE_SCHEMA_VERSION
+                and item.get("prompt_version") == CASE_PROFILE_PROMPT_VERSION
+                and item.get("source_hash") == source_hash
+                and isinstance(item.get("profile"), dict)
+            ):
+                valid[case_id] = item
+            else:
+                missing.append(case_id)
+        status["created_at"] = created_at
+        if missing:
+            status["partial"] = bool(valid)
+            status["missing_count"] = len(missing)
+            status["missing_cases"] = missing[:50]
+            if not valid:
+                status["stale"] = True
+        return valid, status
+
+    def _load_reusable_case_profiles(self) -> dict[str, dict[str, object]]:
+        profiles, status = self._read_case_profile_cache()
+        if status.get("stale") and not profiles:
+            return {}
+        return profiles
+
+    def _write_case_profile_cache(self, profiles: dict[str, dict[str, object]]) -> None:
+        self.case_profile_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.case_profile_cache_path.with_suffix(self.case_profile_cache_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for case_id in sorted(profiles):
+                handle.write(json.dumps(profiles[case_id], ensure_ascii=False, sort_keys=True))
+                handle.write("\n")
+        tmp_path.replace(self.case_profile_cache_path)
+
+    def _write_case_profile_progress(self, payload: dict[str, object]) -> None:
+        self.case_profile_progress_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.case_profile_progress_path.with_suffix(self.case_profile_progress_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(self.case_profile_progress_path)
+
+    def _case_profile_source_text(self, row: dict[str, str]) -> str:
+        text = self._case_similarity_text(row)
+        lines = []
+        for line in text.splitlines():
+            clean = normalize_spaces(line)
+            if not clean:
+                continue
+            lines.append(clean[:700])
+            if len("\n".join(lines)) >= 12000:
+                break
+        return "\n".join(lines)[:12000]
+
+    def _generate_case_profile(self, row: dict[str, str], source_text: str) -> dict[str, object]:
+        system_prompt = (
+            "Ты извлекаешь компактный профиль коммерческой MRO-заявки для поиска аналогов. "
+            "Верни только JSON без markdown. Не добавляй номера похожих заявок, цены, сроки, решения брать/не брать или сведения, которых нет в источнике. "
+            "Тип ВС не является признаком похожести: не используй его как work_type, component или zone. "
+            "Сохраняй явные инженерные идентификаторы: ATA, AD/ДЛГ, SB, FR/Frame/шпангоут, RIB, stringer, P/N, MSN, registration, STA. "
+            "Если данных мало, оставляй поля короткими и ставь низкую confidence."
+        )
+        user_prompt = (
+            "Сформируй JSON строго такой формы:\n"
+            "{\n"
+            '  "problem_summary": "краткое описание проблемы/работы",\n'
+            '  "work_type": "repair | analysis | amoc | modification | ferry | concession | replacement | inspection | other",\n'
+            '  "defect_type": "corrosion | crack | dent | scratch | delamination | lightning strike | wear | installation | limitation change | other | unknown",\n'
+            '  "aircraft_type_metadata": "тип ВС только если явно указан в источнике",\n'
+            '  "components": ["компоненты без типа ВС"],\n'
+            '  "zones": ["зоны/позиции/шпангоуты/станции"],\n'
+            '  "identifiers": ["точные идентификаторы из источника"],\n'
+            '  "action_required": "что требуется выполнить или согласовать",\n'
+            '  "constraints_or_risks": ["ограничения, риски, условия эксплуатации"],\n'
+            '  "search_terms_ru_en": ["короткие русские и английские термины для поиска"],\n'
+            '  "evidence_fields": ["какие поля источника использованы"],\n'
+            '  "confidence": 0.0\n'
+            "}\n\n"
+            "Правила:\n"
+            "- Не возвращай case_id в JSON.\n"
+            "- aircraft_type_metadata заполняй только как metadata, не повторяй тип ВС в components/zones/search_terms.\n"
+            "- Не придумывай синонимы, если они не следуют из авиационного смысла источника.\n"
+            "- search_terms_ru_en должны быть терминами, а не полными предложениями.\n"
+            "- confidence от 0 до 1 отражает полноту источника.\n\n"
+            f"Источник заявки {row.get('case_id', '')}:\n{source_text}"
+        )
+        payload = self._parse_rewrite_json(self._llm.chat(system_prompt, user_prompt, allow_reasoning_fallback=True))
+        try:
+            return self._normalize_case_profile(payload)
+        except ValueError:
+            return self._fallback_case_profile(row, source_text)
+
+    @staticmethod
+    def _normalize_case_profile(payload: dict[str, object]) -> dict[str, object]:
+        profile = {
+            "problem_summary": normalize_spaces(str(payload.get("problem_summary") or ""))[:700],
+            "work_type": normalize_spaces(str(payload.get("work_type") or "other"))[:80],
+            "defect_type": normalize_spaces(str(payload.get("defect_type") or "unknown"))[:100],
+            "aircraft_type_metadata": normalize_spaces(str(payload.get("aircraft_type_metadata") or ""))[:120],
+            "components": CommercialOffersService._profile_string_list(payload.get("components"), limit=16),
+            "zones": CommercialOffersService._profile_string_list(payload.get("zones"), limit=16),
+            "identifiers": CommercialOffersService._profile_identifier_list(payload.get("identifiers"), limit=24),
+            "action_required": normalize_spaces(str(payload.get("action_required") or ""))[:700],
+            "constraints_or_risks": CommercialOffersService._profile_string_list(payload.get("constraints_or_risks"), limit=12),
+            "search_terms_ru_en": CommercialOffersService._profile_string_list(payload.get("search_terms_ru_en"), limit=32),
+            "evidence_fields": CommercialOffersService._profile_string_list(payload.get("evidence_fields"), limit=16),
+            "confidence": 0.0,
+        }
+        try:
+            profile["confidence"] = max(0.0, min(1.0, float(payload.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            profile["confidence"] = 0.0
+        if not profile["problem_summary"] and not profile["search_terms_ru_en"]:
+            raise ValueError("case profile is empty")
+        return profile
+
+    def _fallback_case_profile(self, row: dict[str, str], source_text: str) -> dict[str, object]:
+        summary = normalize_spaces(row.get("request_description", "")) or normalize_spaces(source_text[:500])
+        case_id = row.get("case_id", "")
+        reestr_text = ""
+        if case_id:
+            reestr_text = self._strip_profile_field_labels(self._registry_profile_safe_text(row, case_id))
+        source_terms: list[str] = []
+        seen: set[str] = set()
+        term_source = strip_aircraft_terms(
+            " ".join(
+                [
+                    row.get("request_description", ""),
+                    row.get("bd_comments", ""),
+                    row.get("tasks", ""),
+                    row.get("notes", ""),
+                    row.get("workscope_type", ""),
+                    "" if normalize_lookup(row.get("discipline_primary", "")) == "unknown" else row.get("discipline_primary", ""),
+                    reestr_text,
+                ]
+            )
+        )
+        for token in tokenize(term_source):
+            if token in seen or token.isdigit():
+                continue
+            seen.add(token)
+            source_terms.append(token)
+            if len(source_terms) >= 24:
+                break
+        evidence_fields = ["case_registry"]
+        if reestr_text:
+            evidence_fields.append("reestr_zayavok")
+        return {
+            "problem_summary": strip_aircraft_terms(summary)[:700],
+            "work_type": normalize_spaces(row.get("workscope_type", "")) or "other",
+            "defect_type": "unknown",
+            "aircraft_type_metadata": normalize_spaces(row.get("aircraft_type", ""))[:120],
+            "components": [],
+            "zones": [],
+            "identifiers": CommercialOffersService._profile_identifier_list(exact_terms(source_text), limit=24),
+            "action_required": normalize_spaces(row.get("tasks", ""))[:700],
+            "constraints_or_risks": [],
+            "search_terms_ru_en": source_terms,
+            "evidence_fields": evidence_fields,
+            "confidence": 0.25 if summary or source_terms else 0.0,
+        }
+
+    @staticmethod
+    def _profile_string_list(value: object, limit: int) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in CommercialOffersService._string_list(value, limit=limit * 2):
+            text = normalize_spaces(strip_aircraft_terms(item))
+            if CASE_RE.fullmatch(text) or not text:
+                continue
+            key = normalize_lookup(text)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(text[:240])
+            if len(result) >= limit:
+                break
+        return result
+
+    @staticmethod
+    def _profile_identifier_list(value: object, limit: int) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        values = value if isinstance(value, list) else list(value) if isinstance(value, tuple) else []
+        for item in values:
+            text = normalize_spaces(str(item or ""))
+            if not text or CASE_RE.fullmatch(text):
+                continue
+            key = normalize_lookup(strip_aircraft_terms(text))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(text[:240])
+            if len(result) >= limit:
+                break
+        return result
+
+    def _registry_profile_safe_text(self, row: dict[str, str], case_id: str) -> str:
+        return " ".join(
+            [
+                self._extra_search_texts.get(case_id, ""),
+                self._reestr_enrichment.get(case_id, ""),
+            ]
+        )
+
+    @staticmethod
+    def _strip_profile_field_labels(text: str) -> str:
+        return re.sub(r"\b[a-z][a-z0-9_]{2,}\s*:\s*", " ", text or "", flags=re.IGNORECASE)
+
+    @staticmethod
+    def _case_profile_search_text(profile: dict[str, object]) -> str:
+        parts = []
+        for key in (
+            "problem_summary",
+            "work_type",
+            "defect_type",
+            "components",
+            "zones",
+            "identifiers",
+            "action_required",
+            "constraints_or_risks",
+            "search_terms_ru_en",
+        ):
+            value = profile.get(key)
+            if isinstance(value, list):
+                text = " ".join(str(item) for item in value if str(item).strip())
+            else:
+                text = str(value or "")
+            if text.strip():
+                parts.append(f"{key}: {strip_aircraft_terms(text)}")
+        return "\n".join(parts)[:5000]
+
+    @staticmethod
+    def _case_profile_metadata_text(profile: dict[str, object]) -> str:
+        parts = []
+        aircraft = normalize_spaces(str(profile.get("aircraft_type_metadata") or ""))
+        if aircraft:
+            parts.append(f"aircraft_type_metadata: {aircraft}")
+        evidence_fields = profile.get("evidence_fields")
+        if isinstance(evidence_fields, list) and evidence_fields:
+            parts.append("evidence_fields: " + " ".join(str(item) for item in evidence_fields if str(item).strip()))
+        return "\n".join(parts)[:1000]
 
     def similar_cases(self, query: str, limit: int = 8) -> dict[str, object]:
         query_rewrite, rewrite_warnings = self._rewrite_query(query)

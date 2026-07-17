@@ -182,10 +182,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         default="serve",
-        choices=["serve", "reindex-com-offers", "reindex-com-offers-status", "rebuild-com-offers-manifest"],
+        choices=[
+            "serve",
+            "reindex-com-offers",
+            "reindex-com-offers-status",
+            "rebuild-com-offers-manifest",
+            "build-com-offer-profiles",
+            "com-offer-profiles-status",
+        ],
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8120)
+    parser.add_argument("--limit", type=int, default=0, help="Limit background build commands; 0 means all cases")
+    parser.add_argument("--force", action="store_true", help="Rebuild cached experimental profiles instead of reusing them")
     return parser
 
 
@@ -202,6 +211,14 @@ def main() -> None:
         return
     if args.command == "reindex-com-offers-status":
         result = SERVICES.commercial_offers.reindex_status()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "build-com-offer-profiles":
+        result = SERVICES.commercial_offers.build_case_profiles(limit=args.limit, force=args.force)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "com-offer-profiles-status":
+        result = SERVICES.commercial_offers.case_profiles_status()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     server = ThreadingHTTPServer((args.host, args.port), RequestHandler)

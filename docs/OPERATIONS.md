@@ -110,6 +110,48 @@ Important progress fields:
 - `failure_count`: failed embedding cases;
 - `current_case_id`: last processed case.
 
+## Build Experimental Case Profiles
+
+LLM case profiles are experimental and are not used by default ranking yet.
+
+Run a small smoke build first:
+
+```bash
+MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles --limit 5
+```
+
+Build all profiles after the smoke output is acceptable:
+
+```bash
+MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles
+```
+
+Force refresh:
+
+```bash
+MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles --force
+```
+
+The profile cache is:
+
+```text
+data_runtime/com_offers_case_profiles.jsonl
+```
+
+Progress is written to:
+
+```text
+data_runtime/com_offers_case_profile_progress.json
+```
+
+Check profile status:
+
+```bash
+python3 -m apps.api.server com-offer-profiles-status
+```
+
+The profile builder uses only production sources already loaded into the case card. It does not read benchmark answers.
+
 ## Ingest `mro-kb`
 
 Use this when the MRO_RAG source data changes:

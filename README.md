@@ -84,6 +84,13 @@ python3 -m apps.api.server rebuild-com-offers-manifest
 python3 -m apps.api.server reindex-com-offers
 ```
 
+`build-com-offer-profiles` builds experimental LLM case profiles. These profiles are not used by default ranking until metrics justify enabling them:
+
+```bash
+MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles --limit 5
+python3 -m apps.api.server com-offer-profiles-status
+```
+
 `POST /api/ingest/run` ingests the `mro-kb` document corpus from `MRO_RAG` into SQLite and publishes Obsidian notes:
 
 ```bash

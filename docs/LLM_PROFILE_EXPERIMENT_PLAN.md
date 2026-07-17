@@ -51,6 +51,7 @@ Offline case profile:
   "problem_summary": "",
   "work_type": "",
   "defect_type": "",
+  "aircraft_type_metadata": "",
   "components": [],
   "zones": [],
   "identifiers": [],
@@ -69,6 +70,8 @@ Expected benefit:
 - reduce OCR noise before embedding;
 - make Russian short queries and English source text closer in representation.
 
+`aircraft_type_metadata` is retained in `metadata_text` for display/check/tie-break analysis. It is deliberately separated from the main profile `search_text`, so it is available to the pipeline but cannot dominate the primary semantic similarity.
+
 Expected risk:
 
 - LLM may omit rare identifiers;
@@ -86,16 +89,30 @@ Planned artifacts:
 
 Planned commands:
 
-- `build-com-offer-profiles`: generate or refresh profiles in background/resumable mode;
-- `build-com-offer-profile-vectors`: embed profile search text;
+- `build-com-offer-profiles`: generate or refresh profiles in resumable mode;
+- `com-offer-profiles-status`: inspect progress/cache status;
+- future `build-com-offer-profile-vectors`: embed profile search text;
 - evaluation flag to compare profile-only and hybrid+profile modes.
 
 Runtime behavior:
 
 1. If profile index is missing/stale, the service continues with current hybrid retrieval.
 2. `/api/health` reports profile status and warnings.
-3. Query profile generation is optional and controlled by an explicit environment flag.
-4. Exact and lexical retrieval remain active as safety net.
+3. Profile retrieval is not enabled by default until metrics justify it.
+4. Query profile generation is optional and must be controlled by an explicit environment flag.
+5. Exact and lexical retrieval remain active as safety net.
+
+Implemented command surface:
+
+```bash
+MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles --limit 5
+python3 -m apps.api.server com-offer-profiles-status
+```
+
+Implemented artifacts:
+
+- `data_runtime/com_offers_case_profiles.jsonl`;
+- `data_runtime/com_offers_case_profile_progress.json`.
 
 ## Evaluation
 
