@@ -140,12 +140,28 @@ Partial semantic benchmark with min-max score fusion, 87 queries, 1217/1246 vect
 Important: fallback numbers are expected to be lower than target because semantic embeddings are disabled there.
 The partial semantic result confirms that embeddings are useful after score normalization, but still not enough for the target MVP quality on current case cards.
 
+Additional MRO-ready evaluation metrics are now emitted by `tools/evaluate_com_offers_ground_truth.py`:
+
+- `candidate_recall_at_50`;
+- `candidate_recall_at_100`;
+- `cost_usable_at_5`;
+- `trusted_evidence_at_5`.
+
+`candidate_recall_at_50/100` checks whether the expected analogue is present in a wide candidate pool before final top-N use. This shows whether reranking or structured profile ranking can still recover a case.
+
+`cost_usable_at_5` is not a price metric. It measures whether top-5 analogues have enough historical signals to be used as future cost comparables.
+
+`trusted_evidence_at_5` measures whether top-5 analogues have at least one trusted evidence document.
+
 The next quality checks should:
 
 - rebuild embeddings after `Reestr_zayavok.xlsm` enrichment;
 - compare lexical-only, semantic-only, and hybrid metrics on the same 87-query benchmark;
 - test the GPU reranker only after the candidate pool contains the correct case often enough;
-- evaluate LLM-generated compact profiles from production source text.
+- evaluate structured MRO profiles from production source text;
+- review `misses_candidate_pool_top100` separately from top-10 misses.
+
+Candidate-pool evaluation intentionally requests up to top-100 results per query and is slower than the old top-10 benchmark. Use it for benchmark snapshots, not for every smoke check.
 
 Do not enrich runtime retrieval from the Excel `Заявки` sheet in `ground truth.xlsx`; that sheet is benchmark data.
 

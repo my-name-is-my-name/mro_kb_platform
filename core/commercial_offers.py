@@ -79,8 +79,8 @@ STOP_TOKENS = {
 }
 EXACT_PATTERNS = (ATA_RE, RIB_RE, FRAME_RE, STGR_RE, PART_RE, MSN_RE, REG_RE, AD_RE, SB_RE, CASE_RE)
 CONVERTED_MARKDOWN_SCHEMA_VERSION = 1
-CASE_PROFILE_SCHEMA_VERSION = 1
-CASE_PROFILE_PROMPT_VERSION = 1
+CASE_PROFILE_SCHEMA_VERSION = 3
+CASE_PROFILE_PROMPT_VERSION = 3
 CASE_PROFILE_VECTOR_SCHEMA_VERSION = 1
 CONVERTED_MARKDOWN_EXCLUDED_PARTS = {
     "archive",
@@ -101,6 +101,13 @@ RANGE_DIR_RE = re.compile(r"^(?:MP|MRO|MR|МР)\s*\d{1,4}\s*[-–]\s*\d{1,4}$", 
 SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 SPREADSHEET_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 SPREADSHEET_NAMESPACES = {"a": SPREADSHEET_NS, "r": SPREADSHEET_REL_NS}
+PROFILE_PLACEHOLDER_VALUES = {"", "...", "-", "n/a", "na", "unknown unknown"}
+PROFILE_NOISE_RE = re.compile(
+    r"\b(?:converted|pdf|ocr|page|fallback|reestr|description|comments|tasks|notes|normalized|markdown)\b|"
+    r"(?:^|[\s_/.-])(?:mp|mro|мр)[-_ ]?\d{1,5}(?:[\s_/.-]|$)|"
+    r"\.md\b|(?:^|[\s_/.-])\d{3,4}-\d{3,4}(?:[\s_/.-]|$)",
+    re.IGNORECASE,
+)
 
 
 def normalize_spaces(text: str) -> str:
@@ -289,6 +296,7 @@ class CommercialOffersService:
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "total": total,
+                "processed": 0,
                 "done": reused_count,
                 "reused": reused_count,
                 "built": 0,
@@ -339,6 +347,7 @@ class CommercialOffersService:
                         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
                         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         "total": total,
+                        "processed": index,
                         "done": len([case_id for case_id in profiles if case_id in target_case_ids]),
                         "reused": reused_count,
                         "built": built_count,
@@ -360,6 +369,7 @@ class CommercialOffersService:
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
                 "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "total": total,
+                "processed": len(target_rows),
                 "done": done,
                 "reused": reused_count,
                 "built": built_count,
@@ -851,41 +861,73 @@ class CommercialOffersService:
         tmp_path.replace(self.case_profile_vector_progress_path)
 
     def _case_profile_source_text(self, row: dict[str, str]) -> str:
-        text = self._case_similarity_text(row)
-        lines = []
-        for line in text.splitlines():
-            clean = normalize_spaces(line)
-            if not clean:
+        case_id = row.get("case_id", "")
+        parts: list[str] = []
+        for label, key in (
+            ("request_description", "request_description"),
+            ("bd_comments", "bd_comments"),
+            ("tasks", "tasks"),
+            ("notes", "notes"),
+            ("workscope_type", "workscope_type"),
+            ("discipline_primary", "discipline_primary"),
+            ("status", "status_normalized"),
+        ):
+            value = self._clean_profile_source_fragment(row.get(key, ""))
+            if value:
+                parts.append(f"{label}: {value}")
+        reestr_text = self._clean_profile_source_fragment(self._reestr_enrichment.get(case_id, ""))
+        if reestr_text:
+            parts.append(f"reestr: {reestr_text[:3000]}")
+        markdown_text = self._clean_profile_source_fragment(self._extra_search_texts.get(case_id, ""))
+        if markdown_text:
+            parts.append(f"markdown: {markdown_text[:4000]}")
+        return "\n".join(parts)[:9000]
+
+    @staticmethod
+    def _clean_profile_source_fragment(text: str) -> str:
+        lines: list[str] = []
+        seen: set[str] = set()
+        for raw_line in (text or "").splitlines():
+            line = normalize_spaces(raw_line)
+            if not line:
                 continue
-            lines.append(clean[:700])
-            if len("\n".join(lines)) >= 12000:
+            line = re.sub(r"\b(?:path|converted_markdown|reestr_[a-z_]+)\s*:\s*", " ", line, flags=re.IGNORECASE)
+            line = re.sub(r"[/\\][^\s]{0,120}\.(?:md|pdf|pptx?)\b", " ", line, flags=re.IGNORECASE)
+            line = re.sub(r"\b[^\s]{0,80}\.(?:md|pdf|pptx?)\b", " ", line, flags=re.IGNORECASE)
+            line = re.sub(r"\b(?:converted_md_pdf_ocr|converted_md|normalized_md|pilot_artifacts)\b", " ", line, flags=re.IGNORECASE)
+            line = normalize_spaces(line)
+            if len(line) < 4 or PROFILE_NOISE_RE.fullmatch(line):
+                continue
+            key = normalize_lookup(line)
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(line[:700])
+            if len("\n".join(lines)) >= 9000:
                 break
-        return "\n".join(lines)[:12000]
+        return "\n".join(lines)
 
     def _generate_case_profile(self, row: dict[str, str], source_text: str) -> dict[str, object]:
         system_prompt = (
+            "/no_think\n"
             "Ты извлекаешь компактный профиль коммерческой MRO-заявки для поиска аналогов. "
-            "Верни только JSON без markdown. Не добавляй номера похожих заявок, цены, сроки, решения брать/не брать или сведения, которых нет в источнике. "
+            "Верни только валидный JSON. Первый символ ответа должен быть {, последний символ должен быть }. "
+            "Не пиши ход рассуждений, комментарии, markdown или пояснения. "
+            "Не добавляй номера похожих заявок, цены, сроки, решения брать/не брать или сведения, которых нет в источнике. "
             "Тип ВС не является признаком похожести: не используй его как work_type, component или zone. "
             "Сохраняй явные инженерные идентификаторы: ATA, AD/ДЛГ, SB, FR/Frame/шпангоут, RIB, stringer, P/N, MSN, registration, STA. "
             "Если данных мало, оставляй поля короткими и ставь низкую confidence."
         )
         user_prompt = (
-            "Сформируй JSON строго такой формы:\n"
-            "{\n"
-            '  "problem_summary": "краткое описание проблемы/работы",\n'
-            '  "work_type": "repair | analysis | amoc | modification | ferry | concession | replacement | inspection | other",\n'
-            '  "defect_type": "corrosion | crack | dent | scratch | delamination | lightning strike | wear | installation | limitation change | other | unknown",\n'
-            '  "aircraft_type_metadata": "тип ВС только если явно указан в источнике",\n'
-            '  "components": ["компоненты без типа ВС"],\n'
-            '  "zones": ["зоны/позиции/шпангоуты/станции"],\n'
-            '  "identifiers": ["точные идентификаторы из источника"],\n'
-            '  "action_required": "что требуется выполнить или согласовать",\n'
-            '  "constraints_or_risks": ["ограничения, риски, условия эксплуатации"],\n'
-            '  "search_terms_ru_en": ["короткие русские и английские термины для поиска"],\n'
-            '  "evidence_fields": ["какие поля источника использованы"],\n'
-            '  "confidence": 0.0\n'
-            "}\n\n"
+            "/no_think\n"
+            "Верни только компактный JSON в одну строку, без текста до или после JSON. "
+            "Строковые значения до 80 символов. Массивы до 5 элементов. "
+            "Форма: "
+            '{"problem_summary":"","work_type":"repair|analysis|amoc|modification|ferry|concession|replacement|inspection|other",'
+            '"defect_type":"corrosion|crack|dent|scratch|delamination|lightning strike|wear|installation|limitation change|other|unknown",'
+            '"aircraft_type_metadata":"","ata":[],"components":[],"zones":[],"identifiers":[],"authority_path":[],'
+            '"action_required":"","constraints_or_risks":[],"search_terms_ru_en":[],"evidence_fields":[],"confidence":0.0}'
+            "\n\n"
             "Правила:\n"
             "- Не возвращай case_id в JSON.\n"
             "- aircraft_type_metadata заполняй только как metadata, не повторяй тип ВС в components/zones/search_terms.\n"
@@ -895,10 +937,11 @@ class CommercialOffersService:
             f"Источник заявки {row.get('case_id', '')}:\n{source_text}"
         )
         payload = self._parse_rewrite_json(self._llm.chat(system_prompt, user_prompt, allow_reasoning_fallback=True))
-        try:
-            return self._normalize_case_profile(payload)
-        except ValueError:
-            return self._fallback_case_profile(row, source_text)
+        profile = self._normalize_case_profile(payload)
+        errors = self._profile_quality_errors(profile)
+        if errors:
+            raise ValueError("profile_quality_failed: " + "; ".join(errors))
+        return profile
 
     @staticmethod
     def _normalize_case_profile(payload: dict[str, object]) -> dict[str, object]:
@@ -907,9 +950,11 @@ class CommercialOffersService:
             "work_type": normalize_spaces(str(payload.get("work_type") or "other"))[:80],
             "defect_type": normalize_spaces(str(payload.get("defect_type") or "unknown"))[:100],
             "aircraft_type_metadata": normalize_spaces(str(payload.get("aircraft_type_metadata") or ""))[:120],
+            "ata": CommercialOffersService._profile_identifier_list(payload.get("ata"), limit=12),
             "components": CommercialOffersService._profile_string_list(payload.get("components"), limit=16),
             "zones": CommercialOffersService._profile_string_list(payload.get("zones"), limit=16),
             "identifiers": CommercialOffersService._profile_identifier_list(payload.get("identifiers"), limit=24),
+            "authority_path": CommercialOffersService._profile_string_list(payload.get("authority_path"), limit=8),
             "action_required": normalize_spaces(str(payload.get("action_required") or ""))[:700],
             "constraints_or_risks": CommercialOffersService._profile_string_list(payload.get("constraints_or_risks"), limit=12),
             "search_terms_ru_en": CommercialOffersService._profile_string_list(payload.get("search_terms_ru_en"), limit=32),
@@ -923,6 +968,35 @@ class CommercialOffersService:
         if not profile["problem_summary"] and not profile["search_terms_ru_en"]:
             raise ValueError("case profile is empty")
         return profile
+
+    @classmethod
+    def _profile_quality_errors(cls, profile: dict[str, object]) -> list[str]:
+        errors: list[str] = []
+        summary = normalize_lookup(str(profile.get("problem_summary") or ""))
+        work_type = normalize_lookup(str(profile.get("work_type") or ""))
+        defect_type = normalize_lookup(str(profile.get("defect_type") or ""))
+        if summary in PROFILE_PLACEHOLDER_VALUES:
+            errors.append("empty_or_placeholder_summary")
+        if work_type in {"...", ""}:
+            errors.append("empty_or_placeholder_work_type")
+        try:
+            confidence = float(profile.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < 0.4:
+            errors.append("confidence_below_0_4")
+        list_fields = ("ata", "components", "zones", "identifiers", "authority_path", "constraints_or_risks", "search_terms_ru_en")
+        useful_values = []
+        for key in list_fields:
+            value = profile.get(key)
+            if isinstance(value, list):
+                useful_values.extend(str(item) for item in value if str(item).strip())
+        if len(useful_values) < 3 and defect_type in {"", "unknown", "..."}:
+            errors.append("not_enough_structured_signal")
+        noisy = [value for value in useful_values if PROFILE_NOISE_RE.search(value)]
+        if noisy:
+            errors.append("profile_contains_source_path_noise")
+        return errors
 
     def _fallback_case_profile(self, row: dict[str, str], source_text: str) -> dict[str, object]:
         summary = normalize_spaces(row.get("request_description", "")) or normalize_spaces(source_text[:500])
@@ -955,20 +1029,46 @@ class CommercialOffersService:
         evidence_fields = ["case_registry"]
         if reestr_text:
             evidence_fields.append("reestr_zayavok")
+        profile_text = " ".join([summary, term_source, source_text])
         return {
             "problem_summary": strip_aircraft_terms(summary)[:700],
             "work_type": normalize_spaces(row.get("workscope_type", "")) or "other",
             "defect_type": "unknown",
             "aircraft_type_metadata": normalize_spaces(row.get("aircraft_type", ""))[:120],
+            "ata": self._infer_ata(profile_text),
             "components": [],
-            "zones": [],
+            "zones": self._infer_zones(profile_text),
             "identifiers": CommercialOffersService._profile_identifier_list(exact_terms(source_text), limit=24),
+            "authority_path": [],
             "action_required": normalize_spaces(row.get("tasks", ""))[:700],
             "constraints_or_risks": [],
             "search_terms_ru_en": source_terms,
             "evidence_fields": evidence_fields,
-            "confidence": 0.25 if summary or source_terms else 0.0,
+            "confidence": 0.15 if summary or source_terms else 0.0,
         }
+
+    @staticmethod
+    def _infer_ata(text: str) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for match in ATA_RE.finditer(text or ""):
+            value = normalize_spaces(match.group(0).upper())
+            if value not in seen:
+                seen.add(value)
+                values.append(value)
+        return values[:12]
+
+    @staticmethod
+    def _infer_zones(text: str) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for pattern in (FRAME_RE, RIB_RE, STGR_RE):
+            for match in pattern.finditer(text or ""):
+                value = normalize_spaces(match.group(0).upper())
+                if value not in seen:
+                    seen.add(value)
+                    values.append(value)
+        return values[:16]
 
     @staticmethod
     def _profile_string_list(value: object, limit: int) -> list[str]:
@@ -976,7 +1076,9 @@ class CommercialOffersService:
         seen: set[str] = set()
         for item in CommercialOffersService._string_list(value, limit=limit * 2):
             text = normalize_spaces(strip_aircraft_terms(item))
-            if CASE_RE.fullmatch(text) or not text:
+            if CASE_RE.fullmatch(text) or not text or normalize_lookup(text) in PROFILE_PLACEHOLDER_VALUES:
+                continue
+            if PROFILE_NOISE_RE.search(text):
                 continue
             key = normalize_lookup(text)
             if key in seen:
@@ -994,7 +1096,9 @@ class CommercialOffersService:
         values = value if isinstance(value, list) else list(value) if isinstance(value, tuple) else []
         for item in values:
             text = normalize_spaces(str(item or ""))
-            if not text or CASE_RE.fullmatch(text):
+            if not text or CASE_RE.fullmatch(text) or normalize_lookup(text) in PROFILE_PLACEHOLDER_VALUES:
+                continue
+            if PROFILE_NOISE_RE.search(text):
                 continue
             key = normalize_lookup(strip_aircraft_terms(text))
             if not key or key in seen:
@@ -1024,9 +1128,11 @@ class CommercialOffersService:
             "problem_summary",
             "work_type",
             "defect_type",
+            "ata",
             "components",
             "zones",
             "identifiers",
+            "authority_path",
             "action_required",
             "constraints_or_risks",
             "search_terms_ru_en",
@@ -1051,6 +1157,100 @@ class CommercialOffersService:
             parts.append("evidence_fields: " + " ".join(str(item) for item in evidence_fields if str(item).strip()))
         return "\n".join(parts)[:1000]
 
+    def _case_profile_for_row(self, row: dict[str, str]) -> dict[str, object]:
+        case_id = row.get("case_id", "")
+        cached = self._case_profiles.get(case_id, {})
+        profile = cached.get("profile") if isinstance(cached, dict) else None
+        if isinstance(profile, dict):
+            return self._normalize_case_profile(profile)
+        return self._fallback_case_profile(row, self._case_profile_source_text(row))
+
+    def _query_profile(self, query: str) -> dict[str, object]:
+        row = {
+            "request_description": query,
+            "workscope_type": "",
+            "aircraft_type": "",
+            "bd_comments": "",
+            "tasks": "",
+            "notes": "",
+            "discipline_primary": "",
+        }
+        return self._fallback_case_profile(row, query)
+
+    @staticmethod
+    def _profile_set(profile: dict[str, object], key: str) -> set[str]:
+        value = profile.get(key)
+        if isinstance(value, list):
+            return {normalize_lookup(str(item)) for item in value if str(item).strip()}
+        text = normalize_lookup(str(value or ""))
+        return {text} if text else set()
+
+    def _structured_similarity(
+        self,
+        query_profile: dict[str, object],
+        case_profile: dict[str, object],
+    ) -> dict[str, object]:
+        score = 0.0
+        reasons: list[str] = []
+
+        query_identifiers = self._profile_set(query_profile, "identifiers")
+        case_identifiers = self._profile_set(case_profile, "identifiers")
+        identifier_overlap = query_identifiers.intersection(case_identifiers)
+        if identifier_overlap:
+            score += 4.0
+            reasons.append("совпал инженерный идентификатор")
+
+        query_authority = self._profile_set(query_profile, "authority_path") - {"unknown", "none"}
+        case_authority = self._profile_set(case_profile, "authority_path") - {"unknown", "none"}
+        if query_authority and query_authority.intersection(case_authority):
+            score += 1.4
+            reasons.append("совпал сертификационный/регуляторный путь")
+
+        query_components = self._profile_set(query_profile, "components")
+        case_components = self._profile_set(case_profile, "components")
+        component_overlap = query_components.intersection(case_components)
+        if component_overlap:
+            score += 1.3
+            reasons.append("совпал компонент")
+
+        query_zones = self._profile_set(query_profile, "zones")
+        case_zones = self._profile_set(case_profile, "zones")
+        if query_zones and query_zones.intersection(case_zones):
+            score += 1.2
+            reasons.append("совпала зона/позиция")
+
+        query_ata = self._profile_set(query_profile, "ata")
+        case_ata = self._profile_set(case_profile, "ata")
+        if query_ata and query_ata.intersection(case_ata):
+            score += 1.0
+            reasons.append("совпала ATA-глава")
+
+        query_defect = normalize_lookup(str(query_profile.get("defect_type") or "unknown"))
+        case_defect = normalize_lookup(str(case_profile.get("defect_type") or "unknown"))
+        if query_defect != "unknown" and query_defect == case_defect:
+            score += 1.1
+            reasons.append("совпал тип дефекта")
+
+        query_work_type = normalize_lookup(str(query_profile.get("work_type") or "other"))
+        case_work_type = normalize_lookup(str(case_profile.get("work_type") or "other"))
+        if query_work_type != "other" and query_work_type == case_work_type:
+            score += 0.8
+            reasons.append("совпал тип работ")
+
+        if identifier_overlap:
+            reason_class = "same_identifier"
+        elif component_overlap and query_defect != "unknown" and query_defect == case_defect and query_zones.intersection(case_zones):
+            reason_class = "same_component_defect_zone"
+        elif component_overlap and query_defect != "unknown" and query_defect == case_defect:
+            reason_class = "same_component_defect"
+        elif query_work_type != "other" and query_work_type == case_work_type:
+            reason_class = "same_work_type"
+        elif score > 0:
+            reason_class = "commercially_similar"
+        else:
+            reason_class = "weak_analog"
+        return {"score": score, "reason_class": reason_class, "reasons": reasons[:6]}
+
     def similar_cases(self, query: str, limit: int = 8) -> dict[str, object]:
         query_rewrite, rewrite_warnings = self._rewrite_query(query)
         search_queries = self._search_queries(query, query_rewrite)
@@ -1062,6 +1262,8 @@ class CommercialOffersService:
             case = dict(item["case"])
             evidence = self._case_evidence(case.get("case_id", ""), query, max_docs=3)
             quality_warnings = [str(doc.get("quality_warning")) for doc in evidence if doc.get("quality_warning")]
+            go_no_go = self._go_no_go_assessment(case, evidence)
+            cost_readiness = self._cost_readiness(case, evidence)
             case_payload = {
                 "case_id": case.get("case_id", ""),
                 "case_id_raw": case.get("case_id_raw", ""),
@@ -1080,10 +1282,14 @@ class CommercialOffersService:
                 "profile_semantic_score": float(item.get("profile_semantic_score", 0.0)),
                 "lexical_score": float(item.get("lexical_score", 0.0)),
                 "exact_score": float(item.get("exact_score", 0.0)),
+                "structured_score": float(item.get("structured_score", 0.0)),
                 "rerank_score": float(item.get("rerank_score", 0.0)),
+                "similarity_reason_class": item.get("similarity_reason_class", "weak_analog"),
                 "matched_queries": item.get("matched_queries", []),
                 "reasons": item.get("reasons", []),
                 "check": self._check_points(query, case, evidence),
+                "go_no_go": go_no_go,
+                "cost_readiness": cost_readiness,
                 "documents": evidence,
                 "quality_warnings": quality_warnings,
             }
@@ -1631,6 +1837,8 @@ class CommercialOffersService:
 
     def _candidate_cases(self, search_queries: list[dict[str, object]], limit: int) -> list[dict[str, object]]:
         merged: dict[str, dict[str, object]] = {}
+        original_query = str(search_queries[0].get("text") or "") if search_queries else ""
+        query_profile = self._query_profile(original_query)
         for query_item in search_queries:
             query = str(query_item.get("text") or "")
             query_source = str(query_item.get("source") or "query")
@@ -1706,13 +1914,23 @@ class CommercialOffersService:
                 + float(normalized_scores.get("exact", 0.0))
                 + (float(normalized_scores.get("profile_semantic", 0.0)) * 0.75 if self.profile_search_enabled else 0.0)
             )
+            case_profile = self._case_profile_for_row(item["case"])
+            structured = self._structured_similarity(query_profile, case_profile)
+            structured_score = float(structured.get("score", 0.0))
+            item["structured_score"] = structured_score
+            item["similarity_reason_class"] = structured.get("reason_class", "weak_analog")
+            item["case_profile"] = case_profile
             matched_queries = item.get("matched_queries") if isinstance(item.get("matched_queries"), list) else []
             score += min(len(matched_queries), 5) * 0.035
             if score > 0:
-                original_query = str(search_queries[0].get("text") or "") if search_queries else ""
                 score += self._aircraft_tie_breaker(original_query, item["case"])
             item["score"] = score
-            item["reasons"] = item.get("reasons", [])[:12]
+            reasons = item.get("reasons", []) if isinstance(item.get("reasons"), list) else []
+            for reason in structured.get("reasons", []):
+                labeled = f"структурный профиль: {reason}"
+                if labeled not in reasons:
+                    reasons.append(labeled)
+            item["reasons"] = reasons[:12]
             item["matched_queries"] = matched_queries[:8]
             candidates.append(item)
         candidates.sort(key=lambda item: float(item["score"]), reverse=True)
@@ -2120,6 +2338,73 @@ class CommercialOffersService:
         start = max(min(positions) - window // 3, 0)
         return cleaned[start : start + window]
 
+    @staticmethod
+    def _go_no_go_assessment(case: dict[str, str], evidence: list[dict[str, object]]) -> dict[str, object]:
+        risk_factors: list[str] = []
+        blocking_questions: list[str] = []
+        required_input_data: list[str] = []
+
+        if case.get("certificate_scope_flag") and case.get("certificate_scope_flag") != "in_scope":
+            risk_factors.append("работа может быть вне подтвержденного scope")
+        if normalize_lookup(case.get("missing_input_flag", "")) == "true":
+            blocking_questions.append("историческая заявка требовала дополнительных исходных данных")
+        if case.get("blocking_inputs"):
+            required_input_data.append(case.get("blocking_inputs", ""))
+        if any(doc.get("source_type") != "commercial_offer_document" for doc in evidence):
+            required_input_data.append("проверить документы и исходные данные новой заявки")
+        status = normalize_lookup(case.get("status_normalized", ""))
+        if status in {"cancelled", "rejected", "no_quote"}:
+            risk_factors.append(f"исторический статус заявки: {case.get('status_normalized')}")
+        if normalize_lookup(case.get("needs_expert_review", "")) == "true":
+            risk_factors.append("историческая заявка помечена как требующая экспертной проверки")
+
+        if risk_factors or blocking_questions:
+            recommended_action = "manual_review"
+        elif required_input_data:
+            recommended_action = "take_after_clarification"
+        else:
+            recommended_action = "take_after_applicability_check"
+        return {
+            "recommended_action": recommended_action,
+            "risk_factors": risk_factors[:8],
+            "blocking_questions": blocking_questions[:8],
+            "required_input_data": required_input_data[:8],
+        }
+
+    @staticmethod
+    def _cost_readiness(case: dict[str, str], evidence: list[dict[str, object]]) -> dict[str, object]:
+        signals: list[str] = []
+        gaps: list[str] = []
+        score = 0
+        if case.get("quote_sent_date"):
+            score += 2
+            signals.append("есть дата отправки КП")
+        else:
+            gaps.append("нет даты отправки КП")
+        if case.get("status_normalized") == "accepted":
+            score += 2
+            signals.append("историческая заявка принята")
+        elif case.get("status_normalized"):
+            gaps.append(f"статус не accepted: {case.get('status_normalized')}")
+        if case.get("workscope_type") and case.get("workscope_type") != "other":
+            score += 1
+            signals.append("есть тип работ")
+        else:
+            gaps.append("тип работ не нормализован")
+        if any(doc.get("source_type") == "commercial_offer_document" for doc in evidence):
+            score += 1
+            signals.append("есть trusted evidence document")
+        else:
+            gaps.append("нет trusted evidence document")
+        if normalize_lookup(case.get("missing_input_flag", "")) == "true":
+            gaps.append("в исторической заявке были недостающие исходные данные")
+        return {
+            "usable_for_estimate": score >= 4 and normalize_lookup(case.get("missing_input_flag", "")) != "true",
+            "score": score,
+            "signals": signals[:8],
+            "gaps": gaps[:8],
+        }
+
     def _check_points(self, query: str, case: dict[str, str], evidence: list[dict[str, object]]) -> list[str]:
         checks: list[str] = []
         query_aircraft = {normalize_lookup(item).replace(" ", "") for item in AIRCRAFT_RE.findall(query or "")}
@@ -2142,8 +2427,8 @@ class CommercialOffersService:
             lines.append("")
             lines.append("Это поиск аналогов, не расчет цены и не финальное решение брать/не брать.")
             return "\n".join(lines)
-        lines.append("| Заявка | Заказчик | ВС | Статус | Описание | Почему похожа | Что проверить | Документы |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("| Заявка | Класс аналога | Заказчик | ВС | Статус | Описание | Почему похожа | Что проверить | Cost-ready | Документы |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|")
         for case in cases:
             docs = case.get("documents") if isinstance(case.get("documents"), list) else []
             doc_links = []
@@ -2161,9 +2446,12 @@ class CommercialOffersService:
             description = normalize_spaces(str(case.get("request_description") or ""))[:180].replace("|", "\\|")
             reasons = "; ".join(str(reason) for reason in case.get("reasons", [])[:8]).replace("|", "\\|")
             checks = "; ".join(str(item) for item in case.get("check", [])[:4]).replace("|", "\\|")
+            cost = case.get("cost_readiness") if isinstance(case.get("cost_readiness"), dict) else {}
+            cost_label = "да" if cost.get("usable_for_estimate") else "нет"
             lines.append(
-                f"| {case.get('case_id', '')} | {case.get('customer', '')} | {case.get('aircraft_type', '')} | "
-                f"{case.get('status_normalized', '')} | {description} | {reasons} | {checks} | {'<br>'.join(doc_links)} |"
+                f"| {case.get('case_id', '')} | {case.get('similarity_reason_class', '')} | {case.get('customer', '')} | "
+                f"{case.get('aircraft_type', '')} | {case.get('status_normalized', '')} | {description} | {reasons} | "
+                f"{checks} | {cost_label} | {'<br>'.join(doc_links)} |"
             )
         lines.append("")
         lines.append("Предупреждения по качеству источников:")

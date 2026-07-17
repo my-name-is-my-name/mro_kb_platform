@@ -98,6 +98,11 @@ def _base_case_id(case_id: str) -> str:
     return re.sub(r"\.\d+$", "", case_id)
 
 
+def _case_number(case_id: str) -> int:
+    match = re.search(r"MP-(\d+)", case_id or "")
+    return int(match.group(1)) if match else 10**9
+
+
 def expand_expected_ids(expected: set[str], registry_ids: set[str]) -> set[str]:
     expanded = set(expected)
     by_base: dict[str, set[str]] = defaultdict(set)
@@ -122,33 +127,58 @@ def ndcg_at(ids: list[str], expected: set[str], k: int) -> float:
     return dcg / ideal if ideal else 0.0
 
 
-def _rank_ids(service: CommercialOffersService, query: str, limit: int, mode: str) -> list[str]:
+def _rank_cases(service: CommercialOffersService, query: str, limit: int, mode: str) -> list[dict[str, Any]]:
     if mode == "hybrid":
         result = service.similar_cases(query, limit=limit)
-        return [case["case_id"] for case in result.get("similar_cases", [])]
+        return [dict(case) for case in result.get("similar_cases", [])]
     if mode == "fallback":
         service._vectors = {}
         service._case_profile_vectors = {}
         result = service.similar_cases(query, limit=limit)
-        return [case["case_id"] for case in result.get("similar_cases", [])]
+        return [dict(case) for case in result.get("similar_cases", [])]
     if mode == "lexical":
         items = service._lexical_candidate_cases(query, limit=limit)
-        return [item["case"].get("case_id", "") for item in items]
+        return [{"case_id": item["case"].get("case_id", "")} for item in items]
     if mode == "semantic":
         items = service._semantic_candidate_cases(query, limit=limit)
-        return [item["case"].get("case_id", "") for item in items]
+        return [{"case_id": item["case"].get("case_id", "")} for item in items]
     if mode == "profile":
-        return [item["case_id"] for item in service.profile_semantic_cases(query, limit=limit)]
+        return [dict(item) for item in service.profile_semantic_cases(query, limit=limit)]
     if mode == "hybrid-profile":
         service.profile_search_enabled = True
         result = service.similar_cases(query, limit=limit)
-        return [case["case_id"] for case in result.get("similar_cases", [])]
+        return [dict(case) for case in result.get("similar_cases", [])]
     raise ValueError(f"Unknown evaluation mode: {mode}")
 
 
-def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bool) -> dict[str, Any]:
+def _rank_ids(service: CommercialOffersService, query: str, limit: int, mode: str) -> list[str]:
+    return [str(case.get("case_id") or "") for case in _rank_cases(service, query, limit, mode)]
+
+
+def _cost_usable_count(cases: list[dict[str, Any]], k: int) -> int:
+    return sum(1 for case in cases[:k] if isinstance(case.get("cost_readiness"), dict) and case["cost_readiness"].get("usable_for_estimate"))
+
+
+def _trusted_evidence_count(cases: list[dict[str, Any]], k: int) -> int:
+    count = 0
+    for case in cases[:k]:
+        docs = case.get("documents") if isinstance(case.get("documents"), list) else []
+        if any(isinstance(doc, dict) and doc.get("source_type") == "commercial_offer_document" for doc in docs):
+            count += 1
+    return count
+
+
+def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bool, max_case_number: int = 0) -> dict[str, Any]:
     service = CommercialOffersService()
     service._llm = None
+    if max_case_number > 0:
+        service._registry = [row for row in service._registry if _case_number(row.get("case_id", "")) <= max_case_number]
+        service._registry_by_case = {row.get("case_id", ""): row for row in service._registry}
+        service._vectors = {case_id: item for case_id, item in service._vectors.items() if case_id in service._registry_by_case}
+        service._case_profile_vectors = {
+            case_id: item for case_id, item in service._case_profile_vectors.items() if case_id in service._registry_by_case
+        }
+        service._doc_frequency = service._build_doc_frequency()
     registry_ids = {row.get("case_id", "") for row in service._registry if row.get("case_id")}
     rows = []
     started = time.time()
@@ -156,10 +186,17 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
         expected = set(item["expected"])
         if expand_base_ids:
             expected = expand_expected_ids(expected, registry_ids)
+        expected = {case_id for case_id in expected if case_id in registry_ids}
         if not expected:
             continue
-        ids = _rank_ids(service, str(item["query"]), limit, mode)
+        query = str(item["query"])
+        pool_limit = max(limit, 100)
+        pool_cases = _rank_cases(service, query, pool_limit, mode)
+        cases = pool_cases[:limit]
+        ids = [str(case.get("case_id") or "") for case in cases]
+        pool_ids = [str(case.get("case_id") or "") for case in pool_cases]
         rank = first_relevant_rank(ids, expected)
+        pool_rank = first_relevant_rank(pool_ids, expected)
         rows.append(
             {
                 "row": item["row"],
@@ -167,6 +204,10 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
                 "expected": sorted(expected),
                 "top": ids,
                 "rank": rank,
+                "candidate_pool_rank": pool_rank,
+                "similarity_reason_classes": [case.get("similarity_reason_class", "") for case in cases[:10]],
+                "cost_usable_at_5": _cost_usable_count(cases, 5),
+                "trusted_evidence_at_5": _trusted_evidence_count(cases, 5),
             }
         )
 
@@ -175,6 +216,8 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
     for k in (1, 3, 5, 10):
         capped_k = min(k, limit)
         metrics[f"hit_at_{k}"] = sum(1 for row in rows if row["rank"] and row["rank"] <= capped_k) / count
+    for k in (50, 100):
+        metrics[f"candidate_recall_at_{k}"] = sum(1 for row in rows if row["candidate_pool_rank"] and row["candidate_pool_rank"] <= k) / count
     metrics["mrr"] = sum((1 / row["rank"]) if row["rank"] else 0.0 for row in rows) / count
     for k in (5, 10):
         capped_k = min(k, limit)
@@ -186,6 +229,8 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
             / count
         )
         metrics[f"ndcg_at_{k}"] = sum(ndcg_at(row["top"], set(row["expected"]), capped_k) for row in rows) / count
+    metrics["cost_usable_at_5"] = sum(row["cost_usable_at_5"] for row in rows) / (count * min(5, limit))
+    metrics["trusted_evidence_at_5"] = sum(row["trusted_evidence_at_5"] for row in rows) / (count * min(5, limit))
 
     return {
         "ground_truth": str(ground_truth_path),
@@ -193,9 +238,12 @@ def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bo
         "limit": limit,
         "mode": mode,
         "expand_base_case_ids": expand_base_ids,
+        "max_case_number": max_case_number,
+        "registry_case_count": len(registry_ids),
         "seconds": round(time.time() - started, 2),
         "metrics": {key: round(value, 4) for key, value in metrics.items()},
         "misses_top10": [row for row in rows if not row["rank"] or row["rank"] > 10],
+        "misses_candidate_pool_top100": [row for row in rows if not row["candidate_pool_rank"] or row["candidate_pool_rank"] > 100],
         "rank_gt5": [row for row in rows if row["rank"] and row["rank"] > 5],
         "rows": rows,
     }
@@ -222,6 +270,12 @@ def main() -> None:
     parser.add_argument("--disable-vectors", action="store_true", help="Deprecated alias for --mode fallback")
     parser.add_argument("--no-expand-base-case-ids", action="store_true", help="Do not expand MP-123 to MP-123.* variants")
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument(
+        "--max-case-number",
+        type=int,
+        default=0,
+        help="Evaluate against a temporal registry slice, e.g. 918 for the current ground-truth workbook",
+    )
     args = parser.parse_args()
 
     report = evaluate(
@@ -229,6 +283,7 @@ def main() -> None:
         limit=args.limit,
         mode="fallback" if args.disable_vectors else args.mode,
         expand_base_ids=not args.no_expand_base_case_ids,
+        max_case_number=args.max_case_number,
     )
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)

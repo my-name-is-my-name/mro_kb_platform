@@ -52,9 +52,11 @@ Offline case profile:
   "work_type": "",
   "defect_type": "",
   "aircraft_type_metadata": "",
+  "ata": [],
   "components": [],
   "zones": [],
   "identifiers": [],
+  "authority_path": [],
   "action_required": "",
   "constraints_or_risks": [],
   "search_terms_ru_en": [],
@@ -99,9 +101,17 @@ Runtime behavior:
 
 1. If profile index is missing/stale, the service continues with current hybrid retrieval.
 2. `/api/health` reports profile status and warnings.
-3. Profile retrieval is not enabled by default until metrics justify it.
-4. Query profile generation is optional and must be controlled by an explicit environment flag.
-5. Exact and lexical retrieval remain active as safety net.
+3. Offline LLM profiles must pass a quality gate before they are cached.
+4. Profile-vector retrieval is not enabled by default until metrics justify it.
+5. Runtime fallback profiles are weak regex/field profiles only; they do not use hand-written query aliases.
+6. Exact and lexical retrieval remain active as safety net.
+
+Quality gate rejects profiles with:
+
+- placeholder summaries such as `...`;
+- confidence below `0.4`;
+- source path/OCR plumbing noise such as `converted`, `pdf`, `ocr`, `page`, `.md`;
+- too little structured signal.
 
 Implemented command surface:
 
@@ -136,6 +146,10 @@ Metrics:
 - Recall@5;
 - nDCG@5;
 - nDCG@10.
+- candidate Recall@50;
+- candidate Recall@100;
+- CostUsable@5;
+- TrustedEvidence@5.
 
 Compare modes on the same 87-query benchmark:
 

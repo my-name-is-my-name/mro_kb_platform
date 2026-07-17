@@ -209,17 +209,40 @@ Evidence не участвует в similarity score.
 
 Fallback lexical/exact без свежих embeddings ожидаемо слабее. Его задача - не заменить semantic search, а сохранить работоспособность и exact-identifier retrieval при stale/missing embedding index.
 
-## LLM Case Profiles
+## MRO Case Profiles
 
-LLM-профили являются экспериментальным улучшением, а не заменой текущего hybrid retrieval.
+MRO-профили становятся основным структурным слоем поверх текущего hybrid retrieval.
+Если полный профиль еще не построен LLM offline-процессом, runtime строит слабый fallback-профиль из production-текста заявки: точные identifiers, ATA и зоны извлекаются regex-паттернами, а компоненты/дефекты не подставляются словарями.
 
 Идея:
 
 - offline строить компактный JSON-профиль каждой заявки из production-источников;
-- online строить такой же JSON-профиль пользовательского запроса;
+- online строить слабый технический профиль пользовательского запроса без выбора `case_id`;
 - сравнивать одинаковые структурные поля, а не длинный сырой OCR;
 - оставить lexical/exact retrieval как safety net.
 
 Профиль не должен содержать правильный `case_id` для запроса, ручные aliases или исправления под benchmark. Он должен извлекать только наблюдаемые признаки: дефект, компонент, зону, действие, ограничения, идентификаторы и двуязычные поисковые термины.
 
+Минимальные поля профиля:
+
+- `work_type`;
+- `defect_type`;
+- `ata`;
+- `components`;
+- `zones`;
+- `identifiers`;
+- `authority_path`;
+- `action_required`;
+- `constraints_or_risks`;
+- `search_terms_ru_en`.
+
 Тип ВС в профиле допускается как отдельное metadata/check поле. Он сохраняется в `metadata_text`, но отделяется от основного profile `search_text`, чтобы быть доступным для проверки и tie-breaker, не становясь самостоятельным главным retrieval-сигналом.
+
+Offline LLM-профиль записывается в cache только если проходит quality gate. Профили с `...`, низкой уверенностью, path/OCR-noise или недостаточным структурным сигналом попадают в failures и не индексируются.
+
+Финальная выдача дополнительно содержит:
+
+- `structured_score`;
+- `similarity_reason_class`: `same_identifier`, `same_component_defect_zone`, `same_component_defect`, `same_work_type`, `commercially_similar`, `weak_analog`;
+- `go_no_go`: подсказки по рискам и недостающим данным, не финальное решение;
+- `cost_readiness`: пригодность найденного аналога как comparable для будущей оценки стоимости, не расчет цены.

@@ -101,6 +101,49 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
         self.assertIn("AMOC", self.service._extra_search_texts.get("MP-0861", ""))
         self.assertIn("FR 35", self.service._extra_search_texts.get("MP-0842", ""))
 
+    def test_similar_cases_exposes_structured_mro_decision_hints(self) -> None:
+        result = self.service.similar_cases("Замена огнетушителей", limit=3)
+        first = result["similar_cases"][0]
+
+        self.assertEqual(first["case_id"], "MP-0172.2")
+        self.assertIn("similarity_reason_class", first)
+        self.assertGreaterEqual(first["structured_score"], 0.0)
+        self.assertIn("recommended_action", first["go_no_go"])
+        self.assertIn("usable_for_estimate", first["cost_readiness"])
+
+    def test_fallback_profile_extracts_mro_fields(self) -> None:
+        profile = self.service._query_profile("AMOC AD 2024-1234 трещина FR 35 стойки шасси")
+
+        self.assertEqual(profile["work_type"], "other")
+        self.assertEqual(profile["defect_type"], "unknown")
+        self.assertEqual(profile["components"], [])
+        self.assertTrue(profile["zones"])
+        self.assertLess(profile["confidence"], 0.4)
+
+    def test_bad_llm_profile_fails_quality_gate(self) -> None:
+        profile = self.service._normalize_case_profile(
+            {
+                "problem_summary": "...",
+                "work_type": "...",
+                "defect_type": "unknown",
+                "search_terms_ru_en": ["converted", "pdf", "ocr", "page"],
+                "confidence": 0.0,
+            }
+        )
+
+        errors = self.service._profile_quality_errors(profile)
+
+        self.assertIn("empty_or_placeholder_summary", errors)
+        self.assertIn("confidence_below_0_4", errors)
+        self.assertIn("not_enough_structured_signal", errors)
+
+    def test_profile_source_text_strips_paths(self) -> None:
+        cleaned = self.service._clean_profile_source_fragment("path: converted_md_pdf_ocr/000-100/МР-040/file.md\\nЗапрос: Замена печек")
+
+        self.assertNotIn("converted_md_pdf_ocr", cleaned)
+        self.assertNotIn(".md", cleaned)
+        self.assertIn("Запрос", cleaned)
+
 
 if __name__ == "__main__":
     unittest.main()
