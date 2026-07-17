@@ -569,15 +569,6 @@ class RetrievalService:
         appendix = f"{suffix}\n\n{self._sources_table(sources)}" if suffix else self._sources_table(sources)
         return f"{answer}\n\n{appendix}"
 
-    @staticmethod
-    def _score_from_source(source: dict[str, object]) -> float:
-        descriptor = source.get("source_descriptor") or {}
-        value = descriptor.get("rerank_score")
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
     def _sources_table(self, sources: list[dict[str, object]]) -> str:
         rows = [
             "### Источники",

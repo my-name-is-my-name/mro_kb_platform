@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.config import ensure_runtime_dirs
+from core.commercial_offers import CommercialOffersService
 from core.retrieval.service import RetrievalService
 from ingest.mro_docs.import_documents import import_mro_documents
 from ingest.publish_obsidian.publish import publish_obsidian_vault
@@ -26,6 +27,7 @@ class RuntimeServices:
         self.store = SQLiteStore(self.paths.sqlite_path)
         self.store.initialize()
         self.retrieval = RetrievalService(self.store)
+        self.commercial_offers = CommercialOffersService()
 
     def run_ingest(self) -> dict[str, object]:
         demo_root = self.paths.mro_rag_root / "apps" / "webapp" / "demo_data"
@@ -72,12 +74,25 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 "object": "model",
                                 "created": now,
                                 "owned_by": "local",
+                            },
+                            {
+                                "id": "mro-similar-cases",
+                                "object": "model",
+                                "created": now,
+                                "owned_by": "local",
                             }
                         ],
                     }
                 )
             if parsed.path == "/api/health":
-                return self._send_json({"ok": True, "stats": SERVICES.store.stats(), "components": SERVICES.retrieval.health()})
+                return self._send_json(
+                    {
+                        "ok": True,
+                        "stats": SERVICES.store.stats(),
+                        "components": SERVICES.retrieval.health(),
+                        "commercial_offers": SERVICES.commercial_offers.health(),
+                    }
+                )
             if parsed.path == "/api/cases":
                 return self._send_json({"ok": True, "cases": SERVICES.store.fetch_cases()})
             if parsed.path.startswith("/api/cases/"):
@@ -112,7 +127,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8"))
             if parsed.path == "/v1/chat/completions":
                 model = str(payload.get("model") or "").strip()
-                if model != "mro-kb":
+                if model not in {"mro-kb", "mro-similar-cases"}:
                     return self._send_json({"error": {"message": f"Unknown model: {model}", "type": "invalid_request_error"}}, status=404)
                 messages = payload.get("messages") or []
                 question = ""
@@ -124,13 +139,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 break
                 if not question:
                     return self._send_json({"error": {"message": "User message is required", "type": "invalid_request_error"}}, status=400)
-                result = SERVICES.retrieval.chat(question)
+                if model == "mro-similar-cases":
+                    result = SERVICES.commercial_offers.similar_cases(question)
+                else:
+                    result = SERVICES.retrieval.chat(question)
                 return self._send_json(
                     {
                         "id": f"chatcmpl-{uuid.uuid4().hex}",
                         "object": "chat.completion",
                         "created": int(time.time()),
-                        "model": "mro-kb",
+                        "model": model,
                         "choices": [
                             {
                                 "index": 0,
@@ -160,6 +178,12 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MRO KB Platform API")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="serve",
+        choices=["serve", "reindex-com-offers", "reindex-com-offers-status", "rebuild-com-offers-manifest"],
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8120)
     return parser
@@ -168,6 +192,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.command == "rebuild-com-offers-manifest":
+        result = SERVICES.commercial_offers.rebuild_converted_markdown_manifest()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "reindex-com-offers":
+        result = SERVICES.commercial_offers.reindex_case_vectors()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "reindex-com-offers-status":
+        result = SERVICES.commercial_offers.reindex_status()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     server = ThreadingHTTPServer((args.host, args.port), RequestHandler)
     print(f"MRO KB API started at http://{args.host}:{args.port}")
     try:

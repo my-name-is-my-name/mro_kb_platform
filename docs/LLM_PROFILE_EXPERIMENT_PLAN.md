@@ -1,0 +1,144 @@
+# LLM Case Profile Experiment
+
+## Goal
+
+Test whether Qwen-generated structured case profiles improve `mro-similar-cases` quality over the current hybrid pipeline.
+
+The experiment must be data-driven:
+
+- no query-specific mappings;
+- no benchmark answers in runtime;
+- no hand-written synonym or case-form dictionaries;
+- no aircraft type as a retrieval factor.
+
+## Current Pipeline
+
+Current retrieval compares a user query with case-card text assembled from:
+
+- `case_registry.csv`;
+- `Reestr_zayavok.xlsm`;
+- converted Markdown manifest;
+- exact engineering identifiers.
+
+Signals:
+
+- semantic embeddings over case-card text;
+- lexical/BM25-like scoring;
+- exact identifier matching;
+- optional GPU reranker.
+
+Strengths:
+
+- transparent;
+- fast after embeddings are built;
+- robust for exact terms like `RIB 5`, `FR35.3`, `AD`, `P/N`, `MSN`;
+- easy to audit.
+
+Weaknesses:
+
+- short Russian queries often do not overlap enough with long English/OCR descriptions;
+- raw converted Markdown can be too verbose for embeddings;
+- semantically important distinctions can be buried in procedure/drawing text.
+
+## Profile Pipeline Hypothesis
+
+Instead of embedding raw case-card text, build compact profiles in a shared schema.
+
+Offline case profile:
+
+```json
+{
+  "problem_summary": "",
+  "work_type": "",
+  "defect_type": "",
+  "components": [],
+  "zones": [],
+  "identifiers": [],
+  "action_required": "",
+  "constraints_or_risks": [],
+  "search_terms_ru_en": [],
+  "evidence_fields": []
+}
+```
+
+Online query profile uses the same schema, but must not produce or request target case IDs.
+
+Expected benefit:
+
+- compare defect/component/zone/action fields directly;
+- reduce OCR noise before embedding;
+- make Russian short queries and English source text closer in representation.
+
+Expected risk:
+
+- LLM may omit rare identifiers;
+- LLM may normalize away important exact details;
+- profile generation can be slow and must run offline/background;
+- incorrect profiles can make ranking worse while looking plausible.
+
+## Architecture
+
+Planned artifacts:
+
+- `data_runtime/com_offers_case_profiles.jsonl`
+- optional `data_runtime/com_offers_case_profile_vectors.json`
+- profile progress/status JSON, equivalent to reindex progress.
+
+Planned commands:
+
+- `build-com-offer-profiles`: generate or refresh profiles in background/resumable mode;
+- `build-com-offer-profile-vectors`: embed profile search text;
+- evaluation flag to compare profile-only and hybrid+profile modes.
+
+Runtime behavior:
+
+1. If profile index is missing/stale, the service continues with current hybrid retrieval.
+2. `/api/health` reports profile status and warnings.
+3. Query profile generation is optional and controlled by an explicit environment flag.
+4. Exact and lexical retrieval remain active as safety net.
+
+## Evaluation
+
+Use only benchmark data from:
+
+- `com_offers/tests/ground truth.xlsx`
+
+Metrics:
+
+- Hit@1;
+- Hit@3;
+- Hit@5;
+- Hit@10;
+- MRR;
+- Precision@5;
+- Recall@5;
+- nDCG@5;
+- nDCG@10.
+
+Compare modes on the same 87-query benchmark:
+
+- lexical/exact fallback;
+- semantic-only;
+- lexical-only;
+- current hybrid;
+- profile semantic-only;
+- hybrid + profile;
+- hybrid + profile + reranker.
+
+Acceptance for enabling profile retrieval by default:
+
+- Hit@5 improves by at least 0.05 over current hybrid baseline;
+- Hit@10 does not regress;
+- exact identifier queries do not regress;
+- ambiguous documents are still not treated as trusted evidence;
+- median latency remains acceptable for OpenWebUI after profiles are prebuilt.
+
+## Baseline Checkpoint
+
+Current measured baseline before profile retrieval:
+
+- fallback + `Reestr_zayavok`: Hit@5 `0.644`, Hit@10 `0.678`;
+- partial semantic min-max hybrid before Reestr reindex: Hit@5 `0.690`, Hit@10 `0.747`;
+- reranker not yet included in these metrics.
+
+Before enabling the profile path, rebuild embeddings with Reestr enrichment and record fresh current-hybrid metrics.
