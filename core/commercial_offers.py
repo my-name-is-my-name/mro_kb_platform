@@ -2559,48 +2559,87 @@ class CommercialOffersService:
         lines = [f"Описание для поиска аналогов: {query.strip()}", ""]
         if not cases:
             lines.append("Похожие коммерческие заявки не найдены.")
-            lines.append("")
-            lines.append("Это поиск аналогов, не расчет цены и не финальное решение брать/не брать.")
             return "\n".join(lines)
-        lines.append("| Заявка | Класс аналога | Заказчик | ВС | Статус | Описание | Почему похожа | Что проверить | Cost-ready | Документы |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        lines.append("| Заявка | Описание | Почему похожа | Что проверить | Cost | Документы |")
+        lines.append("|---|---|---|---|---|---|")
         for case in cases:
             docs = case.get("documents") if isinstance(case.get("documents"), list) else []
-            doc_links = []
+            doc_links: list[str] = []
             for doc in docs[:2]:
-                title = str(doc.get("document_id") or doc.get("snippet") or "нет документа")
-                link = str(doc.get("link") or "")
+                if doc.get("source_type") != "commercial_offer_document":
+                    warning = str(doc.get("quality_warning") or doc.get("snippet") or "документ не подтвержден")
+                    doc_links.append(self._markdown_cell(warning))
+                    continue
+                title = str(doc.get("document_id") or doc.get("path") or "документ")
+                link = self._document_link(doc)
                 status = str(doc.get("link_status") or "")
                 warning = str(doc.get("quality_warning") or "")
-                label = title
+                label = self._short_document_title(title)
                 if status:
                     label = f"{label} ({status})"
                 if warning:
                     label = f"{label}: {warning}"
-                doc_links.append(f"[{label}]({link})" if link else label)
-            description = normalize_spaces(str(case.get("request_description") or ""))[:180].replace("|", "\\|")
-            reasons = "; ".join(str(reason) for reason in case.get("reasons", [])[:8]).replace("|", "\\|")
-            checks = "; ".join(str(item) for item in case.get("check", [])[:4]).replace("|", "\\|")
+                doc_links.append(f"[{self._markdown_cell(label)}]({link})" if link else self._markdown_cell(label))
+            meta = [
+                str(case.get("case_id", "")),
+                str(case.get("similarity_reason_class", "")),
+            ]
+            if case.get("customer"):
+                meta.append(str(case.get("customer")))
+            if case.get("aircraft_type"):
+                meta.append(str(case.get("aircraft_type")))
+            if case.get("status_normalized"):
+                meta.append(str(case.get("status_normalized")))
+            description = self._markdown_cell(normalize_spaces(str(case.get("request_description") or ""))[:260])
+            reasons = self._format_reasons(case.get("reasons", []))
+            checks = self._markdown_cell("; ".join(str(item) for item in case.get("check", [])[:3]))
             cost = case.get("cost_readiness") if isinstance(case.get("cost_readiness"), dict) else {}
             cost_label = "да" if cost.get("usable_for_estimate") else "нет"
             lines.append(
-                f"| {case.get('case_id', '')} | {case.get('similarity_reason_class', '')} | {case.get('customer', '')} | "
-                f"{case.get('aircraft_type', '')} | {case.get('status_normalized', '')} | {description} | {reasons} | "
+                f"| {self._markdown_cell('<br>'.join(meta))} | {description} | {reasons} | "
                 f"{checks} | {cost_label} | {'<br>'.join(doc_links)} |"
             )
-        lines.append("")
-        lines.append("Предупреждения по качеству источников:")
-        warnings = sorted({str(w) for case in cases for w in case.get("quality_warnings", []) if w})
-        if warnings:
-            for warning in warnings:
-                lines.append(f"- {warning}")
-        else:
-            lines.append("- Документные связи без специальных предупреждений.")
-        lines.append("")
-        lines.append("Это поиск аналогов, не расчет цены и не финальное решение брать/не брать.")
-        lines.append("")
-        lines.append(self._sources_table(sources))
         return "\n".join(lines)
+
+    @staticmethod
+    def _markdown_cell(value: str) -> str:
+        return normalize_spaces(value).replace("|", "\\|")
+
+    @staticmethod
+    def _short_document_title(title: str) -> str:
+        value = normalize_spaces(title)
+        if "/" in value:
+            value = value.rsplit("/", 1)[-1]
+        return value[:90]
+
+    def _document_link(self, doc: dict[str, object]) -> str:
+        link = str(doc.get("link") or "")
+        if link.startswith(("http://", "https://", "file://")):
+            return link
+        path = str(doc.get("path") or link)
+        if not path:
+            return ""
+        candidate = Path(path)
+        if candidate.is_absolute():
+            return candidate.as_uri()
+        for base in (self.root, self.artifacts, WORKSPACE_ROOT):
+            resolved = base / path
+            if resolved.exists():
+                return resolved.as_uri()
+        return path
+
+    def _format_reasons(self, reasons_value: object) -> str:
+        reasons = [str(reason) for reason in reasons_value if str(reason).strip()] if isinstance(reasons_value, list) else []
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for reason in reasons:
+            text = re.sub(r"^по (?:исходному|расширенному) запросу:\s*", "", reason).strip()
+            text = text.replace("общий термин:", "термин:").replace("ключевое слово:", "ключ:")
+            if text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+        return self._markdown_cell("; ".join(cleaned[:10]))
 
     def _generate_answer(self, query: str, cases: list[dict[str, object]]) -> str:
         assert self._llm is not None

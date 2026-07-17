@@ -113,6 +113,52 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
         self.assertIn("recommended_action", first["go_no_go"])
         self.assertIn("usable_for_estimate", first["cost_readiness"])
 
+    def test_answer_format_keeps_documents_inline_without_sources_table(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".md") as handle:
+            answer = self.service._build_answer(
+                "Коррозия Gear Rib5",
+                [
+                    {
+                        "case_id": "MP-0429",
+                        "similarity_reason_class": "same_identifier",
+                        "customer": "АК Россия",
+                        "aircraft_type": "A319",
+                        "status_normalized": "accepted",
+                        "request_description": "Ремонт коррозии RIB 5 LH и RIB 5 RH",
+                        "reasons": [
+                            "по исходному запросу: общий термин: коррозия",
+                            "по исходному запросу: ключевое слово: коррозия",
+                            "по исходному запросу: точный термин: RIB5",
+                        ],
+                        "check": ["сверить фактическую зону повреждения"],
+                        "cost_readiness": {"usable_for_estimate": True},
+                        "documents": [
+                            {
+                                "source_type": "commercial_offer_document",
+                                "document_id": "МР-429-SDM-A319-LH-RH_Wing_RIB_5_-_corrosion",
+                                "path": handle.name,
+                                "link": "",
+                                "link_status": "matched",
+                                "quality_warning": "",
+                            }
+                        ],
+                    }
+                ],
+                sources=[
+                    {
+                        "source_descriptor": {"case_id": "MP-0429", "document_id": "doc", "link": handle.name},
+                        "snippet": "duplicate source table should not be rendered",
+                    }
+                ],
+            )
+
+        self.assertIn("| Заявка | Описание | Почему похожа | Что проверить | Cost | Документы |", answer)
+        self.assertIn("file://", answer)
+        self.assertIn("точный термин: RIB5", answer)
+        self.assertNotIn("### Источники", answer)
+        self.assertNotIn("Предупреждения по качеству источников", answer)
+        self.assertNotIn("Это поиск аналогов", answer)
+
     def test_fallback_profile_extracts_mro_fields(self) -> None:
         profile = self.service._query_profile("AMOC AD 2024-1234 трещина FR 35 стойки шасси")
 
