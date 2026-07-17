@@ -189,6 +189,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "rebuild-com-offers-manifest",
             "build-com-offer-profiles",
             "com-offer-profiles-status",
+            "reindex-com-offer-profile-vectors",
+            "com-offer-profile-vectors-status",
         ],
     )
     parser.add_argument("--host", default="127.0.0.1")
@@ -219,6 +221,14 @@ def main() -> None:
         return
     if args.command == "com-offer-profiles-status":
         result = SERVICES.commercial_offers.case_profiles_status()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "reindex-com-offer-profile-vectors":
+        result = SERVICES.commercial_offers.reindex_case_profile_vectors()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "com-offer-profile-vectors-status":
+        result = SERVICES.commercial_offers.case_profile_vectors_status()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     server = ThreadingHTTPServer((args.host, args.port), RequestHandler)

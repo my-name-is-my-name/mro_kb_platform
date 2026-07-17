@@ -91,7 +91,8 @@ Planned commands:
 
 - `build-com-offer-profiles`: generate or refresh profiles in resumable mode;
 - `com-offer-profiles-status`: inspect progress/cache status;
-- future `build-com-offer-profile-vectors`: embed profile search text;
+- `reindex-com-offer-profile-vectors`: embed profile search text;
+- `com-offer-profile-vectors-status`: inspect profile vector progress/cache status;
 - evaluation flag to compare profile-only and hybrid+profile modes.
 
 Runtime behavior:
@@ -107,12 +108,16 @@ Implemented command surface:
 ```bash
 MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles --limit 5
 python3 -m apps.api.server com-offer-profiles-status
+python3 -m apps.api.server reindex-com-offer-profile-vectors
+python3 -m apps.api.server com-offer-profile-vectors-status
 ```
 
 Implemented artifacts:
 
 - `data_runtime/com_offers_case_profiles.jsonl`;
-- `data_runtime/com_offers_case_profile_progress.json`.
+- `data_runtime/com_offers_case_profile_progress.json`;
+- `data_runtime/com_offers_case_profile_vectors.json`;
+- `data_runtime/com_offers_case_profile_vector_progress.json`.
 
 ## Evaluation
 
@@ -141,6 +146,16 @@ Compare modes on the same 87-query benchmark:
 - profile semantic-only;
 - hybrid + profile;
 - hybrid + profile + reranker.
+
+Current evaluation command surface:
+
+```bash
+python3 tools/evaluate_com_offers_ground_truth.py --mode fallback
+python3 tools/evaluate_com_offers_ground_truth.py --mode lexical
+python3 tools/evaluate_com_offers_ground_truth.py --mode semantic
+python3 tools/evaluate_com_offers_ground_truth.py --mode profile
+MRO_KB_PROFILE_SEARCH_ENABLED=1 python3 tools/evaluate_com_offers_ground_truth.py --mode hybrid-profile
+```
 
 Acceptance for enabling profile retrieval by default:
 

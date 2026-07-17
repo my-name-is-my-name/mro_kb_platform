@@ -152,6 +152,34 @@ python3 -m apps.api.server com-offer-profiles-status
 
 The profile builder uses only production sources already loaded into the case card. It does not read benchmark answers.
 
+Build profile embeddings after profiles exist:
+
+```bash
+python3 -m apps.api.server reindex-com-offer-profile-vectors
+```
+
+Check profile embedding status:
+
+```bash
+python3 -m apps.api.server com-offer-profile-vectors-status
+```
+
+Profile retrieval is disabled by default. Enable it only for controlled tests:
+
+```bash
+export MRO_KB_PROFILE_SEARCH_ENABLED=1
+```
+
+Evaluate modes independently:
+
+```bash
+python3 tools/evaluate_com_offers_ground_truth.py --mode fallback
+python3 tools/evaluate_com_offers_ground_truth.py --mode lexical
+python3 tools/evaluate_com_offers_ground_truth.py --mode semantic
+python3 tools/evaluate_com_offers_ground_truth.py --mode profile
+MRO_KB_PROFILE_SEARCH_ENABLED=1 python3 tools/evaluate_com_offers_ground_truth.py --mode hybrid-profile
+```
+
 ## Ingest `mro-kb`
 
 Use this when the MRO_RAG source data changes:

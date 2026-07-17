@@ -89,6 +89,8 @@ python3 -m apps.api.server reindex-com-offers
 ```bash
 MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles --limit 5
 python3 -m apps.api.server com-offer-profiles-status
+python3 -m apps.api.server reindex-com-offer-profile-vectors
+python3 -m apps.api.server com-offer-profile-vectors-status
 ```
 
 `POST /api/ingest/run` ingests the `mro-kb` document corpus from `MRO_RAG` into SQLite and publishes Obsidian notes:

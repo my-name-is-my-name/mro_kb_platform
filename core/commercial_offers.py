@@ -81,6 +81,7 @@ EXACT_PATTERNS = (ATA_RE, RIB_RE, FRAME_RE, STGR_RE, PART_RE, MSN_RE, REG_RE, AD
 CONVERTED_MARKDOWN_SCHEMA_VERSION = 1
 CASE_PROFILE_SCHEMA_VERSION = 1
 CASE_PROFILE_PROMPT_VERSION = 1
+CASE_PROFILE_VECTOR_SCHEMA_VERSION = 1
 CONVERTED_MARKDOWN_EXCLUDED_PARTS = {
     "archive",
     "archives",
@@ -160,6 +161,8 @@ class CommercialOffersService:
         reindex_progress_path: Path = DATA_RUNTIME_ROOT / "com_offers_reindex_progress.json",
         case_profile_cache_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profiles.jsonl",
         case_profile_progress_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profile_progress.json",
+        case_profile_vector_cache_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profile_vectors.json",
+        case_profile_vector_progress_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profile_vector_progress.json",
     ) -> None:
         self.root = root
         self.artifacts = root / "pilot_artifacts"
@@ -172,9 +175,12 @@ class CommercialOffersService:
         self.reindex_progress_path = reindex_progress_path
         self.case_profile_cache_path = case_profile_cache_path
         self.case_profile_progress_path = case_profile_progress_path
+        self.case_profile_vector_cache_path = case_profile_vector_cache_path
+        self.case_profile_vector_progress_path = case_profile_vector_progress_path
         self.embedding_url = os.getenv("MRO_KB_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
         self.embedding_model = os.getenv("MRO_KB_EMBEDDING_MODEL", "bge-m3:latest")
         self.query_rewrite_enabled = os.getenv("MRO_KB_QUERY_REWRITE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.profile_search_enabled = os.getenv("MRO_KB_PROFILE_SEARCH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         self.settings = RuntimeSettings()
         self._reranker = ExternalReranker(self.settings.reranker_url, batch_size=self.settings.reranker_batch_size) if (
             self.settings.reranker_enabled and self.settings.reranker_url
@@ -188,12 +194,15 @@ class CommercialOffersService:
         self._extra_search_texts, self._converted_markdown_status = self._read_converted_markdown_manifest()
         self._vectors, self._index_status = self._read_vector_cache()
         self._case_profiles, self._case_profile_status = self._read_case_profile_cache()
+        self._case_profile_vectors, self._case_profile_vector_status = self._read_case_profile_vector_cache()
         self._doc_frequency = self._build_doc_frequency()
 
     def health(self) -> dict[str, object]:
         warnings = list(self._index_status.get("warnings") or [])
         warnings.extend(self._converted_markdown_status.get("warnings") or [])
         warnings.extend(self._reestr_status.get("warnings") or [])
+        warnings.extend(self._case_profile_status.get("warnings") or [])
+        warnings.extend(self._case_profile_vector_status.get("warnings") or [])
         return {
             "cases": len(self._registry),
             "linked_cases": len(self._links),
@@ -230,6 +239,7 @@ class CommercialOffersService:
             },
             "case_profiles": {
                 "experimental": True,
+                "search_enabled": self.profile_search_enabled,
                 "ready": bool(self._case_profiles) and not bool(self._case_profile_status.get("stale")),
                 "count": len(self._case_profiles),
                 "expected_cases": len(self._registry),
@@ -241,6 +251,20 @@ class CommercialOffersService:
                 "schema_version": CASE_PROFILE_SCHEMA_VERSION,
                 "created_at": self._case_profile_status.get("created_at", ""),
                 "warnings": self._case_profile_status.get("warnings", []),
+            },
+            "case_profile_embeddings": {
+                "experimental": True,
+                "ready": bool(self._case_profile_vectors) and not bool(self._case_profile_vector_status.get("stale")),
+                "count": len(self._case_profile_vectors),
+                "expected_profiles": len(self._case_profiles),
+                "stale": bool(self._case_profile_vector_status.get("stale")),
+                "partial": bool(self._case_profile_vector_status.get("partial")),
+                "missing_count": self._case_profile_vector_status.get("missing_count", 0),
+                "cache": str(self.case_profile_vector_cache_path),
+                "model": self.embedding_model,
+                "schema_version": CASE_PROFILE_VECTOR_SCHEMA_VERSION,
+                "created_at": self._case_profile_vector_status.get("created_at", ""),
+                "warnings": self._case_profile_vector_status.get("warnings", []),
             },
             "warnings": warnings,
             "reranker": self._reranker.health() if self._reranker is not None else {"ok": False, "disabled": True},
@@ -376,6 +400,126 @@ class CommercialOffersService:
             "partial": bool(self._case_profile_status.get("partial")),
             "missing_count": self._case_profile_status.get("missing_count", 0),
             "warnings": self._case_profile_status.get("warnings", []),
+        }
+        return progress
+
+    def reindex_case_profile_vectors(self) -> dict[str, object]:
+        if not self._case_profiles:
+            raise RuntimeError("No commercial offer profiles found; run build-com-offer-profiles first")
+        expected_hashes = {
+            case_id: self._text_hash(str(item.get("search_text") or ""))
+            for case_id, item in self._case_profiles.items()
+            if str(item.get("search_text") or "").strip()
+        }
+        vectors = self._load_reusable_case_profile_vectors(expected_hashes)
+        failures: list[str] = []
+        started = time.time()
+        reused_count = len(vectors)
+        built_count = 0
+        total = len(expected_hashes)
+        self._write_case_profile_vector_progress(
+            {
+                "status": "running",
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "total": total,
+                "done": reused_count,
+                "reused": reused_count,
+                "built": 0,
+                "failure_count": 0,
+                "failures": [],
+                "current_case_id": "",
+                "cache": str(self.case_profile_vector_cache_path),
+                "model": self.embedding_model,
+                "schema_version": CASE_PROFILE_VECTOR_SCHEMA_VERSION,
+            }
+        )
+        for index, case_id in enumerate(sorted(expected_hashes), start=1):
+            profile_item = self._case_profiles.get(case_id, {})
+            text = str(profile_item.get("search_text") or "")
+            text_hash = expected_hashes[case_id]
+            if case_id in vectors and vectors[case_id].get("text_hash") == text_hash:
+                continue
+            vector = self._embed_text(text)
+            if vector:
+                vectors[case_id] = {
+                    "text_hash": text_hash,
+                    "terms": exact_terms(text),
+                    "vector": vector,
+                }
+                built_count += 1
+            else:
+                failures.append(case_id)
+            if index % 10 == 0 or index == total or case_id in failures:
+                self._write_case_profile_vectors(vectors)
+                self._write_case_profile_vector_progress(
+                    {
+                        "status": "running",
+                        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "total": total,
+                        "done": len(vectors),
+                        "reused": reused_count,
+                        "built": built_count,
+                        "failure_count": len(failures),
+                        "failures": failures[-20:],
+                        "current_case_id": case_id,
+                        "cache": str(self.case_profile_vector_cache_path),
+                        "model": self.embedding_model,
+                        "schema_version": CASE_PROFILE_VECTOR_SCHEMA_VERSION,
+                    }
+                )
+        self._write_case_profile_vectors(vectors)
+        self._case_profile_vectors, self._case_profile_vector_status = self._read_case_profile_vector_cache()
+        status = "complete" if len(vectors) == total and not failures else "partial"
+        self._write_case_profile_vector_progress(
+            {
+                "status": status,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "total": total,
+                "done": len(vectors),
+                "reused": reused_count,
+                "built": built_count,
+                "failure_count": len(failures),
+                "failures": failures[-50:],
+                "current_case_id": "",
+                "cache": str(self.case_profile_vector_cache_path),
+                "model": self.embedding_model,
+                "schema_version": CASE_PROFILE_VECTOR_SCHEMA_VERSION,
+                "seconds": round(time.time() - started, 2),
+            }
+        )
+        return {
+            "ok": True,
+            "status": status,
+            "profiles": total,
+            "vectors": len(vectors),
+            "reused": reused_count,
+            "built": built_count,
+            "failure_count": len(failures),
+            "failures": failures[:20],
+            "cache": str(self.case_profile_vector_cache_path),
+            "model": self.embedding_model,
+            "seconds": round(time.time() - started, 2),
+        }
+
+    def case_profile_vectors_status(self) -> dict[str, object]:
+        try:
+            progress = json.loads(self.case_profile_vector_progress_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            progress = {"status": "missing", "progress": str(self.case_profile_vector_progress_path)}
+        except (OSError, ValueError) as exc:
+            progress = {"status": "unreadable", "error": repr(exc), "progress": str(self.case_profile_vector_progress_path)}
+        progress["profile_vector_cache"] = {
+            "cache": str(self.case_profile_vector_cache_path),
+            "vectors": len(self._case_profile_vectors),
+            "created_at": self._case_profile_vector_status.get("created_at", ""),
+            "stale": bool(self._case_profile_vector_status.get("stale")),
+            "partial": bool(self._case_profile_vector_status.get("partial")),
+            "missing_count": self._case_profile_vector_status.get("missing_count", 0),
+            "warnings": self._case_profile_vector_status.get("warnings", []),
+            "model": self.embedding_model,
         }
         return progress
 
@@ -623,6 +767,89 @@ class CommercialOffersService:
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(self.case_profile_progress_path)
 
+    def _read_case_profile_vector_cache(self) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+        warnings: list[str] = []
+        status: dict[str, object] = {"stale": False, "warnings": warnings}
+        try:
+            payload = json.loads(self.case_profile_vector_cache_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}, status
+        except (OSError, ValueError) as exc:
+            warnings.append(f"commercial_offer_case_profile_vector_cache_unreadable: {exc}")
+            status["stale"] = True
+            return {}, status
+        status["created_at"] = payload.get("created_at", "")
+        if payload.get("schema_version") != CASE_PROFILE_VECTOR_SCHEMA_VERSION:
+            warnings.append("commercial_offer_case_profile_vector_schema_mismatch")
+            status["stale"] = True
+            return {}, status
+        if payload.get("model") != self.embedding_model:
+            warnings.append("commercial_offer_case_profile_vector_model_mismatch")
+            status["stale"] = True
+            return {}, status
+        vectors = payload.get("vectors")
+        if not isinstance(vectors, dict):
+            warnings.append("commercial_offer_case_profile_vector_cache_has_no_vectors")
+            status["stale"] = True
+            return {}, status
+        missing: list[str] = []
+        valid: dict[str, dict[str, object]] = {}
+        for case_id, profile_item in self._case_profiles.items():
+            text = str(profile_item.get("search_text") or "")
+            if not text.strip():
+                continue
+            item = vectors.get(case_id)
+            text_hash = self._text_hash(text)
+            if isinstance(item, dict) and item.get("text_hash") == text_hash and isinstance(item.get("vector"), list):
+                valid[case_id] = item
+            else:
+                missing.append(case_id)
+        if missing:
+            status["partial"] = bool(valid)
+            status["missing_count"] = len(missing)
+            status["missing_cases"] = missing[:50]
+            if not valid:
+                status["stale"] = True
+        return valid, status
+
+    def _load_reusable_case_profile_vectors(self, expected_hashes: dict[str, str]) -> dict[str, dict[str, object]]:
+        try:
+            payload = json.loads(self.case_profile_vector_cache_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            return {}
+        if payload.get("schema_version") != CASE_PROFILE_VECTOR_SCHEMA_VERSION or payload.get("model") != self.embedding_model:
+            return {}
+        vectors = payload.get("vectors")
+        if not isinstance(vectors, dict):
+            return {}
+        reusable: dict[str, dict[str, object]] = {}
+        for case_id, expected_hash in expected_hashes.items():
+            item = vectors.get(case_id)
+            if isinstance(item, dict) and item.get("text_hash") == expected_hash and isinstance(item.get("vector"), list):
+                reusable[case_id] = item
+        return reusable
+
+    def _write_case_profile_vectors(self, vectors: dict[str, dict[str, object]]) -> None:
+        payload = {
+            "schema_version": CASE_PROFILE_VECTOR_SCHEMA_VERSION,
+            "model": self.embedding_model,
+            "embedding_url": self.embedding_url,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "profile_cache": str(self.case_profile_cache_path),
+            "profile_count": len(self._case_profiles),
+            "vectors": vectors,
+        }
+        self.case_profile_vector_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.case_profile_vector_cache_path.with_suffix(self.case_profile_vector_cache_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(self.case_profile_vector_cache_path)
+
+    def _write_case_profile_vector_progress(self, payload: dict[str, object]) -> None:
+        self.case_profile_vector_progress_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.case_profile_vector_progress_path.with_suffix(self.case_profile_vector_progress_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(self.case_profile_vector_progress_path)
+
     def _case_profile_source_text(self, row: dict[str, str]) -> str:
         text = self._case_similarity_text(row)
         lines = []
@@ -850,6 +1077,7 @@ class CommercialOffersService:
                 "certificate_scope_flag": case.get("certificate_scope_flag", ""),
                 "score": float(item.get("score", 0.0)),
                 "semantic_score": float(item.get("semantic_score", 0.0)),
+                "profile_semantic_score": float(item.get("profile_semantic_score", 0.0)),
                 "lexical_score": float(item.get("lexical_score", 0.0)),
                 "exact_score": float(item.get("exact_score", 0.0)),
                 "rerank_score": float(item.get("rerank_score", 0.0)),
@@ -902,6 +1130,18 @@ class CommercialOffersService:
             "warnings": warnings,
             "llm_status": llm_status,
         }
+
+    def profile_semantic_cases(self, query: str, limit: int = 10) -> list[dict[str, object]]:
+        candidates = self._profile_semantic_candidate_cases(query, limit=limit)
+        return [
+            {
+                "case_id": item["case"].get("case_id", ""),
+                "score": float(item.get("score", 0.0)),
+                "reasons": item.get("reasons", []),
+                "profile_search_text": str(self._case_profiles.get(item["case"].get("case_id", ""), {}).get("search_text") or "")[:1200],
+            }
+            for item in candidates
+        ]
 
     def _rewrite_query(self, query: str) -> tuple[dict[str, object], list[str]]:
         empty = {
@@ -1400,6 +1640,8 @@ class CommercialOffersService:
                 "lexical": self._lexical_candidate_cases(query, limit=limit),
                 "exact": self._exact_candidate_cases(query, limit=limit),
             }
+            if self.profile_search_enabled:
+                source_results["profile_semantic"] = self._profile_semantic_candidate_cases(query, limit=limit)
             source_max: dict[str, float] = {}
             source_min: dict[str, float] = {}
             for source_name, items in source_results.items():
@@ -1410,6 +1652,7 @@ class CommercialOffersService:
                 ("semantic", source_results["semantic"]),
                 ("lexical", source_results["lexical"]),
                 ("exact", source_results["exact"]),
+                ("profile_semantic", source_results.get("profile_semantic", [])),
             ):
                 for item in items:
                     case = item["case"]
@@ -1422,6 +1665,7 @@ class CommercialOffersService:
                             "case": case,
                             "score": 0.0,
                             "semantic_score": 0.0,
+                            "profile_semantic_score": 0.0,
                             "lexical_score": 0.0,
                             "exact_score": 0.0,
                             "reasons": [],
@@ -1460,6 +1704,7 @@ class CommercialOffersService:
                 float(normalized_scores.get("semantic", 0.0))
                 + float(normalized_scores.get("lexical", 0.0))
                 + float(normalized_scores.get("exact", 0.0))
+                + (float(normalized_scores.get("profile_semantic", 0.0)) * 0.75 if self.profile_search_enabled else 0.0)
             )
             matched_queries = item.get("matched_queries") if isinstance(item.get("matched_queries"), list) else []
             score += min(len(matched_queries), 5) * 0.035
@@ -1593,6 +1838,34 @@ class CommercialOffersService:
             row_tokens = set(tokenize(self._case_similarity_text(row)))
             reasons = [f"общий термин: {token}" for token in sorted(query_tokens.intersection(row_tokens), key=lambda token: (-len(token), token))[:12]]
             candidates.append({"case": row, "score": score, "reasons": reasons, "semantic_score": score})
+        candidates.sort(key=lambda item: float(item["score"]), reverse=True)
+        return candidates[:limit]
+
+    def _profile_semantic_candidate_cases(self, query: str, limit: int) -> list[dict[str, object]]:
+        if not self._case_profile_vectors:
+            return []
+        query_vector = self._embed_text(strip_aircraft_terms(query))
+        if not query_vector:
+            return []
+        ignored_aircraft_tokens = aircraft_tokens(query)
+        query_tokens = {token for token in tokenize(query) if token.replace("-", "") not in ignored_aircraft_tokens}
+        candidates = []
+        for case_id, item in self._case_profile_vectors.items():
+            row = self._registry_by_case.get(case_id)
+            profile_item = self._case_profiles.get(case_id, {})
+            vector = item.get("vector") if isinstance(item, dict) else None
+            if not row or not isinstance(vector, list):
+                continue
+            score = self._cosine(query_vector, [float(value) for value in vector])
+            profile_text = str(profile_item.get("search_text") or "")
+            profile_tokens = set(tokenize(profile_text))
+            reasons = [
+                f"профиль: общий термин {token}"
+                for token in sorted(query_tokens.intersection(profile_tokens), key=lambda token: (-len(token), token))[:12]
+            ]
+            if not reasons:
+                reasons = ["профиль заявки близок по semantic embedding"]
+            candidates.append({"case": row, "score": score, "reasons": reasons, "profile_semantic_score": score})
         candidates.sort(key=lambda item: float(item["score"]), reverse=True)
         return candidates[:limit]
 

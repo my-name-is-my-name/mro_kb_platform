@@ -122,11 +122,33 @@ def ndcg_at(ids: list[str], expected: set[str], k: int) -> float:
     return dcg / ideal if ideal else 0.0
 
 
-def evaluate(ground_truth_path: Path, limit: int, disable_vectors: bool, expand_base_ids: bool) -> dict[str, Any]:
+def _rank_ids(service: CommercialOffersService, query: str, limit: int, mode: str) -> list[str]:
+    if mode == "hybrid":
+        result = service.similar_cases(query, limit=limit)
+        return [case["case_id"] for case in result.get("similar_cases", [])]
+    if mode == "fallback":
+        service._vectors = {}
+        service._case_profile_vectors = {}
+        result = service.similar_cases(query, limit=limit)
+        return [case["case_id"] for case in result.get("similar_cases", [])]
+    if mode == "lexical":
+        items = service._lexical_candidate_cases(query, limit=limit)
+        return [item["case"].get("case_id", "") for item in items]
+    if mode == "semantic":
+        items = service._semantic_candidate_cases(query, limit=limit)
+        return [item["case"].get("case_id", "") for item in items]
+    if mode == "profile":
+        return [item["case_id"] for item in service.profile_semantic_cases(query, limit=limit)]
+    if mode == "hybrid-profile":
+        service.profile_search_enabled = True
+        result = service.similar_cases(query, limit=limit)
+        return [case["case_id"] for case in result.get("similar_cases", [])]
+    raise ValueError(f"Unknown evaluation mode: {mode}")
+
+
+def evaluate(ground_truth_path: Path, limit: int, mode: str, expand_base_ids: bool) -> dict[str, Any]:
     service = CommercialOffersService()
     service._llm = None
-    if disable_vectors:
-        service._vectors = {}
     registry_ids = {row.get("case_id", "") for row in service._registry if row.get("case_id")}
     rows = []
     started = time.time()
@@ -136,8 +158,7 @@ def evaluate(ground_truth_path: Path, limit: int, disable_vectors: bool, expand_
             expected = expand_expected_ids(expected, registry_ids)
         if not expected:
             continue
-        result = service.similar_cases(str(item["query"]), limit=limit)
-        ids = [case["case_id"] for case in result.get("similar_cases", [])]
+        ids = _rank_ids(service, str(item["query"]), limit, mode)
         rank = first_relevant_rank(ids, expected)
         rows.append(
             {
@@ -170,7 +191,7 @@ def evaluate(ground_truth_path: Path, limit: int, disable_vectors: bool, expand_
         "ground_truth": str(ground_truth_path),
         "query_count": len(rows),
         "limit": limit,
-        "mode": "fallback_without_vectors" if disable_vectors else "service_loaded_vectors",
+        "mode": mode,
         "expand_base_case_ids": expand_base_ids,
         "seconds": round(time.time() - started, 2),
         "metrics": {key: round(value, 4) for key, value in metrics.items()},
@@ -192,7 +213,13 @@ def main() -> None:
         default=WORKSPACE_ROOT / "com_offers" / "tests" / "ground truth.xlsx",
     )
     parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--disable-vectors", action="store_true", help="Evaluate lexical/exact fallback only")
+    parser.add_argument(
+        "--mode",
+        choices=["hybrid", "fallback", "lexical", "semantic", "profile", "hybrid-profile"],
+        default="hybrid",
+        help="Retrieval mode to evaluate",
+    )
+    parser.add_argument("--disable-vectors", action="store_true", help="Deprecated alias for --mode fallback")
     parser.add_argument("--no-expand-base-case-ids", action="store_true", help="Do not expand MP-123 to MP-123.* variants")
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
@@ -200,7 +227,7 @@ def main() -> None:
     report = evaluate(
         ground_truth_path=args.ground_truth,
         limit=args.limit,
-        disable_vectors=args.disable_vectors,
+        mode="fallback" if args.disable_vectors else args.mode,
         expand_base_ids=not args.no_expand_base_case_ids,
     )
     if args.json_out:
