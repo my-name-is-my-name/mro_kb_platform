@@ -2788,12 +2788,14 @@ class CommercialOffersService:
         if not cases:
             lines.append("Похожие коммерческие заявки не найдены.")
             return "\n".join(lines)
-        lines.append("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Оценка стоимости | Документы |")
-        lines.append("|---|---:|---|---|---|---|---|---|")
+        lines.append("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Документы |")
+        lines.append("|---|---:|---|---|---|---|---|")
         for case in cases:
             docs = case.get("documents") if isinstance(case.get("documents"), list) else []
-            doc_summary = self._document_summary(docs)
+            case_id = str(case.get("case_id", ""))
+            doc_summary = self._document_summary(case_id, docs)
             meta = [
+                case_id,
                 str(case.get("similarity_reason_class", "")),
             ]
             if case.get("customer"):
@@ -2804,16 +2806,11 @@ class CommercialOffersService:
             description = self._markdown_cell(normalize_spaces(str(case.get("request_description") or ""))[:260])
             reasons = self._format_reasons(case.get("reasons", []))
             checks = self._markdown_cell("; ".join(str(item) for item in case.get("check", [])[:3]))
-            cost = case.get("cost_readiness") if isinstance(case.get("cost_readiness"), dict) else {}
-            cost_label = self._cost_label(cost)
-            case_id = str(case.get("case_id", ""))
-            case_label = self._markdown_cell(case_id)
-            case_link = f"[{case_label}]({self._registry_case_url(case_id)})" if case_id else ""
-            case_cell = "<br>".join([case_link, self._markdown_cell("<br>".join(meta))])
+            case_cell = self._markdown_cell("<br>".join(meta))
             score_label = self._score_label(case)
             lines.append(
                 f"| {case_cell} | {score_label} | {status_summary} | {description} | {reasons} | "
-                f"{checks} | {cost_label} | {doc_summary} |"
+                f"{checks} | {doc_summary} |"
             )
         return "\n".join(lines)
 
@@ -2825,22 +2822,17 @@ class CommercialOffersService:
             return f"{score:.3f}<br>R {rerank:.3f}"
         return f"{score:.3f}"
 
-    def _document_summary(self, docs: list[object]) -> str:
+    def _document_summary(self, case_id: str, docs: list[object]) -> str:
+        card = f"[карточка]({self._registry_case_url(case_id)})" if case_id else "карточка"
         if not docs:
-            return "нет"
+            return f"{card}<br>нет"
         trusted = [doc for doc in docs if isinstance(doc, dict) and doc.get("source_type") == "commercial_offer_document"]
         if trusted:
-            return self._markdown_cell(f"есть {len(trusted)}")
+            return f"{card}<br>{self._markdown_cell(f'есть {len(trusted)}')}"
         warnings = [str(doc.get("quality_warning") or "") for doc in docs if isinstance(doc, dict) and doc.get("quality_warning")]
         if any("не найдены" in warning for warning in warnings):
-            return "нет"
-        return "проверить связь"
-
-    @staticmethod
-    def _cost_label(cost: dict[str, object]) -> str:
-        score = cost.get("score")
-        prefix = "годится" if cost.get("usable_for_estimate") else "только ориентир"
-        return f"{prefix} ({score}/6)" if isinstance(score, int) else prefix
+            return f"{card}<br>нет"
+        return f"{card}<br>проверить связь"
 
     def _status_summary(self, case: dict[str, object]) -> str:
         status = normalize_lookup(str(case.get("status_normalized") or ""))

@@ -156,11 +156,11 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
                 ],
             )
 
-        self.assertIn("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Оценка стоимости | Документы |", answer)
-        self.assertIn("[MP-0429](http://127.0.0.1:8121/api/com-offers/registry/MP-0429)", answer)
+        self.assertIn("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Документы |", answer)
+        self.assertIn("| MP-0429<br>same_identifier", answer)
+        self.assertIn("[карточка](http://127.0.0.1:8121/api/com-offers/registry/MP-0429)", answer)
         self.assertIn("1.235<br>R 0.877", answer)
-        self.assertIn("| годится (", answer)
-        self.assertIn("| есть 1 |", answer)
+        self.assertIn("есть 1", answer)
         self.assertIn("совпал точный идентификатор: RIB5", answer)
         self.assertIn("принята", answer)
         self.assertNotIn("### Источники", answer)
