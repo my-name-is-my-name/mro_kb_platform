@@ -22,8 +22,8 @@ from core.runtime_clients import ExternalReranker, OpenAICompatibleLLM, RuntimeS
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9.-]{2,}")
 CASE_RE = re.compile(r"\b(?:MP|MRO|MR|МР)[-_\s.]*(\d{1,5})(?:[.,-](\d{1,3}))?\b", re.IGNORECASE)
 AIRCRAFT_RE = re.compile(
-    r"\b(?:(?:AIRBUS|BOEING)\s*)?(?:A|А|B|В|CRJ|CL|BD|RRJ|SSJ|EMB|ATR)\s*-?\s*\d{2,4}(?:[-\s]?(?:CL|NG|MAX|\d{2,4}))?\b|"
-    r"\b(?:BOEING|AIRBUS)\s*\d{2,4}(?:[-\s]?(?:CL|NG|MAX|\d{2,4}))?\b|"
+    r"\b(?:(?:AIRBUS|BOEING)\s*)?(?:A|А|B|В|CRJ|CL|BD|RRJ|SSJ|EMB|ATR)\s*-?\s*\d{2,4}(?:\s*/\s*(?:A|А|B|В)?\s*\d{2,4})?(?:[-\s]?(?:CL|NG|MAX|\d{2,4}))?\b|"
+    r"\b(?:BOEING|AIRBUS)\s*[-/]?\s*(?:A|А|B|В)?\s*\d{2,4}(?:\s*/\s*(?:A|А|B|В)?\s*\d{2,4})?(?:[-\s]?(?:CL|NG|MAX|\d{2,4}))?\b|"
     r"\b\d{3}(?:CL|NG|MAX)\b",
     re.IGNORECASE,
 )
@@ -153,11 +153,26 @@ def exact_terms(text: str) -> list[str]:
 
 
 def aircraft_tokens(text: str) -> set[str]:
-    return {normalize_lookup(match.group(0)).replace(" ", "").replace("-", "") for match in AIRCRAFT_RE.finditer(text or "")}
+    tokens: set[str] = set()
+    for match in AIRCRAFT_RE.finditer(text or ""):
+        value = normalize_lookup(match.group(0))
+        value = re.sub(r"\b(?:airbus|boeing)\b", " ", value)
+        value = value.replace("а", "a").replace("в", "b")
+        for code in re.findall(r"(?:a|b|crj|cl|bd|rrj|ssj|emb|atr)?\s*-?\s*\d{2,4}", value):
+            compact = code.replace(" ", "").replace("-", "")
+            if not compact:
+                continue
+            tokens.add(compact)
+            digits = re.sub(r"\D", "", compact)
+            if digits:
+                tokens.add(digits)
+    return tokens
 
 
 def strip_aircraft_terms(text: str) -> str:
-    return normalize_spaces(AIRCRAFT_RE.sub(" ", text or ""))
+    stripped = AIRCRAFT_RE.sub(" ", text or "")
+    stripped = re.sub(r"(^|\s)/+\s*", " ", stripped)
+    return normalize_spaces(stripped)
 
 
 class CommercialOffersService:
@@ -167,6 +182,7 @@ class CommercialOffersService:
         vector_cache_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_vectors.json",
         converted_markdown_manifest_path: Path = DATA_RUNTIME_ROOT / "com_offers_converted_markdown_manifest.json",
         reindex_progress_path: Path = DATA_RUNTIME_ROOT / "com_offers_reindex_progress.json",
+        registry_pages_dir: Path = DATA_RUNTIME_ROOT / "com_offer_registry_pages",
         case_profile_cache_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profiles.jsonl",
         case_profile_progress_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profile_progress.json",
         case_profile_vector_cache_path: Path = DATA_RUNTIME_ROOT / "com_offers_case_profile_vectors.json",
@@ -181,6 +197,7 @@ class CommercialOffersService:
         self.vector_cache_path = vector_cache_path
         self.converted_markdown_manifest_path = converted_markdown_manifest_path
         self.reindex_progress_path = reindex_progress_path
+        self.registry_pages_dir = registry_pages_dir
         self.case_profile_cache_path = case_profile_cache_path
         self.case_profile_progress_path = case_profile_progress_path
         self.case_profile_vector_cache_path = case_profile_vector_cache_path
@@ -189,6 +206,7 @@ class CommercialOffersService:
         self.embedding_model = os.getenv("MRO_KB_EMBEDDING_MODEL", "bge-m3:latest")
         self.query_rewrite_enabled = os.getenv("MRO_KB_QUERY_REWRITE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         self.profile_search_enabled = os.getenv("MRO_KB_PROFILE_SEARCH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.public_base_url = os.getenv("MRO_KB_PUBLIC_BASE_URL", "http://127.0.0.1:8121").rstrip("/")
         self.case_profile_llm_timeout_seconds = int(os.getenv("MRO_KB_CASE_PROFILE_TIMEOUT_SECONDS", "180"))
         self.settings = RuntimeSettings()
         self._reranker = ExternalReranker(self.settings.reranker_url, batch_size=self.settings.reranker_batch_size) if (
@@ -274,6 +292,11 @@ class CommercialOffersService:
                 "schema_version": CASE_PROFILE_VECTOR_SCHEMA_VERSION,
                 "created_at": self._case_profile_vector_status.get("created_at", ""),
                 "warnings": self._case_profile_vector_status.get("warnings", []),
+            },
+            "registry_pages": {
+                "path": str(self.registry_pages_dir),
+                "existing": len(list(self.registry_pages_dir.glob("*.md"))) if self.registry_pages_dir.exists() else 0,
+                "public_base_url": self.public_base_url,
             },
             "warnings": warnings,
             "reranker": self._reranker.health() if self._reranker is not None else {"ok": False, "disabled": True},
@@ -924,6 +947,114 @@ class CommercialOffersService:
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(self.case_profile_vector_progress_path)
 
+    def publish_registry_pages(self, limit: int = 0) -> dict[str, object]:
+        self.registry_pages_dir.mkdir(parents=True, exist_ok=True)
+        rows = self._registry if limit <= 0 else self._registry[:limit]
+        written = 0
+        for row in rows:
+            case_id = row.get("case_id", "")
+            if not case_id:
+                continue
+            self._write_registry_case_page(row)
+            written += 1
+        index_path = self.registry_pages_dir / "_index.md"
+        index_lines = ["# Commercial Offer Registry", ""]
+        for row in self._registry:
+            case_id = row.get("case_id", "")
+            if not case_id:
+                continue
+            title = normalize_spaces(row.get("request_description", ""))
+            index_lines.append(f"- [{case_id}]({self._case_page_filename(case_id)}) - {title}")
+        index_path.write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+        return {
+            "status": "complete",
+            "written": written,
+            "total_cases": len(self._registry),
+            "path": str(self.registry_pages_dir),
+            "index": str(index_path),
+        }
+
+    def registry_case_markdown(self, case_id: str) -> str | None:
+        normalized = normalize_case_id(case_id)
+        row = self._registry_by_case.get(normalized)
+        if not row:
+            return None
+        path = self._write_registry_case_page(row)
+        return path.read_text(encoding="utf-8")
+
+    def _write_registry_case_page(self, row: dict[str, str]) -> Path:
+        self.registry_pages_dir.mkdir(parents=True, exist_ok=True)
+        path = self.registry_pages_dir / self._case_page_filename(row.get("case_id", ""))
+        path.write_text(self._registry_case_markdown(row), encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _case_page_filename(case_id: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", normalize_case_id(case_id) or "case")
+        return f"{safe}.md"
+
+    def _registry_case_url(self, case_id: str) -> str:
+        return f"{self.public_base_url}/api/com-offers/registry/{normalize_case_id(case_id)}"
+
+    def _registry_case_markdown(self, row: dict[str, str]) -> str:
+        case_id = row.get("case_id", "")
+        lines = [
+            "---",
+            f"case_id: {case_id}",
+            f"status: {row.get('status_normalized', '')}",
+            f"customer: {row.get('customer', '')}",
+            f"aircraft_type: {row.get('aircraft_type', '')}",
+            "---",
+            "",
+            f"# {case_id} - {normalize_spaces(row.get('request_description', ''))}",
+            "",
+            "## Summary",
+            "",
+            f"- Customer: {row.get('customer', '') or 'unknown'}",
+            f"- Aircraft: {row.get('aircraft_type', '') or 'unknown'}",
+            f"- Serial/registration: {row.get('serial_or_registration', '') or 'unknown'}",
+            f"- Received: {row.get('received_date', '') or 'unknown'}",
+            f"- Status: {self._status_summary(row).replace('<br>', '; ')}",
+            f"- Work type: {row.get('workscope_type', '') or 'unknown'}",
+            f"- Discipline: {row.get('discipline_primary', '') or 'unknown'}",
+            f"- Certificate scope: {row.get('certificate_scope_flag', '') or 'unknown'}",
+            "",
+            "## Request",
+            "",
+            normalize_spaces(row.get("request_description", "")) or "No request description.",
+            "",
+        ]
+        for title, key in (
+            ("BD Comments", "bd_comments"),
+            ("Tasks / Decision Trail", "tasks"),
+            ("Notes", "notes"),
+            ("Similar Case References", "similar_case_refs"),
+        ):
+            value = normalize_spaces(row.get(key, ""))
+            if value:
+                lines.extend([f"## {title}", "", value, ""])
+        reestr = normalize_spaces(self._reestr_enrichment.get(case_id, ""))
+        if reestr:
+            lines.extend(["## Reestr_zayavok Extract", "", "```text", reestr[:4000], "```", ""])
+        docs = self._links.get(case_id, {})
+        doc_paths = [str(path) for path in docs.get("documents", []) if path]
+        lines.extend(["## Documents", ""])
+        if doc_paths:
+            lines.append(f"Link status: {docs.get('link_status', '')}")
+            lines.append("")
+            for path in doc_paths:
+                meta = self._documents.get(path, {})
+                title = str(meta.get("document_id") or Path(path).stem)
+                link = Path(path).as_uri() if Path(path).is_absolute() else path
+                lines.append(f"- [{title}]({link})")
+        else:
+            lines.append("No linked documents in registry.")
+        extra = self._extra_search_texts.get(case_id, "")
+        if extra:
+            lines.extend(["", "## Converted Markdown Search Text", "", "```text", extra[:2500], "```"])
+        lines.append("")
+        return "\n".join(lines)
+
     def _case_profile_source_text(self, row: dict[str, str]) -> str:
         case_id = row.get("case_id", "")
         parts: list[str] = []
@@ -1383,6 +1514,9 @@ class CommercialOffersService:
                 "status_normalized": case.get("status_normalized", ""),
                 "quote_sent_date": case.get("quote_sent_date", ""),
                 "request_description": case.get("request_description", ""),
+                "bd_comments": case.get("bd_comments", ""),
+                "tasks": case.get("tasks", ""),
+                "notes": case.get("notes", ""),
                 "workscope_type": case.get("workscope_type", ""),
                 "discipline_primary": case.get("discipline_primary", ""),
                 "certificate_scope_flag": case.get("certificate_scope_flag", ""),
@@ -1593,12 +1727,14 @@ class CommercialOffersService:
         return result
 
     def _search_queries(self, query: str, rewrite: dict[str, object]) -> list[dict[str, object]]:
-        items: list[dict[str, object]] = [{"text": query.strip(), "source": "original_query", "weight": 1.0}]
+        items: list[dict[str, object]] = [
+            {"text": self._retrieval_query_text(query), "display_text": query.strip(), "source": "original_query", "weight": 1.0}
+        ]
         normalized = normalize_spaces(str(rewrite.get("normalized_query") or ""))
         if normalized and normalize_lookup(normalized) != normalize_lookup(query):
-            items.append({"text": normalized, "source": "normalized_query", "weight": 0.96})
+            items.append({"text": self._retrieval_query_text(normalized), "display_text": normalized, "source": "normalized_query", "weight": 0.96})
         for value in rewrite.get("search_variants") or []:
-            items.append({"text": str(value), "source": "search_variant", "weight": 0.9})
+            items.append({"text": self._retrieval_query_text(str(value)), "display_text": str(value), "source": "search_variant", "weight": 0.9})
         for field, weight in (
             ("key_terms", 0.82),
             ("workscope_hints", 0.78),
@@ -1608,7 +1744,8 @@ class CommercialOffersService:
         ):
             values = [str(value) for value in rewrite.get(field) or [] if str(value).strip()]
             if values:
-                items.append({"text": " ".join(values), "source": field, "weight": weight})
+                text = " ".join(values)
+                items.append({"text": self._retrieval_query_text(text), "display_text": text, "source": field, "weight": weight})
         deduped: list[dict[str, object]] = []
         seen: set[str] = set()
         for item in items:
@@ -1621,6 +1758,14 @@ class CommercialOffersService:
             seen.add(key)
             deduped.append({**item, "text": text})
         return deduped[:14]
+
+    @staticmethod
+    def _retrieval_query_text(text: str) -> str:
+        original = normalize_spaces(text)
+        stripped = strip_aircraft_terms(original)
+        if stripped and (tokenize(stripped) or exact_terms(stripped)):
+            return stripped
+        return original
 
     @staticmethod
     def _is_informative_rewrite_variant(text: str) -> bool:
@@ -1972,7 +2117,7 @@ class CommercialOffersService:
 
     def _candidate_cases(self, search_queries: list[dict[str, object]], limit: int) -> list[dict[str, object]]:
         merged: dict[str, dict[str, object]] = {}
-        original_query = str(search_queries[0].get("text") or "") if search_queries else ""
+        original_query = str(search_queries[0].get("display_text") or search_queries[0].get("text") or "") if search_queries else ""
         query_profile = self._query_profile(original_query)
         for query_item in search_queries:
             query = str(query_item.get("text") or "")
@@ -2027,7 +2172,8 @@ class CommercialOffersService:
                     current["retrieval_modes"].append(source_name)
                     matched_queries = current["matched_queries"]
                     if isinstance(matched_queries, list):
-                        marker = f"{query_source}: {query}"
+                        display_query = normalize_spaces(str(query_item.get("display_text") or query))
+                        marker = f"{query_source}: {display_query}"
                         if marker not in matched_queries:
                             matched_queries.append(marker)
                     reasons = current["reasons"]
@@ -2080,7 +2226,8 @@ class CommercialOffersService:
         return max(0.0, min(1.0, (score - source_min) / (source_max - source_min)))
 
     def _exact_candidate_cases(self, query: str, limit: int) -> list[dict[str, object]]:
-        terms = exact_terms(query)
+        retrieval_query = strip_aircraft_terms(query)
+        terms = exact_terms(retrieval_query)
         explicit_case_id = normalize_case_id(query)
         candidates = []
         if not terms and explicit_case_id == query.strip():
@@ -2447,7 +2594,7 @@ class CommercialOffersService:
         for token in (token for token in tokenize(query) if token.replace("-", "") not in ignored_aircraft_tokens):
             if token in haystack:
                 score += 1.0
-        for term in exact_terms(query):
+        for term in exact_terms(strip_aircraft_terms(query)):
             if normalize_lookup(term).replace(" ", "") in compact:
                 score += 5.0
         return score
@@ -2464,7 +2611,7 @@ class CommercialOffersService:
             pos = lowered.find(token)
             if pos >= 0:
                 positions.append(pos)
-        for term in exact_terms(query):
+        for term in exact_terms(strip_aircraft_terms(query)):
             pos = lowered.replace(" ", "").find(normalize_lookup(term).replace(" ", ""))
             if pos >= 0:
                 positions.append(pos)
@@ -2542,9 +2689,13 @@ class CommercialOffersService:
 
     def _check_points(self, query: str, case: dict[str, str], evidence: list[dict[str, object]]) -> list[str]:
         checks: list[str] = []
-        query_aircraft = {normalize_lookup(item).replace(" ", "") for item in AIRCRAFT_RE.findall(query or "")}
-        case_aircraft = normalize_lookup(case.get("aircraft_type", "")).replace(" ", "")
-        if query_aircraft and case_aircraft and case_aircraft not in query_aircraft:
+        query_aircraft = aircraft_tokens(query)
+        case_aircraft = aircraft_tokens(case.get("aircraft_type", "")) or {normalize_lookup(case.get("aircraft_type", "")).replace(" ", "").replace("-", "")}
+        if query_aircraft and case_aircraft and not any(
+            query_token == case_token or case_token.startswith(query_token) or query_token.startswith(case_token)
+            for query_token in query_aircraft
+            for case_token in case_aircraft
+        ):
             checks.append(f"тип ВС отличается или требует проверки: {case.get('aircraft_type', '')}")
         status = case.get("status_normalized", "")
         if status and status != "accepted":
@@ -2560,8 +2711,8 @@ class CommercialOffersService:
         if not cases:
             lines.append("Похожие коммерческие заявки не найдены.")
             return "\n".join(lines)
-        lines.append("| Заявка | Описание | Почему похожа | Что проверить | Cost | Документы |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| Заявка | Статус/решение | Описание | Почему похожа | Что проверить | Cost | Документы |")
+        lines.append("|---|---|---|---|---|---|---|")
         for case in cases:
             docs = case.get("documents") if isinstance(case.get("documents"), list) else []
             doc_links: list[str] = []
@@ -2581,25 +2732,49 @@ class CommercialOffersService:
                     label = f"{label}: {warning}"
                 doc_links.append(f"[{self._markdown_cell(label)}]({link})" if link else self._markdown_cell(label))
             meta = [
-                str(case.get("case_id", "")),
                 str(case.get("similarity_reason_class", "")),
             ]
             if case.get("customer"):
                 meta.append(str(case.get("customer")))
             if case.get("aircraft_type"):
                 meta.append(str(case.get("aircraft_type")))
-            if case.get("status_normalized"):
-                meta.append(str(case.get("status_normalized")))
+            status_summary = self._status_summary(case)
             description = self._markdown_cell(normalize_spaces(str(case.get("request_description") or ""))[:260])
             reasons = self._format_reasons(case.get("reasons", []))
             checks = self._markdown_cell("; ".join(str(item) for item in case.get("check", [])[:3]))
             cost = case.get("cost_readiness") if isinstance(case.get("cost_readiness"), dict) else {}
             cost_label = "да" if cost.get("usable_for_estimate") else "нет"
+            case_id = str(case.get("case_id", ""))
+            case_label = self._markdown_cell(case_id)
+            case_link = f"[{case_label}]({self._registry_case_url(case_id)})" if case_id else ""
+            case_cell = "<br>".join([case_link, self._markdown_cell("<br>".join(meta))])
             lines.append(
-                f"| {self._markdown_cell('<br>'.join(meta))} | {description} | {reasons} | "
+                f"| {case_cell} | {status_summary} | {description} | {reasons} | "
                 f"{checks} | {cost_label} | {'<br>'.join(doc_links)} |"
             )
         return "\n".join(lines)
+
+    def _status_summary(self, case: dict[str, object]) -> str:
+        status = normalize_lookup(str(case.get("status_normalized") or ""))
+        if status == "accepted":
+            label = "принята"
+        elif status == "cancelled":
+            label = "не взяли / отменена"
+        elif status == "in_work":
+            label = "в работе"
+        elif status:
+            label = status
+        else:
+            label = "статус не указан"
+        details: list[str] = []
+        if case.get("quote_sent_date"):
+            details.append(f"КП: {case.get('quote_sent_date')}")
+        for key in ("tasks", "bd_comments", "notes"):
+            value = normalize_spaces(str(case.get(key) or ""))
+            if value:
+                details.append(value[:140])
+                break
+        return self._markdown_cell("<br>".join([label, *details[:2]]))
 
     @staticmethod
     def _markdown_cell(value: str) -> str:
@@ -2630,16 +2805,42 @@ class CommercialOffersService:
 
     def _format_reasons(self, reasons_value: object) -> str:
         reasons = [str(reason) for reason in reasons_value if str(reason).strip()] if isinstance(reasons_value, list) else []
-        cleaned: list[str] = []
-        seen: set[str] = set()
+        terms: list[str] = []
+        exact: list[str] = []
+        structural: list[str] = []
+        phrase = False
         for reason in reasons:
             text = re.sub(r"^по (?:исходному|расширенному) запросу:\s*", "", reason).strip()
-            text = text.replace("общий термин:", "термин:").replace("ключевое слово:", "ключ:")
-            if text in seen:
+            if text.startswith("общий термин:") or text.startswith("ключевое слово:"):
+                term = normalize_spaces(text.split(":", 1)[1])
+                if term and term not in terms:
+                    terms.append(term)
                 continue
-            seen.add(text)
-            cleaned.append(text)
-        return self._markdown_cell("; ".join(cleaned[:10]))
+            if text.startswith("точный термин:"):
+                term = normalize_spaces(text.split(":", 1)[1])
+                if term and term not in exact:
+                    exact.append(term)
+                continue
+            if "совпадение фразы" in text:
+                phrase = True
+                continue
+            if text.startswith("структурный профиль:"):
+                value = normalize_spaces(text.split(":", 1)[1])
+                if value and value not in structural:
+                    structural.append(value)
+                continue
+        parts: list[str] = []
+        if exact:
+            parts.append("совпал точный идентификатор: " + ", ".join(exact[:4]))
+        if terms:
+            parts.append("совпали ключевые признаки: " + ", ".join(terms[:8]))
+        if phrase:
+            parts.append("есть близкая формулировка в описании/документе")
+        if structural:
+            parts.append("структурно похоже: " + ", ".join(structural[:3]))
+        if not parts:
+            parts.append("слабый аналог: проверить вручную по описанию и документам")
+        return self._markdown_cell("; ".join(parts))
 
     def _generate_answer(self, query: str, cases: list[dict[str, object]]) -> str:
         assert self._llm is not None

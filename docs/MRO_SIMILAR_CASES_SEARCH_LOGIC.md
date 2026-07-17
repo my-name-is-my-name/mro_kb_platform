@@ -205,6 +205,14 @@ Evidence не участвует в similarity score.
 - документы/Markdown, если есть надежная связь, в виде кликабельных inline-ссылок в основной таблице;
 - предупреждения по качеству документов inline в колонке документов или `что проверить`.
 
+`case_id` в таблице является ссылкой на Markdown-страницу заявки:
+
+- HTTP endpoint: `/api/com-offers/registry/{case_id}`;
+- cache on disk: `data_runtime/com_offer_registry_pages/{case_id}.md`;
+- bulk publish command: `python3 -m apps.api.server publish-com-offer-registry`.
+
+Страница заявки агрегирует поля `case_registry.csv`, статус/решение из реестра, выдержку из `Reestr_zayavok.xlsm`, linked documents и compact converted Markdown search text. Это удобнее, чем ссылаться прямо на строку Excel: ссылка стабильна, кликабельна из UI и дает читаемый dashboard по заявке.
+
 ## Метрики качества
 
 Для ручного regression-набора считаются:

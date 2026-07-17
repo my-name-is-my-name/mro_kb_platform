@@ -84,6 +84,12 @@ python3 -m apps.api.server rebuild-com-offers-manifest
 python3 -m apps.api.server reindex-com-offers
 ```
 
+`publish-com-offer-registry` writes one Markdown dashboard page per commercial request. Similar-case answers link case IDs to these pages through `/api/com-offers/registry/{case_id}`:
+
+```bash
+python3 -m apps.api.server publish-com-offer-registry
+```
+
 `build-com-offer-profiles` builds experimental LLM case profiles. Profile vectors are not used by default ranking until metrics justify enabling them. The runtime still emits structured diagnostics from available profiles/fallback profiles: `structured_score`, `similarity_reason_class`, `go_no_go`, and `cost_readiness`.
 
 ```bash
@@ -110,6 +116,7 @@ curl -X POST http://127.0.0.1:8121/api/ingest/run
 - `GET /api/cases/{case_id}`
 - `GET /api/documents/{document_id}`
 - `GET /api/chunks/{chunk_id}`
+- `GET /api/com-offers/registry/{case_id}`
 
 ## Runtime Environment
 

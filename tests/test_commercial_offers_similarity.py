@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 
 from core.commercial_offers import CommercialOffersService
+from core.config import WORKSPACE_ROOT
+from tools.evaluate_com_offers_ground_truth import build_ground_truth
 
 
 GROUND_TRUTH = [
@@ -152,12 +154,56 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
                 ],
             )
 
-        self.assertIn("| Заявка | Описание | Почему похожа | Что проверить | Cost | Документы |", answer)
+        self.assertIn("| Заявка | Статус/решение | Описание | Почему похожа | Что проверить | Cost | Документы |", answer)
+        self.assertIn("[MP-0429](http://127.0.0.1:8121/api/com-offers/registry/MP-0429)", answer)
         self.assertIn("file://", answer)
-        self.assertIn("точный термин: RIB5", answer)
+        self.assertIn("совпал точный идентификатор: RIB5", answer)
+        self.assertIn("принята", answer)
         self.assertNotIn("### Источники", answer)
         self.assertNotIn("Предупреждения по качеству источников", answer)
         self.assertNotIn("Это поиск аналогов", answer)
+
+    def test_registry_case_markdown_page_contains_decision_context(self) -> None:
+        markdown = self.service.registry_case_markdown("MP-0481")
+
+        self.assertIsNotNone(markdown)
+        self.assertIn("# MP-0481", markdown or "")
+        self.assertIn("не взяли / отменена", markdown or "")
+        self.assertIn("Запрос более неактуален", markdown or "")
+
+    def test_aircraft_prefixed_ground_truth_fixture_matches_workbook_order(self) -> None:
+        rows = build_ground_truth(
+            WORKSPACE_ROOT / "com_offers" / "tests" / "ground truth.xlsx",
+            aircraft_query_fixture=WORKSPACE_ROOT / "com_offers" / "tests" / "aircraft_queries.tsv",
+            prefix_aircraft=True,
+        )
+
+        self.assertEqual(len(rows), 87)
+        self.assertFalse([row for row in rows if row.get("aircraft_fixture_warning")])
+        gear_rib = next(row for row in rows if row["base_query"] == "Коррозия Gear Rib5")
+        self.assertEqual(gear_rib["query"], "Airbus A319 Коррозия Gear Rib5")
+        extinguishers = next(row for row in rows if row["base_query"] == "Замена огнетушителей")
+        self.assertEqual(extinguishers["query"], "Замена огнетушителей")
+
+    def test_aircraft_prefix_is_removed_from_retrieval_text(self) -> None:
+        self.assertEqual(self.service._retrieval_query_text("Airbus A319 Коррозия Gear Rib5"), "Коррозия Gear Rib5")
+        self.assertEqual(
+            self.service._retrieval_query_text("Boeing-737/800 Коррозия интеркостала пола"),
+            "Коррозия интеркостала пола",
+        )
+        self.assertEqual(
+            self.service._retrieval_query_text("Airbus A320/A321 Приведение флота Airbus"),
+            "Приведение флота Airbus",
+        )
+
+    def test_aircraft_check_does_not_flag_same_aircraft(self) -> None:
+        checks = self.service._check_points(
+            "Airbus A320 Устранение царапин",
+            {"aircraft_type": "A320", "status_normalized": "accepted"},
+            [],
+        )
+
+        self.assertNotIn("тип ВС отличается или требует проверки: A320", checks)
 
     def test_fallback_profile_extracts_mro_fields(self) -> None:
         profile = self.service._query_profile("AMOC AD 2024-1234 трещина FR 35 стойки шасси")

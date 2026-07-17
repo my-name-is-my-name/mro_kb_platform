@@ -20,6 +20,7 @@ from core.commercial_offers import CommercialOffersService, normalize_case_id, n
 from core.config import WORKSPACE_ROOT
 
 
+DEFAULT_AIRCRAFT_QUERY_FIXTURE = WORKSPACE_ROOT / "com_offers" / "tests" / "aircraft_queries.tsv"
 SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS = {"a": SPREADSHEET_NS, "r": REL_NS}
@@ -68,7 +69,26 @@ def read_xlsx(path: Path) -> dict[str, list[tuple[int, dict[str, str]]]]:
         return sheets
 
 
-def build_ground_truth(path: Path) -> list[dict[str, Any]]:
+def read_aircraft_query_fixture(path: Path) -> list[tuple[str, str]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Aircraft query fixture not found: {path}")
+    rows: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) == 1:
+            rows.append(("", parts[0].strip()))
+        else:
+            rows.append((parts[0].strip(), parts[1].strip()))
+    return rows
+
+
+def build_ground_truth(
+    path: Path,
+    aircraft_query_fixture: Path | None = None,
+    prefix_aircraft: bool = False,
+) -> list[dict[str, Any]]:
     sheets = read_xlsx(path)
     if "Поиск заявки" not in sheets or "Заявки" not in sheets:
         raise ValueError("Expected sheets 'Поиск заявки' and 'Заявки'")
@@ -90,7 +110,20 @@ def build_ground_truth(path: Path) -> list[dict[str, Any]]:
         if row_number < 4 or not query:
             continue
         expected = sorted(by_description.get(normalize_lookup(query), set()))
-        ground_truth.append({"row": row_number, "query": query, "expected": expected})
+        ground_truth.append({"row": row_number, "query": query, "base_query": query, "expected": expected})
+    if prefix_aircraft:
+        fixture_path = aircraft_query_fixture or DEFAULT_AIRCRAFT_QUERY_FIXTURE
+        aircraft_rows = read_aircraft_query_fixture(fixture_path)
+        for index, item in enumerate(ground_truth):
+            if index >= len(aircraft_rows):
+                item["aircraft_fixture_warning"] = "missing_aircraft_fixture_row"
+                continue
+            aircraft, fixture_query = aircraft_rows[index]
+            if normalize_lookup(fixture_query) != normalize_lookup(str(item["base_query"])):
+                item["aircraft_fixture_warning"] = f"fixture_query_mismatch: {fixture_query}"
+            item["aircraft_type_query"] = aircraft
+            if aircraft:
+                item["query"] = f"{aircraft} {item['base_query']}"
     return ground_truth
 
 
@@ -175,6 +208,8 @@ def evaluate(
     expand_base_ids: bool,
     max_case_number: int = 0,
     candidate_pool_limit: int = 100,
+    prefix_aircraft: bool = False,
+    aircraft_query_fixture: Path | None = None,
 ) -> dict[str, Any]:
     service = CommercialOffersService()
     service._llm = None
@@ -189,7 +224,20 @@ def evaluate(
     registry_ids = {row.get("case_id", "") for row in service._registry if row.get("case_id")}
     rows = []
     started = time.time()
-    for item in build_ground_truth(ground_truth_path):
+    fixture_warnings: list[dict[str, Any]] = []
+    for item in build_ground_truth(
+        ground_truth_path,
+        aircraft_query_fixture=aircraft_query_fixture,
+        prefix_aircraft=prefix_aircraft,
+    ):
+        if item.get("aircraft_fixture_warning"):
+            fixture_warnings.append(
+                {
+                    "row": item["row"],
+                    "base_query": item.get("base_query", ""),
+                    "warning": item["aircraft_fixture_warning"],
+                }
+            )
         expected = set(item["expected"])
         if expand_base_ids:
             expected = expand_expected_ids(expected, registry_ids)
@@ -208,6 +256,8 @@ def evaluate(
             {
                 "row": item["row"],
                 "query": item["query"],
+                "base_query": item.get("base_query", item["query"]),
+                "aircraft_type_query": item.get("aircraft_type_query", ""),
                 "expected": sorted(expected),
                 "top": ids,
                 "rank": rank,
@@ -248,6 +298,9 @@ def evaluate(
         "expand_base_case_ids": expand_base_ids,
         "max_case_number": max_case_number,
         "candidate_pool_limit": candidate_pool_limit,
+        "prefix_aircraft": prefix_aircraft,
+        "aircraft_query_fixture": str(aircraft_query_fixture or DEFAULT_AIRCRAFT_QUERY_FIXTURE) if prefix_aircraft else "",
+        "aircraft_fixture_warnings": fixture_warnings[:20],
         "registry_case_count": len(registry_ids),
         "seconds": round(time.time() - started, 2),
         "metrics": {key: round(value, 4) for key, value in metrics.items()},
@@ -282,6 +335,17 @@ def main() -> None:
     parser.add_argument("--no-expand-base-case-ids", action="store_true", help="Do not expand MP-123 to MP-123.* variants")
     parser.add_argument("--json-out", type=Path)
     parser.add_argument(
+        "--prefix-aircraft",
+        action="store_true",
+        help="Prefix benchmark queries with aircraft type from tests/fixtures/com_offer_aircraft_queries.tsv",
+    )
+    parser.add_argument(
+        "--aircraft-query-fixture",
+        type=Path,
+        default=DEFAULT_AIRCRAFT_QUERY_FIXTURE,
+        help="TSV fixture with two columns: aircraft type and original benchmark query, ordered like the workbook queries",
+    )
+    parser.add_argument(
         "--max-case-number",
         type=int,
         default=0,
@@ -302,6 +366,8 @@ def main() -> None:
         expand_base_ids=not args.no_expand_base_case_ids,
         max_case_number=args.max_case_number,
         candidate_pool_limit=args.candidate_pool_limit,
+        prefix_aircraft=args.prefix_aircraft,
+        aircraft_query_fixture=args.aircraft_query_fixture,
     )
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)

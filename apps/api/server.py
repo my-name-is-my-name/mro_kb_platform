@@ -58,6 +58,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, body_text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200) -> None:
+        body = body_text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         try:
             parsed = urlparse(self.path)
@@ -93,6 +101,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "commercial_offers": SERVICES.commercial_offers.health(),
                     }
                 )
+            if parsed.path.startswith("/api/com-offers/registry/"):
+                case_id = parsed.path.rsplit("/", 1)[-1]
+                markdown = SERVICES.commercial_offers.registry_case_markdown(case_id)
+                if markdown is None:
+                    return self._send_json({"ok": False, "error": "commercial offer case not found"}, status=404)
+                return self._send_text(markdown, content_type="text/markdown; charset=utf-8")
             if parsed.path == "/api/cases":
                 return self._send_json({"ok": True, "cases": SERVICES.store.fetch_cases()})
             if parsed.path.startswith("/api/cases/"):
@@ -187,6 +201,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "reindex-com-offers",
             "reindex-com-offers-status",
             "rebuild-com-offers-manifest",
+            "publish-com-offer-registry",
             "build-com-offer-profiles",
             "com-offer-profiles-status",
             "reindex-com-offer-profile-vectors",
@@ -205,6 +220,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "rebuild-com-offers-manifest":
         result = SERVICES.commercial_offers.rebuild_converted_markdown_manifest()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "publish-com-offer-registry":
+        result = SERVICES.commercial_offers.publish_registry_pages(limit=args.limit)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "reindex-com-offers":

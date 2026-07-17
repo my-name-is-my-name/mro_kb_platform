@@ -36,6 +36,7 @@ Primary benchmark source:
 - `/mnt/ii_models/Users/hizhenkov/com_offers/tests/ground truth.xlsx`
 - sheet `Поиск заявки`: user-style search queries
 - sheet `Заявки`: expected commercial request IDs and normalized descriptions
+- `/mnt/ii_models/Users/hizhenkov/com_offers/tests/aircraft_queries.tsv`: same benchmark queries with an aircraft/engine prefix for request-style evaluation
 
 The evaluation script builds expected answers automatically by matching each query from `Поиск заявки` to descriptions from `Заявки`. This file is evaluation data only. It is not used by runtime retrieval, so it does not create query-to-case hardcode.
 
@@ -46,6 +47,14 @@ python3 tools/evaluate_com_offers_ground_truth.py --disable-vectors --json-out d
 ```
 
 The script expands base expected IDs to registry variants for scoring. Example: if the Excel file says `MP-0856` but the registry contains `MP-0856.01` and `MP-0856.02`, either concrete registry case can count as relevant. This is a general evaluation rule, not a retrieval signal.
+
+Aircraft-prefixed evaluation command:
+
+```bash
+MRO_KB_LLM_ENABLED=0 MRO_KB_RERANKER_ENABLED=0 python3 tools/evaluate_com_offers_ground_truth.py --mode hybrid --limit 10 --max-case-number 918 --candidate-pool-limit 100 --prefix-aircraft --json-out data_runtime/com_offers_ground_truth_aircraft_hybrid_report.json
+```
+
+The aircraft prefix is removed from retrieval text and kept for compatibility checks/tie-breaks. This prevents `Airbus A320` or `Boeing-737/800` from becoming the primary similarity signal.
 
 ## Benchmark Validity
 
@@ -113,6 +122,24 @@ Fresh semantic hybrid, reranker disabled:
 | nDCG@10 | 0.581 |
 | CostUsable@5 | 0.618 |
 | TrustedEvidence@5 | 0.584 |
+
+Aircraft-prefixed hybrid benchmark on the same temporal slice, reranker disabled:
+
+| Metric | Value |
+|---|---:|
+| Hit@1 | 0.437 |
+| Hit@3 | 0.609 |
+| Hit@5 | 0.644 |
+| Hit@10 | 0.690 |
+| CandidateRecall@50 | 0.839 |
+| CandidateRecall@100 | 0.885 |
+| MRR | 0.521 |
+| nDCG@5 | 0.493 |
+| nDCG@10 | 0.514 |
+| CostUsable@5 | 0.595 |
+| TrustedEvidence@5 | 0.510 |
+
+This run has zero aircraft fixture ordering warnings. Its top-N metrics are lower than the fresh semantic snapshot above and close to fallback/hybrid behavior, but candidate recall@100 remains `0.885`; the aircraft prefix is no longer acting as the dominant retrieval signal.
 
 Semantic hybrid with compact external reranker, controlled temporal benchmark:
 
