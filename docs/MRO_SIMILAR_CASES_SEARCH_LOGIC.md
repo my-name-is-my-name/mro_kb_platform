@@ -28,10 +28,11 @@
    - lexical/BM25-подобный поиск по токенам;
    - exact matching по инженерным идентификаторам.
 5. Кандидаты объединяются по `case_id`.
-6. Финальный score складывается из semantic, lexical и exact сигналов.
-7. Если включен внешний reranker, top candidates дополнительно ранжируются через `BAAI/bge-reranker-v2-m3` endpoint.
-8. Для top results подбираются документы evidence layer.
-9. Ответ строится как таблица похожих заявок с предупреждениями по качеству источников.
+6. Финальный score складывается из нормализованных semantic, lexical и exact сигналов.
+7. Для каждого кандидата строится структурный профиль заявки. Сейчас он используется как диагностический слой: добавляет `structured_score`, класс похожести и объяснения, но не дает отдельный boost в итоговый score.
+8. Если включен внешний reranker, top candidates дополнительно ранжируются через `BAAI/bge-reranker-v2-m3` endpoint по компактному rerank-тексту, а не по длинному OCR.
+9. Для top results подбираются документы evidence layer.
+10. Ответ строится как таблица похожих заявок с предупреждениями по качеству источников и подсказками для будущего go/no-go/cost workflow.
 
 ## Query Rewrite
 
@@ -145,9 +146,30 @@ Exact matching применяется к инженерным идентифик
 - `semantic_score`;
 - `lexical_score`;
 - `exact_score`;
+- `structured_score`;
+- `profile_semantic_score`;
 - `rerank_score`;
+- `similarity_reason_class`;
 - `matched_queries`;
 - `reasons`.
+
+Итоговый score в текущей ветке не включает прямой structured-profile boost. Это осознанное ограничение: на текущем benchmark профильный boost ухудшал старую выдачу, поэтому профиль оставлен как explainability/diagnostic слой до улучшения candidate generation и качества профилей.
+
+### Reranker
+
+Reranker получает компактный текст заявки:
+
+- `request_description`;
+- `workscope_type`;
+- `discipline_primary`;
+- `bd_comments`;
+- `certificate_scope_flag`;
+- `status_normalized`;
+- до 500 символов очищенного `Reestr_zayavok.xlsm`;
+- до 700 символов очищенного converted Markdown/OCR;
+- извлеченные exact identifiers.
+
+Максимальная длина текста кандидата ограничена примерно 1500 символами. Это нужно, чтобы внешний `BAAI/bge-reranker-v2-m3` не зависал на длинных OCR-презентациях и оценивал именно коммерчески важную часть заявки.
 
 ## Evidence Layer
 
@@ -211,7 +233,7 @@ Fallback lexical/exact без свежих embeddings ожидаемо слаб�
 
 ## MRO Case Profiles
 
-MRO-профили становятся основным структурным слоем поверх текущего hybrid retrieval.
+MRO-профили - это структурный слой поверх текущего hybrid retrieval, `schema_version=3`.
 Если полный профиль еще не построен LLM offline-процессом, runtime строит слабый fallback-профиль из production-текста заявки: точные identifiers, ATA и зоны извлекаются regex-паттернами, а компоненты/дефекты не подставляются словарями.
 
 Идея:
@@ -219,14 +241,17 @@ MRO-профили становятся основным структурным 
 - offline строить компактный JSON-профиль каждой заявки из production-источников;
 - online строить слабый технический профиль пользовательского запроса без выбора `case_id`;
 - сравнивать одинаковые структурные поля, а не длинный сырой OCR;
-- оставить lexical/exact retrieval как safety net.
+- использовать профиль для объяснения, оценки пригодности аналога и будущего отбора candidate pool;
+- оставить semantic/lexical/exact retrieval как основной ranking path до достижения MVP-метрик.
 
 Профиль не должен содержать правильный `case_id` для запроса, ручные aliases или исправления под benchmark. Он должен извлекать только наблюдаемые признаки: дефект, компонент, зону, действие, ограничения, идентификаторы и двуязычные поисковые термины.
 
 Минимальные поля профиля:
 
+- `problem_summary`;
 - `work_type`;
 - `defect_type`;
+- `aircraft_type_metadata`;
 - `ata`;
 - `components`;
 - `zones`;
@@ -234,11 +259,21 @@ MRO-профили становятся основным структурным 
 - `authority_path`;
 - `action_required`;
 - `constraints_or_risks`;
-- `search_terms_ru_en`.
+- `search_terms_ru_en`;
+- `evidence_fields`;
+- `confidence`.
 
 Тип ВС в профиле допускается как отдельное metadata/check поле. Он сохраняется в `metadata_text`, но отделяется от основного profile `search_text`, чтобы быть доступным для проверки и tie-breaker, не становясь самостоятельным главным retrieval-сигналом.
 
 Offline LLM-профиль записывается в cache только если проходит quality gate. Профили с `...`, низкой уверенностью, path/OCR-noise или недостаточным структурным сигналом попадают в failures и не индексируются.
+
+Текущий fallback-профиль намеренно консервативен:
+
+- извлекает ATA, зоны и точные идентификаторы;
+- не угадывает broad-сущности вроде `landing gear`, `corrosion`, `repair` по ручным словарям;
+- ставит низкую `confidence`, чтобы fallback не выглядел как полноценный инженерный профиль.
+
+`structured_score` считается по пересечению identifiers, authority path, components, zones, ATA, defect type и work type. В текущей ветке он не прибавляется к ranking score, но используется для объяснения и классификации аналога.
 
 Финальная выдача дополнительно содержит:
 

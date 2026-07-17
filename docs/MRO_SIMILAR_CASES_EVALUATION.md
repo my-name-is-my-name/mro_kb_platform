@@ -1,6 +1,6 @@
 # mro-similar-cases Evaluation
 
-Date: 2026-07-16
+Date: 2026-07-17
 
 This document records the current evaluation state for `mro-similar-cases`.
 
@@ -14,9 +14,13 @@ Latest checked artifacts:
 - manifest documents: 1188
 - skipped converted Markdown files: 316
 - conflicting converted Markdown paths: 7
-- embedding cache: stale relative to the current manifest
+- embedding cache after reindex: partial, 1216 vectors for 1246 registry cases
+- embedding missing cases reported by `/api/health`: `MP-0048`, `MP-0071`, `MP-0089`, `MP-0109`, `MP-0343`, `MP-0405`, `MP-0462`, `MP-0664`, `MP-1040`
+- reranker endpoint checked separately: `BAAI/bge-reranker-v2-m3`, CUDA enabled
 
-Current fallback evaluation was run with:
+The current branch includes structured case-profile diagnostics, compact rerank text and go/no-go/cost-readiness output. Structured profile score is not used as a direct ranking boost because the measured boost degraded top-N quality on the benchmark.
+
+Fallback evaluation is still useful as a lower-bound check and is run with:
 
 - `MRO_KB_LLM_ENABLED=0`
 - `MRO_KB_RERANKER_ENABLED=0`
@@ -42,6 +46,19 @@ python3 tools/evaluate_com_offers_ground_truth.py --disable-vectors --json-out d
 ```
 
 The script expands base expected IDs to registry variants for scoring. Example: if the Excel file says `MP-0856` but the registry contains `MP-0856.01` and `MP-0856.02`, either concrete registry case can count as relevant. This is a general evaluation rule, not a retrieval signal.
+
+## Benchmark Validity
+
+The benchmark contains 87 queries with expected IDs. The expected IDs are limited to the historical slice up to base request `918`:
+
+- expected IDs above `918`: 0;
+- rows with multiple expected IDs: 21;
+- expected IDs missing after base/subcase expansion: 0;
+- registry currently contains newer cases above `918`: 259.
+
+For honest regression tracking, the main MVP metric should be computed on the temporal slice `--max-case-number 918`. Running against the full registry is still useful as a robustness check because newer cases are realistic distractors, but it is not the same distribution as the benchmark labels.
+
+Known benchmark/data limitation: expected case `MP-0109` is one of the embedding failures in the current partial vector cache, so semantic retrieval cannot fully recover that row until the vector failure is fixed.
 
 ## Smoke Ground Truth Set
 
@@ -77,7 +94,53 @@ Not allowed as runtime enrichment:
 
 ## Latest Results
 
-The latest fallback-only run after removing manual token normalization and manual aliases.
+The latest honest snapshot uses the temporal benchmark slice up to `MP-0918`, no query-to-case hardcode, no manual aliases, and no hand-written synonym/case-form dictionaries.
+
+Fresh semantic hybrid, reranker disabled:
+
+| Metric | Value |
+|---|---:|
+| Hit@1 | 0.460 |
+| Hit@3 | 0.655 |
+| Hit@5 | 0.690 |
+| Hit@10 | 0.793 |
+| MRR | 0.567 |
+| Precision@5 | 0.177 |
+| Recall@5 | 0.617 |
+| nDCG@5 | 0.539 |
+| Precision@10 | 0.112 |
+| Recall@10 | 0.741 |
+| nDCG@10 | 0.581 |
+| CostUsable@5 | 0.618 |
+| TrustedEvidence@5 | 0.584 |
+
+Semantic hybrid with compact external reranker, controlled temporal benchmark:
+
+| Pool | Hit@1 | Hit@3 | Hit@5 | Hit@10 | MRR | nDCG@10 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 50 | 0.529 | 0.713 | 0.736 | 0.805 | 0.623 | 0.635 |
+| 100 | 0.529 | 0.701 | 0.736 | 0.828 | 0.622 | 0.642 |
+
+Current result is still below the MVP target `Hit@5 >= 0.80` and `Hit@10 >= 0.90`. The main blocker is candidate generation, not only final ranking: candidate-pool recall@100 on the temporal slice is `0.885`.
+
+Candidate-pool misses at top-100 on the temporal slice:
+
+| Row | Query | Expected |
+|---:|---|---|
+| 11 | `Временное разрешение на эксплуатацию с трещиной` | `MP-0842` |
+| 16 | `Инцидент с обледенением` | `MP-0057` |
+| 25 | `Модификация дренажной системы` | `MP-0109` |
+| 29 | `Перевод ремонта узла подвески вертикального стабилизатора из категории B в категорию А` | `MP-0771` |
+| 30 | `Перенос кислородных баллонов` | `MP-0503` |
+| 40 | `Ремонт внутренней панели реверса тяги` | `MP-0825` |
+| 42 | `Ремонт капота двигателя` | `MP-0460` |
+| 47 | `Ремонт коррозии выреза под люк на крыле` | `MP-0694` |
+| 55 | `Ремонт коррозии порожка` | `MP-0478` |
+| 59 | `Ремонт крепления аккумуляторной батареи` | `MP-0490` |
+
+For rows where the expected analogue enters the candidate pool, compact reranking is useful. With pool 100, reranked Hit@10 is `0.828` overall; on the retrievable subset this is materially higher, but the 10 pool misses cap the final MVP metrics.
+
+Historical fallback-only run after removing manual token normalization and manual aliases:
 
 Small 10-query smoke set:
 

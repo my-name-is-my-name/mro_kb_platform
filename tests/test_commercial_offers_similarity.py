@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 
 from core.commercial_offers import CommercialOffersService
 
@@ -137,12 +139,55 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
         self.assertIn("confidence_below_0_4", errors)
         self.assertIn("not_enough_structured_signal", errors)
 
+    def test_low_confidence_profile_without_technical_signal_fails_quality_gate(self) -> None:
+        profile = self.service._normalize_case_profile(
+            {
+                "problem_summary": "Реконфигурация 24 to 293",
+                "work_type": "modification",
+                "defect_type": "other",
+                "components": [],
+                "zones": [],
+                "identifiers": [],
+                "constraints_or_risks": ["Проект отменён"],
+                "search_terms_ru_en": ["модификация", "реконфигурация"],
+                "confidence": 0.2,
+            }
+        )
+
+        errors = self.service._profile_quality_errors(profile)
+
+        self.assertIn("confidence_below_0_4", errors)
+
     def test_profile_source_text_strips_paths(self) -> None:
         cleaned = self.service._clean_profile_source_fragment("path: converted_md_pdf_ocr/000-100/МР-040/file.md\\nЗапрос: Замена печек")
 
         self.assertNotIn("converted_md_pdf_ocr", cleaned)
         self.assertNotIn(".md", cleaned)
         self.assertIn("Запрос", cleaned)
+
+    def test_build_profiles_falls_back_when_llm_returns_empty_profile(self) -> None:
+        class EmptyProfileLLM:
+            def chat(self, *_args, **_kwargs) -> str:
+                return "{}"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = CommercialOffersService(
+                case_profile_cache_path=Path(tmp) / "profiles.jsonl",
+                case_profile_progress_path=Path(tmp) / "progress.json",
+            )
+            service._registry = [row for row in service._registry if row.get("case_id") == "MP-0002"]
+            service._llm = EmptyProfileLLM()
+
+            result = service.build_case_profiles(force=True)
+            item = service._case_profiles["MP-0002"]
+            profile = item["profile"]
+
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["failure_count"], 0)
+            self.assertEqual(result["fallback_count"], 1)
+            self.assertIn("деактивация", profile["problem_summary"].lower())
+            self.assertIn("runtime_fallback_profile", profile["quality_warnings"])
+            self.assertIn("llm_profile_failed", profile["quality_warnings"])
 
 
 if __name__ == "__main__":

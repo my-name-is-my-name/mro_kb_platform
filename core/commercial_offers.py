@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import signal
 import time
 import urllib.request
 import zipfile
@@ -188,6 +189,7 @@ class CommercialOffersService:
         self.embedding_model = os.getenv("MRO_KB_EMBEDDING_MODEL", "bge-m3:latest")
         self.query_rewrite_enabled = os.getenv("MRO_KB_QUERY_REWRITE_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
         self.profile_search_enabled = os.getenv("MRO_KB_PROFILE_SEARCH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+        self.case_profile_llm_timeout_seconds = int(os.getenv("MRO_KB_CASE_PROFILE_TIMEOUT_SECONDS", "180"))
         self.settings = RuntimeSettings()
         self._reranker = ExternalReranker(self.settings.reranker_url, batch_size=self.settings.reranker_batch_size) if (
             self.settings.reranker_enabled and self.settings.reranker_url
@@ -284,6 +286,7 @@ class CommercialOffersService:
         existing = {} if force else self._load_reusable_case_profiles()
         profiles = dict(existing)
         failures: list[str] = []
+        fallbacks: list[str] = []
         started = time.time()
         target_rows = self._registry if limit <= 0 else self._registry[:limit]
         target_case_ids = {row.get("case_id", "") for row in target_rows if row.get("case_id")}
@@ -300,9 +303,12 @@ class CommercialOffersService:
                 "done": reused_count,
                 "reused": reused_count,
                 "built": 0,
+                "fallback_count": 0,
+                "fallbacks": [],
                 "failure_count": 0,
                 "failures": [],
                 "current_case_id": "",
+                "phase": "starting",
                 "cache": str(self.case_profile_cache_path),
                 "schema_version": CASE_PROFILE_SCHEMA_VERSION,
                 "prompt_version": CASE_PROFILE_PROMPT_VERSION,
@@ -313,6 +319,27 @@ class CommercialOffersService:
             if not case_id:
                 continue
             case_failed = False
+            self._write_case_profile_progress(
+                {
+                    "status": "running",
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "total": total,
+                    "processed": index - 1,
+                    "done": len([case_id for case_id in profiles if case_id in target_case_ids]),
+                    "reused": reused_count,
+                    "built": built_count,
+                    "fallback_count": len(fallbacks),
+                    "fallbacks": fallbacks[-20:],
+                    "failure_count": len(failures),
+                    "failures": failures[-20:],
+                    "current_case_id": case_id,
+                    "phase": "preparing_source",
+                    "cache": str(self.case_profile_cache_path),
+                    "schema_version": CASE_PROFILE_SCHEMA_VERSION,
+                    "prompt_version": CASE_PROFILE_PROMPT_VERSION,
+                }
+            )
             source_text = self._case_profile_source_text(row)
             source_hash = self._text_hash(source_text)
             cached = profiles.get(case_id)
@@ -323,22 +350,39 @@ class CommercialOffersService:
                 and cached.get("prompt_version") == CASE_PROFILE_PROMPT_VERSION
             ):
                 continue
-            try:
-                profile = self._generate_case_profile(row, source_text)
-                profiles[case_id] = {
+            self._write_case_profile_progress(
+                {
+                    "status": "running",
+                    "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "total": total,
+                    "processed": index - 1,
+                    "done": len([case_id for case_id in profiles if case_id in target_case_ids]),
+                    "reused": reused_count,
+                    "built": built_count,
+                    "fallback_count": len(fallbacks),
+                    "fallbacks": fallbacks[-20:],
+                    "failure_count": len(failures),
+                    "failures": failures[-20:],
+                    "current_case_id": case_id,
+                    "phase": "llm_profile",
+                    "cache": str(self.case_profile_cache_path),
                     "schema_version": CASE_PROFILE_SCHEMA_VERSION,
                     "prompt_version": CASE_PROFILE_PROMPT_VERSION,
-                    "case_id": case_id,
-                    "source_hash": source_hash,
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "profile": profile,
-                    "search_text": self._case_profile_search_text(profile),
-                    "metadata_text": self._case_profile_metadata_text(profile),
                 }
-                built_count += 1
+            )
+            try:
+                profile = self._generate_case_profile_with_timeout(row, source_text)
             except Exception as exc:
-                failures.append(f"{case_id}: {exc}")
+                profile = self._fallback_case_profile(row, source_text)
+                warnings = CommercialOffersService._profile_string_list(profile.get("quality_warnings"), limit=8)
+                warnings.extend(["llm_profile_failed", f"llm_error: {type(exc).__name__}"])
+                profile["quality_warnings"] = list(dict.fromkeys(warnings))
+                profile["llm_profile_error"] = normalize_spaces(str(exc))[:300]
+                fallbacks.append(f"{case_id}: {exc}")
                 case_failed = True
+            profiles[case_id] = self._case_profile_cache_item(case_id, source_hash, profile)
+            built_count += 1
             if index % 5 == 0 or index == len(target_rows) or case_failed:
                 self._write_case_profile_cache(profiles)
                 self._write_case_profile_progress(
@@ -351,9 +395,12 @@ class CommercialOffersService:
                         "done": len([case_id for case_id in profiles if case_id in target_case_ids]),
                         "reused": reused_count,
                         "built": built_count,
+                        "fallback_count": len(fallbacks),
+                        "fallbacks": fallbacks[-20:],
                         "failure_count": len(failures),
                         "failures": failures[-20:],
                         "current_case_id": case_id,
+                        "phase": "fallback" if case_failed else "batch",
                         "cache": str(self.case_profile_cache_path),
                         "schema_version": CASE_PROFILE_SCHEMA_VERSION,
                         "prompt_version": CASE_PROFILE_PROMPT_VERSION,
@@ -373,9 +420,12 @@ class CommercialOffersService:
                 "done": done,
                 "reused": reused_count,
                 "built": built_count,
+                "fallback_count": len(fallbacks),
+                "fallbacks": fallbacks[-50:],
                 "failure_count": len(failures),
                 "failures": failures[-50:],
                 "current_case_id": "",
+                "phase": "finished",
                 "cache": str(self.case_profile_cache_path),
                 "schema_version": CASE_PROFILE_SCHEMA_VERSION,
                 "prompt_version": CASE_PROFILE_PROMPT_VERSION,
@@ -389,10 +439,24 @@ class CommercialOffersService:
             "profiles": done,
             "reused": reused_count,
             "built": built_count,
+            "fallback_count": len(fallbacks),
+            "fallbacks": fallbacks[:20],
             "failure_count": len(failures),
             "failures": failures[:20],
             "cache": str(self.case_profile_cache_path),
             "seconds": round(time.time() - started, 2),
+        }
+
+    def _case_profile_cache_item(self, case_id: str, source_hash: str, profile: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema_version": CASE_PROFILE_SCHEMA_VERSION,
+            "prompt_version": CASE_PROFILE_PROMPT_VERSION,
+            "case_id": case_id,
+            "source_hash": source_hash,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "profile": profile,
+            "search_text": self._case_profile_search_text(profile),
+            "metadata_text": self._case_profile_metadata_text(profile),
         }
 
     def case_profiles_status(self) -> dict[str, object]:
@@ -944,6 +1008,26 @@ class CommercialOffersService:
         profile["quality_warnings"] = warnings
         return profile
 
+    def _generate_case_profile_with_timeout(self, row: dict[str, str], source_text: str) -> dict[str, object]:
+        timeout = self.case_profile_llm_timeout_seconds
+        if timeout <= 0:
+            return self._generate_case_profile(row, source_text)
+
+        def _timeout_handler(_signum: int, _frame: object) -> None:
+            raise TimeoutError(f"case profile LLM timeout after {timeout}s")
+
+        try:
+            previous_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            previous_timer = signal.setitimer(signal.ITIMER_REAL, float(timeout))
+        except (AttributeError, ValueError):
+            return self._generate_case_profile(row, source_text)
+        try:
+            return self._generate_case_profile(row, source_text)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+            signal.signal(signal.SIGALRM, previous_handler)
+
     @staticmethod
     def _normalize_case_profile(payload: dict[str, object]) -> dict[str, object]:
         profile = {
@@ -986,18 +1070,25 @@ class CommercialOffersService:
             confidence = float(profile.get("confidence") or 0.0)
         except (TypeError, ValueError):
             confidence = 0.0
-        list_fields = ("ata", "components", "zones", "identifiers", "authority_path", "constraints_or_risks", "search_terms_ru_en")
+        structured_fields = ("ata", "components", "zones", "identifiers", "authority_path")
+        list_fields = structured_fields + ("constraints_or_risks", "search_terms_ru_en")
         useful_values = []
         for key in list_fields:
             value = profile.get(key)
             if isinstance(value, list):
                 useful_values.extend(str(item) for item in value if str(item).strip())
+        structured_values = []
+        for key in structured_fields:
+            value = profile.get(key)
+            if isinstance(value, list):
+                structured_values.extend(str(item) for item in value if str(item).strip())
         has_meaningful_summary = len(summary) >= 8 and summary not in PROFILE_PLACEHOLDER_VALUES
         has_commercial_signal = has_meaningful_summary and (
             work_type not in {"", "...", "other", "unknown"} or len(useful_values) >= 2
         )
+        has_technical_signal = bool(structured_values) or defect_type not in {"", "unknown", "...", "other"}
         if confidence < 0.4:
-            if has_commercial_signal:
+            if has_commercial_signal and has_technical_signal:
                 warnings.append("low_confidence_accepted")
             else:
                 errors.append("confidence_below_0_4")

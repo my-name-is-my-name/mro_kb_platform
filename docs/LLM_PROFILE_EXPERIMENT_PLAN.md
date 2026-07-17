@@ -44,7 +44,7 @@ Weaknesses:
 
 Instead of embedding raw case-card text, build compact profiles in a shared schema.
 
-Offline case profile:
+Offline case profile, current `schema_version=3`:
 
 ```json
 {
@@ -58,9 +58,10 @@ Offline case profile:
   "identifiers": [],
   "authority_path": [],
   "action_required": "",
-  "constraints_or_risks": [],
-  "search_terms_ru_en": [],
-  "evidence_fields": []
+    "constraints_or_risks": [],
+    "search_terms_ru_en": [],
+    "evidence_fields": [],
+    "confidence": 0.0
 }
 ```
 
@@ -105,6 +106,7 @@ Runtime behavior:
 4. Profile-vector retrieval is not enabled by default until metrics justify it.
 5. Runtime fallback profiles are weak regex/field profiles only; they do not use hand-written query aliases.
 6. Exact and lexical retrieval remain active as safety net.
+7. Structured profile similarity is currently diagnostic: it emits `structured_score`, reason class and explanations, but does not directly boost the final ranking score.
 
 Quality gate rejects profiles with:
 
@@ -182,10 +184,11 @@ Acceptance for enabling profile retrieval by default:
 
 ## Baseline Checkpoint
 
-Current measured baseline before profile retrieval:
+Current measured baseline before enabling profile retrieval as a ranking signal:
 
 - fallback + `Reestr_zayavok`: Hit@5 `0.644`, Hit@10 `0.678`;
-- partial semantic min-max hybrid before Reestr reindex: Hit@5 `0.690`, Hit@10 `0.747`;
-- reranker not yet included in these metrics.
+- fresh semantic hybrid on temporal slice up to `MP-0918`, reranker disabled: Hit@5 `0.690`, Hit@10 `0.793`;
+- semantic hybrid with compact reranker, pool 100, temporal slice: Hit@5 `0.736`, Hit@10 `0.828`;
+- candidate-pool recall@100 on temporal slice: `0.885`.
 
-Before enabling the profile path, rebuild embeddings with Reestr enrichment and record fresh current-hybrid metrics.
+The profile boost is not enabled in ranking because it did not improve the benchmark reliably enough. The next useful work is to improve candidate generation and source coverage for the current top-100 misses, then retest profile-vector retrieval and compact reranking on the same temporal slice.

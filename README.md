@@ -84,7 +84,7 @@ python3 -m apps.api.server rebuild-com-offers-manifest
 python3 -m apps.api.server reindex-com-offers
 ```
 
-`build-com-offer-profiles` builds experimental LLM case profiles. These profiles are not used by default ranking until metrics justify enabling them:
+`build-com-offer-profiles` builds experimental LLM case profiles. Profile vectors are not used by default ranking until metrics justify enabling them. The runtime still emits structured diagnostics from available profiles/fallback profiles: `structured_score`, `similarity_reason_class`, `go_no_go`, and `cost_readiness`.
 
 ```bash
 MRO_KB_LLM_ENABLED=1 python3 -m apps.api.server build-com-offer-profiles --limit 5
