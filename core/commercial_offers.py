@@ -1568,7 +1568,7 @@ class CommercialOffersService:
             reason_class = "weak_analog"
         return {"score": score, "reason_class": reason_class, "reasons": reasons[:6]}
 
-    def similar_cases(self, query: str, limit: int = 8) -> dict[str, object]:
+    def similar_cases(self, query: str, limit: int = 5) -> dict[str, object]:
         query_rewrite, rewrite_warnings = self._rewrite_query(query)
         search_queries = self._search_queries(query, query_rewrite)
         candidates = self._candidate_cases(search_queries, limit=max(limit * 20, 200))
