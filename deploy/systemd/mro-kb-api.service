@@ -1,0 +1,19 @@
+[Unit]
+Description=MRO KB API for OpenWebUI
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/ii_models/Users/hizhenkov/mro_kb_platform
+Environment=MRO_KB_PUBLIC_BASE_URL=http://10.100.112.51:8121
+Environment=MRO_KB_LLM_ENABLED=0
+Environment=MRO_KB_RERANKER_URL=http://10.251.10.5:9101
+Environment=MRO_KB_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+ExecStart=/home/akhi93m6/.local/bin/python3 -m apps.api.server --host 0.0.0.0 --port 8121
+Restart=always
+RestartSec=5
+StandardOutput=append:/mnt/ii_models/Users/hizhenkov/mro_kb_platform/data_runtime/mro_api_8121.log
+StandardError=append:/mnt/ii_models/Users/hizhenkov/mro_kb_platform/data_runtime/mro_api_8121.log
+
+[Install]
+WantedBy=default.target

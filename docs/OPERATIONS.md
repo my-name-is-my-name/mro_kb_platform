@@ -6,7 +6,11 @@ Recommended OpenWebUI API port for this project:
 
 ```bash
 cd /mnt/ii_models/Users/hizhenkov/mro_kb_platform
-python3 -m apps.api.server --host 0.0.0.0 --port 8121
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/mro-kb-api.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now mro-kb-api.service
+loginctl enable-linger "$USER"
 ```
 
 OpenWebUI base URL:
@@ -16,6 +20,33 @@ http://10.100.112.51:8121/v1
 ```
 
 Do not run another project on the same port.
+
+Check the persistent service:
+
+```bash
+systemctl --user status mro-kb-api.service
+```
+
+View logs:
+
+```bash
+journalctl --user -u mro-kb-api.service -f
+```
+
+Stop it with:
+
+```bash
+systemctl --user stop mro-kb-api.service
+```
+
+Fallback for environments without user systemd:
+
+```bash
+tools/start_mro_api.sh
+tools/stop_mro_api.sh
+```
+
+The fallback start script uses `nohup`, writes the PID to `data_runtime/mro_api_8121.pid`, and appends logs to `data_runtime/mro_api_8121.log`.
 
 ## Check Health
 
