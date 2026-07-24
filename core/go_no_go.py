@@ -8,7 +8,7 @@ import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -279,10 +279,34 @@ class AtaImpactAgent:
         self.ontology = self._load_ontology()
         self.evidence_enabled = True
         settings = RuntimeSettings()
-        enabled = os.getenv("MRO_KB_ATA_AGENT_LLM_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
-        self._llm = llm or (OpenAICompatibleLLM(settings) if enabled and settings.llm_enabled and settings.llm_provider == "openai" else None)
+        ata_llm_flag = os.getenv("MRO_KB_ATA_AGENT_LLM_ENABLED")
+        enabled = (
+            settings.llm_enabled
+            if ata_llm_flag is None
+            else ata_llm_flag.strip().lower() in {"1", "true", "yes", "on"}
+        )
+        ata_settings = replace(
+            settings,
+            llm_max_tokens=int(os.getenv("MRO_KB_ATA_LLM_MAX_TOKENS", "4000")),
+            llm_timeout_seconds=float(os.getenv("MRO_KB_ATA_LLM_TIMEOUT_SECONDS", "90")),
+        )
+        self._llm = llm or (OpenAICompatibleLLM(ata_settings) if enabled and settings.llm_enabled and settings.llm_provider == "openai" else None)
 
-    def analyze(self, request: str, fields: dict[str, object] | None = None, progress: Callable[[dict[str, object]], None] | None = None, mode: str = "ontology_llm") -> dict[str, object]:
+    def analyze(self, request: str, fields: dict[str, object] | None = None, progress: Callable[[dict[str, object]], None] | None = None, mode: str = "auto") -> dict[str, object]:
+        # v2 is the default. The old modes remain as explicit, deprecated
+        # compatibility fallbacks while consumers migrate.
+        if mode in {"auto", "standard", "extended"}:
+            from core.ata_impact.evidence import LegacyEvidenceRetrieverAdapter, NullAtaEvidenceRetriever
+            from core.ata_impact.service import AtaImpactService
+
+            evidence = LegacyEvidenceRetrieverAdapter(self.retriever) if self.retriever is not None else NullAtaEvidenceRetriever()
+            return AtaImpactService(self.certificate, self._llm, evidence).analyze(
+                request,
+                fields,
+                runtime_mode=mode,
+                progress=progress,
+            )
+
         def report(stage: str, message: str, **extra: object) -> None:
             if progress is not None:
                 progress({"stage": stage, "message": message, **extra})
@@ -364,9 +388,12 @@ class AtaImpactAgent:
         # Model selection belongs to the OpenAI-compatible endpoint.  Do not leak
         # or pin a concrete deployment name in the ATA service contract.
         return {
+            "pipeline_version": "v2",
+            "default_mode": "auto",
             "llm_critic": {"enabled": self._llm is not None, "provider": "openai_compatible" if self._llm is not None else None},
             "evidence_enabled": self.evidence_enabled,
             "ontology_loaded": bool(self.ontology.get("links")),
+            "legacy_ontology": {"enabled_by_default": False, "deprecated": True},
         }
 
     def _load_ontology(self) -> dict[str, object]:
@@ -794,12 +821,16 @@ class DuckDuckGoEvidenceRetriever:
 
 
 class InternalEvidenceRetriever:
+    _local_documents_cache: list[dict[str, str]] | None = None
+
     def __init__(self, store: SQLiteStore, commercial_offers: Any | None = None, tsearch: TSearchRetriever | None = None) -> None:
         self.store = store
         self.commercial_offers = commercial_offers
         self.tsearch = tsearch or TSearchRetriever()
         self.search_timeout_seconds = max(1, int(os.getenv("MRO_KB_GO_NO_GO_SEARCH_TIMEOUT_SECONDS", "6")))
-        self.local_documents = self._load_local_documents()
+        if self.__class__._local_documents_cache is None:
+            self.__class__._local_documents_cache = self._load_local_documents()
+        self.local_documents = self.__class__._local_documents_cache
 
     @staticmethod
     def _load_local_documents() -> list[dict[str, str]]:
@@ -848,7 +879,8 @@ class InternalEvidenceRetriever:
         document_models = {re.sub(r"[^a-z0-9]", "", item.lower()) for item in AIRCRAFT_RE.findall(text)}
         return not (requested_models and document_models and requested_models.isdisjoint(document_models))
 
-    def _search_local_documents(self, query: str, limit: int, filters: dict[str, object]) -> list[dict[str, object]]:
+    def _search_local_documents(self, query: str, limit: int, filters: dict[str, object] | None = None) -> list[dict[str, object]]:
+        filters = filters or {}
         tokens = {
             token.lower()
             for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9-]{3,}", query or "")
@@ -973,6 +1005,7 @@ class GoNoGoService:
         self.retriever = InternalEvidenceRetriever(store, commercial_offers)
         settings = RuntimeSettings()
         self._llm = OpenAICompatibleLLM(settings) if settings.llm_enabled and settings.llm_provider == "openai" else None
+        self.ata_impact = AtaImpactAgent(self.certificate, self.ata_catalog, self.retriever)
 
     def health(self) -> dict[str, object]:
         return {
@@ -987,19 +1020,27 @@ class GoNoGoService:
         facts = self._extract_facts(request, fields)
         if self._llm is not None and os.getenv("MRO_KB_GO_NO_GO_LLM_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
             facts = self._llm_enrich_facts(request, facts)
-        impact = self._impact_analysis(request, facts)
-        certificate = self.certificate.match(impact["confirmed_affected_ata"] or impact["direct_ata"])
+        staged = self.ata_impact.analyze(request, fields, mode="auto")
+        impact = {
+            "direct_ata": list(staged.get("affected_ata") or []),
+            "potentially_affected_ata": list(staged.get("potentially_affected_ata") or []),
+            "confirmed_affected_ata": list(staged.get("affected_ata") or []),
+            "unresolved_ata": (
+                ["ATA scope"] if staged.get("decision") == "engineering_review_required" else []
+            ),
+        }
+        certificate = staged.get("certificate_scope") or self.certificate.match(impact["direct_ata"])
         missing = self._missing_inputs(facts)
-        evidence_result = self.retriever.retrieve(request, {"ata_codes": impact["confirmed_affected_ata"] or impact["direct_ata"], "aircraft_type": facts.get("aircraft_type", "")})
+        requested_ata = impact["confirmed_affected_ata"] or impact["direct_ata"]
+        evidence_result = (
+            self.retriever.retrieve(request, {"ata_codes": requested_ata, "aircraft_type": facts.get("aircraft_type", "")})
+            if requested_ata
+            else {"documents": [], "retrieval_mode": "skipped_no_validated_ata", "warnings": []}
+        )
         evidence = evidence_result.get("documents") or []
         evidence_ata = self.ata_catalog.evidence_candidates([item for item in evidence if isinstance(item, dict)], impact["confirmed_affected_ata"])
-        known_potential = set(impact["potentially_affected_ata"])
-        for item in evidence_ata:
-            ata = str(item.get("ata") or "")
-            if ata and ata not in known_potential:
-                impact["potentially_affected_ata"].append(ata)
-                known_potential.add(ata)
-        impact["potentially_affected_ata"].sort()
+        # Evidence search hits remain diagnostic candidates. They must not
+        # bypass v2 relation/category/critic validation or mutate ATA impact.
         unresolved = impact["unresolved_ata"]
         risks: list[str] = []
         if unresolved:
@@ -1009,8 +1050,8 @@ class GoNoGoService:
         if not evidence:
             risks.append("внутренние доказательные документы не найдены")
         if certificate.get("status") == "out_of_scope":
-            recommendation = "no_go"
-            reason = "подтверждённая ATA вне доступного перечня сертификата"
+            recommendation = "hold_expert_review"
+            reason = "техническая ATA не найдена в текущей области сертификата; требуется отдельная capability-проверка"
         elif missing:
             recommendation = "need_more_info"
             reason = "для проверки применимости и обоснования не хватает исходных данных"
@@ -1026,10 +1067,10 @@ class GoNoGoService:
             "needs_human_approval": True,
             "case_facts": facts,
             "ata_discovery": {
-                "catalog_version": self.ata_catalog.version,
-                "catalog_source": str(self.ata_catalog.path),
-                "initial_candidates": facts.get("ata_candidates", []),
-                "related_candidates": facts.get("related_ata_candidates", []),
+                "catalog_version": "deprecated-disabled",
+                "catalog_source": "LLM semantic classification; certificate scope checked separately",
+                "initial_candidates": staged.get("ata_mapping", {}),
+                "related_candidates": [],
                 "evidence_candidates": evidence_ata,
             },
             "direct_ata": impact["direct_ata"],
@@ -1045,6 +1086,8 @@ class GoNoGoService:
             "questions_for_expert": self._expert_questions(facts, impact, evidence),
             "explanation": reason,
             "search_trace": {"retrieval_mode": evidence_result.get("retrieval_mode", ""), "warnings": evidence_result.get("warnings", [])},
+            "ata_impact": staged,
+            "capability_screening": "not_assessed",
         }
         result["answer"] = self._build_answer(result)
         return result
@@ -1095,11 +1138,9 @@ class GoNoGoService:
         component_text = " ".join(str(fields.get(key) or "") for key in ("component", "components", "asset_name", "zone", "zones"))
         declared_ata = self._ata_codes(" ".join(str(fields.get(key) or "") for key in ("ata", "ata_code", "ata_codes")))
         direct_ata = sorted(set(self._ata_codes(" ".join(part for part in (text, component_text) if part)) + declared_ata))
-        if not direct_ata:
-            candidates = self.ata_catalog.candidates(" ".join(part for part in (text, component_text) if part), declared_ata)
-            direct_ata = [str(item["ata"]) for item in candidates if float(item.get("score", 0.0)) >= 20.0]
-        else:
-            candidates = self.ata_catalog.candidates(" ".join(part for part in (text, component_text) if part), direct_ata)
+        # Formal identifiers only. Semantic ATA classification belongs to the
+        # staged AtaImpactAgent v2 invoked by triage(), never to legacy aliases.
+        candidates: list[dict[str, object]] = []
         identifiers = sorted({match.group(0).strip() for match in IDENTIFIER_RE.finditer(text)})
         aircraft = str(fields.get("aircraft_type") or "") or (AIRCRAFT_RE.search(text).group(0) if AIRCRAFT_RE.search(text) else "")
         merged = {key: value for key, value in fields.items() if value not in (None, "", [])}

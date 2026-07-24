@@ -65,9 +65,15 @@ The ATA-impact service is deployed independently at:
 http://10.100.112.51:8122/v1
 ```
 
-Select the `mro-ata-impact` model in an OpenAI-compatible client. Its first layer
-uses the controlled ontology and does not retrieve AMM/NTM/CMM documents; those
-documents are checked only by the later Go/No-Go workflow.
+Select the `mro-ata-impact` model in an OpenAI-compatible client. ATA impact v2
+extracts engineering facts before ATA classification, lets the LLM create
+candidates, validates certificate scope separately, runs a critic, and then
+queries the configured OEM evidence retriever. Certificate scope is not
+capability approval. The legacy ontology and keyword catalog are disabled by
+default and remain only in explicit deprecated compatibility modes.
+Reasoning-style local models may require `MRO_KB_ATA_LLM_MAX_TOKENS` (default
+`4000`) and `MRO_KB_ATA_LLM_TIMEOUT_SECONDS` (default `90`) so the structured
+JSON answer is not truncated.
 ```
 
 Available OpenWebUI models:

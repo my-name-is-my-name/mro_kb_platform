@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline, leakage-safe ATA chapter benchmark for the first-pass agent."""
+"""ATA chapter benchmark with explicit legacy, fallback and real-LLM modes."""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +26,12 @@ def main() -> None:
     parser.add_argument("--fixture", default="tests/fixtures/ata_impact_from_mro_rag.jsonl")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output", type=Path, help="Write per-case predictions and aggregate metrics as JSON.")
+    parser.add_argument(
+        "--mode",
+        choices=("legacy-rules", "v2-fallback", "v2-llm"),
+        default="legacy-rules",
+        help="legacy-rules preserves the deprecated offline baseline; v2-llm measures the new semantic pipeline.",
+    )
     args = parser.parse_args()
     fixture = Path(args.fixture)
     if not fixture.is_absolute():
@@ -33,10 +39,18 @@ def main() -> None:
     rows = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines() if line.strip()]
     if args.limit:
         rows = rows[:args.limit]
-    # First-layer benchmark: documents and LLM are intentionally excluded so
-    # historical work-order text cannot leak an answer into the classifier.
-    os.environ["MRO_KB_ATA_AGENT_LLM_ENABLED"] = "0"
+    if args.mode in {"legacy-rules", "v2-fallback"}:
+        os.environ["MRO_KB_ATA_AGENT_LLM_ENABLED"] = "0"
+    elif os.getenv("MRO_KB_ATA_AGENT_LLM_ENABLED", "").lower() not in {"1", "true", "yes", "on"}:
+        raise SystemExit("v2-llm requires MRO_KB_ATA_AGENT_LLM_ENABLED=1")
     agent = AtaImpactAgent()
+    if args.mode == "v2-llm":
+        health = agent.health()
+        if not health.get("llm_critic", {}).get("enabled"):
+            raise SystemExit("v2-llm requested but ATA LLM is disabled")
+        llm_health = agent._llm.health() if agent._llm is not None else {"ok": False}
+        if not llm_health.get("ok"):
+            raise SystemExit(f"v2-llm endpoint is unavailable: {llm_health.get('error', 'unknown error')}")
     hits_at_1 = hits_at_3 = eligible = predicted_queries = exact_sets = 0
     true_positive = false_positive = false_negative = 0
     latencies_ms: list[float] = []
@@ -50,10 +64,14 @@ def main() -> None:
         fields = {key: input_data[key] for key in ("aircraft_type", "msn", "case_type") if input_data.get(key) not in (None, "")}
         request = str(input_data.get("request") or input_data.get("description") or input_data.get("problem_summary") or "")
         started = time.perf_counter()
-        result = agent.analyze(request, fields)
+        runtime_mode = "rules_only" if args.mode == "legacy-rules" else "auto"
+        result = agent.analyze(request, fields, mode=runtime_mode)
+        if args.mode == "v2-llm" and result.get("runtime_mode") == "fallback":
+            raise RuntimeError(f"v2-llm fell back for benchmark case {row.get('benchmark_id')}: {result.get('warnings')}")
         elapsed_ms = (time.perf_counter() - started) * 1000
         latencies_ms.append(elapsed_ms)
-        predicted = list(dict.fromkeys(chapter(str(item)) for item in result["direct_ata"]))
+        source = result["direct_ata"] if args.mode == "legacy-rules" else result["affected_ata"]
+        predicted = list(dict.fromkeys(chapter(str(item)) for item in source))
         predicted_set = set(predicted)
         intersection = expected & predicted_set
         hits_at_1 += bool(expected.intersection(predicted[:1]))
@@ -73,7 +91,7 @@ def main() -> None:
     precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else 0.0
     recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else 0.0
     metrics = {
-        "fixture": str(fixture), "eligible": eligible, "mode": "first_layer_no_llm_no_evidence",
+        "fixture": str(fixture), "eligible": eligible, "mode": args.mode,
         "chapter_hit_at_1": round(hits_at_1 / eligible, 4) if eligible else 0,
         "chapter_hit_at_3": round(hits_at_3 / eligible, 4) if eligible else 0,
         "chapter_precision_micro": round(precision, 4),

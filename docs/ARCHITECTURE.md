@@ -73,6 +73,15 @@ OpenAI-compatible endpoints:
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
+ATA impact v2 находится в `core/ata_impact/`. Engineering fact extraction, ATA
+mapping, certificate validation, critic, OEM evidence retrieval и deterministic
+assembly имеют отдельные границы. `CertificateCatalog` предоставляет официальный
+certificate scope, но не доказывает техническую классификацию и capability.
+
+`config/mro_ontology_v1.json` и `config/ata_catalog_overrides.json` deprecated и
+disabled by default. Они доступны только через explicit compatibility modes и
+не передаются v2 LLM как allowlist.
+
 Native endpoints:
 
 - `GET /api/health`

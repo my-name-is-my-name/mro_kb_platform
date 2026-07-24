@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from core.go_no_go import AtaImpactAgent
 
 
+@patch.dict("os.environ", {"MRO_KB_ATA_AGENT_LLM_ENABLED": "0"})
 class AtaImpactV1Tests(unittest.TestCase):
     def test_intake_does_not_query_historical_or_document_retriever(self) -> None:
         class Retriever:

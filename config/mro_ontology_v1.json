@@ -1,5 +1,8 @@
 {
-  "version": "1.1.2",
+  "version": "1.1.2-deprecated",
+  "deprecated": true,
+  "enabled_by_default": false,
+  "deprecation_note": "Not used by ATA impact v2 and never supplied as an LLM candidate allowlist; retained only for explicit legacy modes.",
   "review_workflow": {
     "status": "provisional_pending_engineering_approval",
     "engineering_owner": "MRO Engineering",

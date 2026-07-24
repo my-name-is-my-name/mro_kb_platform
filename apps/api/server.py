@@ -242,6 +242,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or "0")
             raw = self.rfile.read(length) if length else b"{}"
             payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                return self._send_json({"error": {"message": "JSON body must be an object", "type": "invalid_request_error"}}, status=400)
             if parsed.path == "/v1/chat/completions":
                 model = str(payload.get("model") or "").strip()
                 if model not in {"mro-kb", "mro-similar-cases", "mro-go-no-go", "mro-ata-impact"}:
@@ -279,7 +281,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send_json({"ok": False, "error": "request is required"}, status=400)
                 fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
                 fields = {**{key: value for key, value in payload.items() if key in {"aircraft_type", "component", "components", "asset_name", "zone", "zones", "part_number", "ata", "ata_code", "ata_codes"}}, **fields}
-                mode = str(payload.get("mode") or "ontology_llm")
+                mode = str(payload.get("mode") or "auto")
                 return self._send_json({"ok": True, "ata_impact": SERVICES.ata_impact.analyze(request_text, fields, mode=mode)})
             if parsed.path == "/api/chat":
                 question = str(payload.get("q") or payload.get("question") or "").strip()
@@ -287,6 +289,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send_json({"ok": False, "error": "q is required"}, status=400)
                 return self._send_json({"ok": True, **SERVICES.retrieval.chat(question)})
             return self._send_json({"ok": False, "error": "not found"}, status=404)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self._send_json({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
         except Exception as exc:
             return self._send_json({"ok": False, "error": f"internal error: {exc}"}, status=500)
 

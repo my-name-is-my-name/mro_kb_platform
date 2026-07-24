@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from core.go_no_go import AtaImpactAgent, CertificateCatalog
 
@@ -25,6 +26,7 @@ class FakeReActLLM:
         return {"ok": True, "provider": "fake"}
 
 
+@patch.dict("os.environ", {"MRO_KB_ATA_AGENT_LLM_ENABLED": "0"})
 class AtaImpactAgentTests(unittest.TestCase):
     def test_full_pipeline_confirms_secondary_only_from_applicable_controlled_document(self) -> None:
         class Retriever:

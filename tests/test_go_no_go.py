@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from core.go_no_go import CertificateCatalog, GoNoGoService, InternalEvidenceRetriever, TSearchRetriever
 from storage.sqlite.store import SQLiteStore
@@ -17,7 +18,8 @@ class GoNoGoTests(unittest.TestCase):
         path = Path(tempfile.mktemp(suffix=".sqlite3"))
         store = SQLiteStore(path)
         store.initialize()
-        return GoNoGoService(store)
+        with patch.dict("os.environ", {"MRO_KB_ATA_AGENT_LLM_ENABLED": "0"}):
+            return GoNoGoService(store)
 
     def test_certificate_catalog_reads_docx_and_matches_known_ata(self) -> None:
         self.assertTrue(self.certificate.entries)
@@ -32,14 +34,18 @@ class GoNoGoTests(unittest.TestCase):
         self.assertIn("Запросить дополнительную информацию", result["answer"])
         self.assertIn("размеры/координаты повреждения", result["missing_inputs"])
         self.assertIn("фотографии повреждения", result["missing_inputs"])
-        self.assertEqual(result["confirmed_affected_ata"], ["ATA 53"])
+        self.assertEqual(result["confirmed_affected_ata"], [])
+        self.assertEqual(
+            [item["ata"] for item in result["ata_impact"]["validated_ata"]["user_declared_unverified"]],
+            ["ATA 53"],
+        )
         self.assertTrue(result["needs_human_approval"])
 
-    def test_modification_expands_impact_and_out_of_scope_blocks_go(self) -> None:
+    def test_modification_does_not_mix_certificate_scope_with_capability(self) -> None:
         result = self.make_service().triage("Модификация электрической системы ATA 24 на Airbus A320")
-        self.assertEqual(result["recommendation"], "no_go")
-        self.assertIn("ATA 51", result["potentially_affected_ata"])
-        self.assertIn("ATA 51", result["certificate_scope"]["unmatched"])
+        self.assertEqual(result["recommendation"], "hold_expert_review")
+        self.assertNotIn("ATA 51", result["potentially_affected_ata"])
+        self.assertEqual(result["capability_screening"], "not_assessed")
 
     def test_unknown_scope_is_hold_or_no_go_not_go(self) -> None:
         result = self.make_service().triage("Работа на неизвестной системе ATA 99")
@@ -56,7 +62,7 @@ class GoNoGoTests(unittest.TestCase):
         self.assertTrue(evidence)
         self.assertTrue(any(item["source_type"] == "additional_internal_document" for item in evidence))
 
-    def test_fields_infer_ata_and_do_not_request_already_available_photos(self) -> None:
+    def test_fields_do_not_use_legacy_semantic_mapping_without_llm(self) -> None:
         result = self.make_service().triage(
             "Разработать ремонт трещины в районе шпангоута FR 35 фюзеляжа Airbus A320",
             {
@@ -66,7 +72,8 @@ class GoNoGoTests(unittest.TestCase):
                 "documents_available": ["фотографии повреждения"],
             },
         )
-        self.assertEqual(result["direct_ata"], ["ATA 53"])
+        self.assertEqual(result["direct_ata"], [])
+        self.assertEqual(result["ata_impact"]["decision"], "engineering_review_required")
         self.assertNotIn("фотографии повреждения", result["missing_inputs"])
         self.assertIn("размеры/координаты повреждения", result["missing_inputs"])
 

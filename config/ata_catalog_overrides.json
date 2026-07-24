@@ -1,5 +1,8 @@
 {
-  "version": "2026-07-23.2",
+  "version": "2026-07-23.2-deprecated",
+  "deprecated": true,
+  "enabled_by_default": false,
+  "deprecation_note": "Not used by ATA impact v2; retained only for explicit legacy modes until compatibility consumers migrate.",
   "description": "Экспертно управляемые синонимы компонентов и правила поиска связанных ATA. Сертификат DOCX остаётся источником списка ATA. Это не копия ATA iSpec 2200 и не заменяет OEM-документацию.",
   "sources": [
     {
