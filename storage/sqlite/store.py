@@ -66,6 +66,9 @@ class SQLiteStore:
             with self.connect() as conn:
                 conn.executescript(SCHEMA_SQL)
                 self._migrate_chunks_schema(conn)
+                self._migrate_documents_schema(conn)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_trust_level ON documents(trust_level)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_aircraft_type ON documents(aircraft_type)")
 
     @staticmethod
     def _migrate_chunks_schema(conn: sqlite3.Connection) -> None:
@@ -79,6 +82,26 @@ class SQLiteStore:
             "search_text": "ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''",
             "table_refs_json": "ALTER TABLE chunks ADD COLUMN table_refs_json TEXT NOT NULL DEFAULT '[]'",
             "metadata_json": "ALTER TABLE chunks ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, statement in migrations.items():
+            if column not in existing:
+                conn.execute(statement)
+
+    @staticmethod
+    def _migrate_documents_schema(conn: sqlite3.Connection) -> None:
+        existing = {str(row["name"]) for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        migrations = {
+            "document_type": "ALTER TABLE documents ADD COLUMN document_type TEXT NOT NULL DEFAULT ''",
+            "issuer": "ALTER TABLE documents ADD COLUMN issuer TEXT NOT NULL DEFAULT ''",
+            "aircraft_type": "ALTER TABLE documents ADD COLUMN aircraft_type TEXT NOT NULL DEFAULT ''",
+            "effectivity": "ALTER TABLE documents ADD COLUMN effectivity TEXT NOT NULL DEFAULT ''",
+            "ata": "ALTER TABLE documents ADD COLUMN ata TEXT NOT NULL DEFAULT ''",
+            "revision": "ALTER TABLE documents ADD COLUMN revision TEXT NOT NULL DEFAULT ''",
+            "issue_date": "ALTER TABLE documents ADD COLUMN issue_date TEXT NOT NULL DEFAULT ''",
+            "section_reference": "ALTER TABLE documents ADD COLUMN section_reference TEXT NOT NULL DEFAULT ''",
+            "source_url": "ALTER TABLE documents ADD COLUMN source_url TEXT NOT NULL DEFAULT ''",
+            "trust_level": "ALTER TABLE documents ADD COLUMN trust_level TEXT NOT NULL DEFAULT 'internal_reference'",
+            "source_origin": "ALTER TABLE documents ADD COLUMN source_origin TEXT NOT NULL DEFAULT 'internal'",
         }
         for column, statement in migrations.items():
             if column not in existing:
@@ -126,8 +149,10 @@ class SQLiteStore:
                 conn.executemany(
                     """
                     INSERT INTO documents (
-                        document_id, case_id, source_document_id, title, subject, document_family, source_file, source_system
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        document_id, case_id, source_document_id, title, subject, document_family, source_file, source_system,
+                        document_type, issuer, aircraft_type, effectivity, ata, revision, issue_date, section_reference,
+                        source_url, trust_level, source_origin
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -139,6 +164,17 @@ class SQLiteStore:
                             row.get("document_family", ""),
                             row.get("source_file", ""),
                             row.get("source_system", "mro_rag"),
+                            row.get("document_type", row.get("document_family", "")),
+                            row.get("issuer", row.get("oem_or_regulator", "")),
+                            row.get("aircraft_type", ""),
+                            row.get("effectivity", row.get("msn_effectivity", "")),
+                            row.get("ata", ""),
+                            row.get("revision", ""),
+                            row.get("issue_date", row.get("date", "")),
+                            row.get("section_reference", row.get("section", "")),
+                            row.get("source_url", ""),
+                            row.get("trust_level", "internal_reference"),
+                            row.get("source_origin", "internal"),
                         )
                         for row in documents
                     ],
@@ -268,7 +304,9 @@ class SQLiteStore:
                        h.section_label, h.section_title, h.heading_path_json,
                        h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
                        h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
-                       d.source_document_id, d.title AS document_title
+                       d.source_document_id, d.title AS document_title, d.document_type, d.issuer,
+                       d.aircraft_type AS document_aircraft_type, d.effectivity, d.ata AS document_ata,
+                       d.revision, d.issue_date, d.section_reference, d.source_url, d.trust_level, d.source_origin
                 FROM chunks h
                 JOIN documents d ON d.document_id = h.document_id
                 WHERE h.chunk_id = ?
@@ -473,6 +511,9 @@ class SQLiteStore:
             rows = conn.execute(
                 f"""
                 SELECT d.document_id, d.case_id, d.source_document_id, d.title, d.subject, d.document_family, d.source_file,
+                       d.document_type, d.issuer, d.aircraft_type AS document_aircraft_type, d.effectivity,
+                       d.ata AS document_ata, d.revision, d.issue_date, d.section_reference, d.source_url,
+                       d.trust_level, d.source_origin,
                        c.problem_summary, c.aircraft_type,
                        ({' + '.join(score_terms)}) AS lexical_score,
                        ({' + '.join(coverage_terms)}) AS token_coverage
@@ -494,7 +535,9 @@ class SQLiteStore:
                        h.section_label, h.section_title, h.heading_path_json,
                        h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
                        h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
-                       d.source_document_id, d.title, d.document_family,
+                       d.source_document_id, d.title, d.document_family, d.document_type, d.issuer,
+                       d.aircraft_type AS document_aircraft_type, d.effectivity, d.ata AS document_ata,
+                       d.revision, d.issue_date, d.section_reference, d.source_url, d.trust_level, d.source_origin,
                        c.subject, c.problem_summary, c.aircraft_type, c.msn
                 FROM chunks h
                 JOIN documents d ON d.document_id = h.document_id
@@ -517,8 +560,8 @@ class SQLiteStore:
                        h.section_label, h.section_title, h.heading_path_json,
                        h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
                        h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
-                       d.source_document_id, d.title, d.document_family,
-                       c.subject, c.problem_summary, c.aircraft_type, c.msn
+                       d.source_document_id, d.title, d.document_family, d.document_type, d.issuer,
+                      c.subject, c.problem_summary, c.aircraft_type, c.msn
                 FROM chunks h
                 JOIN documents d ON d.document_id = h.document_id
                 JOIN cases c ON c.case_id = h.case_id

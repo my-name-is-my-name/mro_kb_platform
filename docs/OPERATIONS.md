@@ -17,6 +17,16 @@ OpenWebUI base URL:
 
 ```text
 http://10.100.112.51:8121/v1
+
+The independent ATA-impact endpoint for OpenWebUI is:
+
+```text
+http://10.100.112.51:8122/v1
+```
+
+It publishes model `mro-ata-impact`. Install and enable
+`deploy/systemd/mro-ata-impact.service` for a persistent deployment. The service
+does not replace or restart the legacy API on port 8121.
 ```
 
 Do not run another project on the same port.

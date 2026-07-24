@@ -1,0 +1,55 @@
+{
+  "version": "2026-07-23.2",
+  "description": "Экспертно управляемые синонимы компонентов и правила поиска связанных ATA. Сертификат DOCX остаётся источником списка ATA. Это не копия ATA iSpec 2200 и не заменяет OEM-документацию.",
+  "sources": [
+    {
+      "source_id": "ata-ispec-2200",
+      "title": "ATA iSpec 2200 / ATA Standard Numbering System",
+      "authority": "Airlines for America / ATA",
+      "access": "licensed",
+      "use": "Нормативный справочник нумерации; загружается контролируемо при наличии лицензии."
+    },
+    {
+      "source_id": "oem-amm-srm-ipc-cmm",
+      "title": "OEM AMM/SRM/IPC/CMM/ALS",
+      "authority": "Производитель ВС/компонента",
+      "access": "controlled_ingestion",
+      "use": "Единственный источник для подтверждения применимости на уровне subchapter/процедуры."
+    },
+    {
+      "source_id": "easa-faa-public",
+      "title": "Публичные EASA/FAA материалы",
+      "authority": "EASA / FAA",
+      "access": "public_supplemental",
+      "use": "Дополнительный контекст, AD и регуляторные требования; не подтверждает OEM-процедуру."
+    }
+  ],
+  "alias_sources": {
+    "ATA 24": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"},
+    "ATA 25": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"},
+    "ATA 34": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"},
+    "ATA 52": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"},
+    "ATA 53": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"},
+    "ATA 55": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"},
+    "ATA 56": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"},
+    "ATA 57": {"source_id": "ata-ispec-2200", "review_status": "expert_reviewed"}
+  },
+  "aliases": {
+    "ATA 24": ["электрика", "электрическая система", "электропроводка", "кабель", "жгут", "wiring", "electrical"],
+    "ATA 25": ["салон", "кресло", "обивка", "интерьер", "cabin", "seat", "interior"],
+    "ATA 34": ["приемник статического давления", "приёмник статического давления", "приемник полного давления", "приёмник полного давления", "статическое давление", "полное давление", "пито", "pitot", "air data", "барометрический"],
+    "ATA 52": ["дверь", "люк", "аварийный выход", "door", "hatch"],
+    "ATA 53": ["фюзеляж", "шпангоут", "стрингер", "обшивка фюзеляжа", "fuselage", "frame", "stringer"],
+    "ATA 55": ["оперение", "стабилизатор", "руль направления", "empennage", "stabilizer"],
+    "ATA 56": ["окно", "фонарь", "лобовое стекло", "windshield", "window"],
+    "ATA 57": ["крыло", "предкрылок", "закрылок", "wing", "slat", "flap"]
+  },
+  "impact_rules": [
+    {"id": "modification", "when_any": ["изменение", "модификация", "переоборудование", "modification", "installation"], "add": ["ATA 51"], "reason": "изменение конструкции требует проверки общих практик и стандартов", "requires_evidence": true},
+    {"id": "electrical", "when_any": ["электр", "провод", "кабель", "wiring", "power", "electrical"], "add": ["ATA 24"], "reason": "в заявке есть признак электрической системы или проводки", "requires_evidence": true},
+    {"id": "flight_controls", "when_any": ["управлен", "тяга", "control", "flight control"], "add": ["ATA 27"], "reason": "в заявке есть признак системы управления", "requires_evidence": true},
+    {"id": "fire", "when_any": ["пожар", "fire"], "add": ["ATA 26"], "reason": "в заявке есть признак противопожарной системы", "requires_evidence": true},
+    {"id": "cabin", "when_any": ["салон", "кресл", "интерьер", "interior", "cabin"], "add": ["ATA 25"], "reason": "в заявке есть признак салона", "requires_evidence": true},
+    {"id": "covers_need_object", "when_any": ["чехл", "seat cover", "seat covers"], "add": ["ATA 25"], "reason": "чехлы обычно относятся к интерьеру/креслам, но объект необходимо подтвердить", "requires_evidence": true}
+  ]
+}

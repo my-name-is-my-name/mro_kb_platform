@@ -4,6 +4,7 @@
 
 - `mro-kb`: RAG over completed MRO case documents and engineering evidence.
 - `mro-similar-cases`: analogue search over commercial MRO requests from `com_offers`.
+- `mro-go-no-go`: first-line recommendation whether a new request can proceed to engineering assessment, needs more information, is out of scope, or requires expert review.
 
 The two models are intentionally separate. `mro-kb` answers from the engineering/document knowledge base. `mro-similar-cases` searches commercial analogues and uses documents only as evidence, not as the primary similarity source.
 
@@ -57,6 +58,16 @@ OpenWebUI base URL:
 
 ```text
 http://10.100.112.51:8121/v1
+
+The ATA-impact service is deployed independently at:
+
+```text
+http://10.100.112.51:8122/v1
+```
+
+Select the `mro-ata-impact` model in an OpenAI-compatible client. Its first layer
+uses the controlled ontology and does not retrieve AMM/NTM/CMM documents; those
+documents are checked only by the later Go/No-Go workflow.
 ```
 
 Available OpenWebUI models:
@@ -117,6 +128,17 @@ curl -X POST http://127.0.0.1:8121/api/ingest/run
 - `GET /api/documents/{document_id}`
 - `GET /api/chunks/{chunk_id}`
 - `GET /api/com-offers/registry/{case_id}`
+- `POST /api/triage`
+
+Example go/no-go request:
+
+```bash
+curl -X POST http://127.0.0.1:8121/api/triage \
+  -H 'Content-Type: application/json' \
+  -d '{"request":"Ремонт повреждения фюзеляжа ATA 53 на Airbus A320"}'
+```
+
+The triage response is a recommendation and always contains `needs_human_approval: true`. T-Search is an optional evidence retriever; configure `MRO_KB_TSEARCH_ENABLED=1` and `MRO_KB_TSEARCH_URL` only after deploying its separate harness. See [T-Search deployment specification](docs/T_SEARCH_DEPLOYMENT_SPEC.md).
 
 ## Runtime Environment
 

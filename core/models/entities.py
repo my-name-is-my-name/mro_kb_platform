@@ -38,3 +38,27 @@ class DocumentChunk:
     block_id: str = ""
     vault_note_path: str = ""
     page_image_path: str = ""
+
+
+@dataclass(slots=True)
+class DocumentRecord:
+    """Controlled-document registry fields used by ATA evidence retrieval.
+
+    The registry is deliberately separate from a chunk's free-form metadata: an
+    ATA conclusion must be auditable without relying on a filename or an LLM
+    interpretation of a historical case.
+    """
+
+    document_id: str
+    document_type: str = ""
+    issuer: str = ""
+    aircraft_type: str = ""
+    effectivity: str = ""
+    ata: str = ""
+    revision: str = ""
+    issue_date: str = ""
+    section_reference: str = ""
+    source_url: str = ""
+    source_path: str = ""
+    trust_level: str = "internal_reference"
+    source_origin: str = "internal"

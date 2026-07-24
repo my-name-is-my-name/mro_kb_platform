@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.config import ensure_runtime_dirs
 from core.commercial_offers import CommercialOffersService
+from core.go_no_go import AtaImpactAgent, GoNoGoService
 from core.retrieval.service import RetrievalService
 from ingest.mro_docs.import_documents import import_mro_documents
 from ingest.publish_obsidian.publish import publish_obsidian_vault
@@ -28,6 +31,8 @@ class RuntimeServices:
         self.store.initialize()
         self.retrieval = RetrievalService(self.store)
         self.commercial_offers = CommercialOffersService()
+        self.go_no_go = GoNoGoService(self.store, self.commercial_offers)
+        self.ata_impact = AtaImpactAgent(self.go_no_go.certificate, self.go_no_go.ata_catalog, self.go_no_go.retriever)
 
     def run_ingest(self) -> dict[str, object]:
         demo_root = self.paths.mro_rag_root / "apps" / "webapp" / "demo_data"
@@ -66,6 +71,84 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_openai_completion(self, model: str, result: dict[str, object], stream: bool) -> None:
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        content = str(result.get("answer") or "")
+        if not stream:
+            return self._send_json(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+                    "sources": result.get("sources") or [],
+                    "warnings": result.get("warnings") or [],
+                    "triage": result if model == "mro-go-no-go" else None,
+                    "ata_impact": result if model == "mro-ata-impact" else None,
+                }
+            )
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        chunks = [
+            {"id": completion_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]},
+            {"id": completion_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]},
+            {"id": completion_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+        ]
+        for chunk in chunks:
+            self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
+    def _send_ata_impact_stream(self, question: str) -> None:
+        """Expose safe tool progress in OpenWebUI's collapsible reasoning area."""
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        events: queue.Queue[dict[str, object]] = queue.Queue()
+        result_box: dict[str, object] = {}
+
+        def run_agent() -> None:
+            try:
+                result_box["result"] = SERVICES.ata_impact.analyze(question, progress=events.put)
+            except Exception as exc:
+                result_box["error"] = str(exc)
+            finally:
+                events.put({"stage": "_finished"})
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        def send_delta(delta: dict[str, object], finish_reason: str | None = None) -> None:
+            payload = {"id": completion_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": "mro-ata-impact", "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+            self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+
+        send_delta({"role": "assistant"})
+        threading.Thread(target=run_agent, name="ata-impact-react", daemon=True).start()
+        while True:
+            event = events.get()
+            if event.get("stage") == "_finished":
+                break
+            message = str(event.get("message") or "")
+            if message:
+                send_delta({"reasoning_content": message + "\n"})
+        if result_box.get("error"):
+            content = "Не удалось завершить предварительную оценку ATA. Проверьте доступность источников и повторите запрос."
+        else:
+            result = result_box.get("result") if isinstance(result_box.get("result"), dict) else {}
+            content = str(result.get("answer") or "")
+        send_delta({"content": content})
+        send_delta({}, finish_reason="stop")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
     def do_GET(self) -> None:
         try:
             parsed = urlparse(self.path)
@@ -88,7 +171,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 "object": "model",
                                 "created": now,
                                 "owned_by": "local",
-                            }
+                            },
+                            {
+                                "id": "mro-go-no-go",
+                                "object": "model",
+                                "created": now,
+                                "owned_by": "local",
+                            },
+                            {
+                                "id": "mro-ata-impact",
+                                "object": "model",
+                                "created": int(time.time()),
+                                "owned_by": "mro-kb-platform",
+                            },
                         ],
                     }
                 )
@@ -99,6 +194,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "stats": SERVICES.store.stats(),
                         "components": SERVICES.retrieval.health(),
                         "commercial_offers": SERVICES.commercial_offers.health(),
+                        "go_no_go": SERVICES.go_no_go.health(),
+                        "ata_impact": {"catalog_version": SERVICES.ata_impact.catalog.version, **SERVICES.ata_impact.health()},
                     }
                 )
             if parsed.path.startswith("/api/com-offers/registry/"):
@@ -147,7 +244,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8"))
             if parsed.path == "/v1/chat/completions":
                 model = str(payload.get("model") or "").strip()
-                if model not in {"mro-kb", "mro-similar-cases"}:
+                if model not in {"mro-kb", "mro-similar-cases", "mro-go-no-go", "mro-ata-impact"}:
                     return self._send_json({"error": {"message": f"Unknown model: {model}", "type": "invalid_request_error"}}, status=404)
                 messages = payload.get("messages") or []
                 question = ""
@@ -161,28 +258,29 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send_json({"error": {"message": "User message is required", "type": "invalid_request_error"}}, status=400)
                 if model == "mro-similar-cases":
                     result = SERVICES.commercial_offers.similar_cases(question)
+                elif model == "mro-go-no-go":
+                    result = SERVICES.go_no_go.triage(question)
+                elif model == "mro-ata-impact":
+                    if bool(payload.get("stream")):
+                        return self._send_ata_impact_stream(question)
+                    result = SERVICES.ata_impact.analyze(question)
                 else:
                     result = SERVICES.retrieval.chat(question)
-                return self._send_json(
-                    {
-                        "id": f"chatcmpl-{uuid.uuid4().hex}",
-                        "object": "chat.completion",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": {
-                                    "role": "assistant",
-                                    "content": str(result.get("answer") or ""),
-                                },
-                                "finish_reason": "stop",
-                            }
-                        ],
-                        "sources": result.get("sources") or [],
-                        "warnings": result.get("warnings") or [],
-                    }
-                )
+                return self._send_openai_completion(model, result, bool(payload.get("stream")))
+            if parsed.path == "/api/triage":
+                request_text = str(payload.get("request") or payload.get("q") or payload.get("question") or "").strip()
+                if not request_text:
+                    return self._send_json({"ok": False, "error": "request is required"}, status=400)
+                fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+                return self._send_json({"ok": True, "triage": SERVICES.go_no_go.triage(request_text, fields)})
+            if parsed.path == "/api/ata-impact":
+                request_text = str(payload.get("request") or payload.get("q") or payload.get("question") or "").strip()
+                if not request_text:
+                    return self._send_json({"ok": False, "error": "request is required"}, status=400)
+                fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+                fields = {**{key: value for key, value in payload.items() if key in {"aircraft_type", "component", "components", "asset_name", "zone", "zones", "part_number", "ata", "ata_code", "ata_codes"}}, **fields}
+                mode = str(payload.get("mode") or "ontology_llm")
+                return self._send_json({"ok": True, "ata_impact": SERVICES.ata_impact.analyze(request_text, fields, mode=mode)})
             if parsed.path == "/api/chat":
                 question = str(payload.get("q") or payload.get("question") or "").strip()
                 if not question:

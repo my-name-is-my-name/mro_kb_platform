@@ -1,0 +1,24 @@
+[Unit]
+Description=MRO ATA impact API for OpenWebUI
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/ii_models/Users/hizhenkov/mro_kb_platform
+Environment=MRO_KB_PUBLIC_BASE_URL=http://10.100.112.51:8122
+Environment=MRO_KB_LLM_ENABLED=1
+Environment=MRO_KB_ATA_AGENT_LLM_ENABLED=1
+Environment=MRO_KB_LLM_BASE_URL=http://10.100.112.71:1234/v1
+Environment=MRO_KB_LLM_MODEL=
+Environment=MRO_KB_LLM_MAX_TOKENS=300
+Environment=MRO_KB_LLM_TIMEOUT_SECONDS=30
+Environment=MRO_KB_RERANKER_ENABLED=0
+Environment=MRO_KB_TSEARCH_ENABLED=0
+ExecStart=/home/akhi93m6/.local/bin/python3 -m apps.api.ata_server --host 10.100.112.51 --port 8122
+Restart=always
+RestartSec=5
+StandardOutput=append:/mnt/ii_models/Users/hizhenkov/mro_kb_platform/data_runtime/mro_ata_impact_8122.log
+StandardError=append:/mnt/ii_models/Users/hizhenkov/mro_kb_platform/data_runtime/mro_ata_impact_8122.log
+
+[Install]
+WantedBy=default.target

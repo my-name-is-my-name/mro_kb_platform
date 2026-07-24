@@ -6,6 +6,7 @@ __pycache__/
 .mypy_cache/
 
 data_runtime/
+data/
 *.sqlite
 *.sqlite3
 *.db
@@ -15,3 +16,5 @@ data_runtime/
 !.env.example
 
 *.log
+mro-go-no-go-web/
+~$*.docx

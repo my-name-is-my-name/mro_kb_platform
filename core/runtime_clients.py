@@ -28,6 +28,9 @@ class RuntimeSettings:
     llm_api_key: str = os.getenv("MRO_KB_LLM_API_KEY", "local").strip()
     llm_temperature: float = float(os.getenv("MRO_KB_LLM_TEMPERATURE", "0"))
     llm_max_tokens: int = int(os.getenv("MRO_KB_LLM_MAX_TOKENS", "1200"))
+    # The intake agent must fail closed to the ontology result instead of leaving
+    # an OpenWebUI stream in a perpetual "thinking" state.
+    llm_timeout_seconds: float = float(os.getenv("MRO_KB_LLM_TIMEOUT_SECONDS", "30"))
 
 
 class ExternalReranker:
@@ -99,7 +102,7 @@ class OpenAICompatibleLLM:
             headers=self._headers(),
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=min(20, self.settings.llm_timeout_seconds)) as response:
             payload = json.loads(response.read().decode("utf-8"))
         items = payload.get("data") or []
         if not items:
@@ -128,7 +131,7 @@ class OpenAICompatibleLLM:
             headers=self._headers(),
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=self.settings.llm_timeout_seconds) as response:
             body = json.loads(response.read().decode("utf-8"))
         choices = body.get("choices") or []
         if not choices:

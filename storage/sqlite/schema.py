@@ -23,6 +23,17 @@ CREATE TABLE IF NOT EXISTS documents (
     document_family TEXT NOT NULL DEFAULT '',
     source_file TEXT NOT NULL DEFAULT '',
     source_system TEXT NOT NULL DEFAULT 'mro_rag',
+    document_type TEXT NOT NULL DEFAULT '',
+    issuer TEXT NOT NULL DEFAULT '',
+    aircraft_type TEXT NOT NULL DEFAULT '',
+    effectivity TEXT NOT NULL DEFAULT '',
+    ata TEXT NOT NULL DEFAULT '',
+    revision TEXT NOT NULL DEFAULT '',
+    issue_date TEXT NOT NULL DEFAULT '',
+    section_reference TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    trust_level TEXT NOT NULL DEFAULT 'internal_reference',
+    source_origin TEXT NOT NULL DEFAULT 'internal',
     FOREIGN KEY(case_id) REFERENCES cases(case_id)
 );
 
