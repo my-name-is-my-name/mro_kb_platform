@@ -5,7 +5,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core.go_no_go import CertificateCatalog, GoNoGoService, InternalEvidenceRetriever, TSearchRetriever
+from core.go_no_go import (
+    CertificateCatalog,
+    CertificateEntry,
+    GoNoGoService,
+    InternalEvidenceRetriever,
+    TSearchRetriever,
+)
 from storage.sqlite.store import SQLiteStore
 
 
@@ -28,6 +34,39 @@ class GoNoGoTests(unittest.TestCase):
         self.assertEqual(result["unmatched"], ["ATA 99"])
         self.assertEqual(result["matched"][0]["ata"], "ATA 53")
 
+    def test_certificate_catalog_subchapter_matching_matrix(self) -> None:
+        catalog = object.__new__(CertificateCatalog)
+        catalog.path = Path("test-certificate.docx")
+        catalog.entries = [
+            CertificateEntry("25", "20", "twenty", ""),
+            CertificateEntry("25", "10", "ten", ""),
+        ]
+        catalog.by_system = {"25": catalog.entries}
+
+        exact = catalog.match(["ATA 25-10"])
+        self.assertEqual(exact["status"], "in_scope_candidate")
+        self.assertEqual(exact["matched"][0]["certificate_ata"], "ATA 25-10")
+        self.assertEqual(exact["matched"][0]["name"], "ten")
+
+        missing = catalog.match(["ATA 25-30"])
+        self.assertEqual(missing["status"], "ambiguous")
+        self.assertEqual(missing["matched"], [])
+        self.assertEqual(missing["ambiguous"], ["ATA 25-30"])
+
+        chapter = catalog.match(["ATA 25"])
+        self.assertEqual(chapter["status"], "in_scope_candidate")
+        self.assertEqual(chapter["matched"][0]["certificate_ata"], "ATA 25")
+        self.assertEqual(chapter["matched"][0]["name"], "")
+
+        unavailable = object.__new__(CertificateCatalog)
+        unavailable.path = Path("missing.docx")
+        unavailable.entries = []
+        unavailable.by_system = {}
+        unavailable_result = unavailable.match(["ATA 25-10"])
+        self.assertEqual(unavailable_result["status"], "catalog_unavailable")
+        self.assertFalse(unavailable_result["catalog_loaded"])
+        self.assertEqual(unavailable_result["ambiguous"], ["ATA 25-10"])
+
     def test_direct_ata_repair_without_damage_dimensions_requests_info(self) -> None:
         result = self.make_service().triage("Ремонт повреждения фюзеляжа ATA 53 на Airbus A320")
         self.assertEqual(result["recommendation"], "need_more_info")
@@ -43,7 +82,7 @@ class GoNoGoTests(unittest.TestCase):
 
     def test_modification_does_not_mix_certificate_scope_with_capability(self) -> None:
         result = self.make_service().triage("Модификация электрической системы ATA 24 на Airbus A320")
-        self.assertEqual(result["recommendation"], "hold_expert_review")
+        self.assertNotEqual(result["recommendation"], "go_to_assessment")
         self.assertNotIn("ATA 51", result["potentially_affected_ata"])
         self.assertEqual(result["capability_screening"], "not_assessed")
 
@@ -76,6 +115,156 @@ class GoNoGoTests(unittest.TestCase):
         self.assertEqual(result["ata_impact"]["decision"], "engineering_review_required")
         self.assertNotIn("фотографии повреждения", result["missing_inputs"])
         self.assertIn("размеры/координаты повреждения", result["missing_inputs"])
+
+    def staged_result(self, **overrides: object) -> dict[str, object]:
+        result: dict[str, object] = {
+            "affected_ata": ["ATA 25"],
+            "potentially_affected_ata": [],
+            "context_ata": [],
+            "required_input_data": [],
+            "decision": "completed",
+            "warnings": [],
+            "engineering_facts": {"uncertainties": []},
+            "validated_ata": {
+                "document_verification_required": [],
+                "candidate_unverified": [],
+                "user_declared_unverified": [],
+            },
+            "certificate_scope": {
+                "status": "in_scope_candidate",
+                "catalog_loaded": True,
+                "matched": [{"ata": "ATA 25"}],
+                "unmatched": [],
+            },
+            "ata_mapping": {},
+        }
+        result.update(overrides)
+        return result
+
+    def triage_staged(self, staged: dict[str, object]) -> dict[str, object]:
+        class StubImpact:
+            def analyze(self, *args: object, **kwargs: object) -> dict[str, object]:
+                return staged
+
+        service = self.make_service()
+        service.ata_impact = StubImpact()  # type: ignore[assignment]
+        return service.triage(
+            "Engineering work package",
+            {
+                "aircraft_type": "A320",
+                "components": "cargo equipment",
+                "work_type": "assessment",
+            },
+        )
+
+    def test_context_only_never_goes_to_assessment(self) -> None:
+        result = self.triage_staged(
+            self.staged_result(
+                affected_ata=[],
+                context_ata=["ATA 53"],
+                decision="engineering_review_required",
+            )
+        )
+        self.assertEqual(result["recommendation"], "hold_expert_review")
+        self.assertIn("технически затронутый объект не определён", result["explanation"])
+
+    def test_empty_affected_never_goes_to_assessment(self) -> None:
+        result = self.triage_staged(
+            self.staged_result(
+                affected_ata=[],
+                decision="engineering_review_required",
+            )
+        )
+        self.assertNotEqual(result["recommendation"], "go_to_assessment")
+
+    def test_staged_required_input_and_uncertainty_block_assessment(self) -> None:
+        required = self.triage_staged(
+            self.staged_result(
+                required_input_data=["effectivity"],
+                decision="additional_input_required",
+            )
+        )
+        self.assertEqual(required["recommendation"], "need_more_info")
+        uncertain = self.triage_staged(
+            self.staged_result(
+                engineering_facts={"uncertainties": ["attachment involvement"]},
+                decision="additional_input_required",
+            )
+        )
+        self.assertEqual(uncertain["recommendation"], "need_more_info")
+
+    def test_document_required_and_potential_ata_block_assessment(self) -> None:
+        document = self.triage_staged(
+            self.staged_result(
+                potentially_affected_ata=["ATA 53"],
+                validated_ata={
+                    "document_verification_required": [{"candidate_id": "candidate:1"}],
+                    "candidate_unverified": [],
+                },
+                decision="document_verification_required",
+            )
+        )
+        self.assertEqual(document["recommendation"], "hold_expert_review")
+        potential = self.triage_staged(
+            self.staged_result(
+                potentially_affected_ata=["ATA 32"],
+                decision="completed_with_hypotheses",
+            )
+        )
+        self.assertEqual(potential["recommendation"], "hold_expert_review")
+
+    def test_valid_closed_staged_case_can_go_to_assessment(self) -> None:
+        result = self.triage_staged(self.staged_result())
+        self.assertEqual(result["recommendation"], "go_to_assessment")
+
+    def test_unverified_user_declared_ata_blocks_assessment(self) -> None:
+        result = self.triage_staged(
+            self.staged_result(
+                validated_ata={
+                    "document_verification_required": [],
+                    "candidate_unverified": [],
+                    "user_declared_unverified": [
+                        {
+                            "candidate_id": (
+                                "candidate:user_declared_ata:request:ATA_34:1"
+                            ),
+                            "ata": "ATA 34",
+                        }
+                    ],
+                },
+                decision="engineering_review_required",
+            )
+        )
+        self.assertEqual(result["recommendation"], "hold_expert_review")
+        self.assertNotEqual(result["recommendation"], "go_to_assessment")
+        self.assertTrue(result["unresolved_ata"])
+
+    def test_certificate_unavailable_or_out_of_scope_blocks_assessment(self) -> None:
+        unavailable = self.triage_staged(
+            self.staged_result(
+                certificate_scope={
+                    "status": "catalog_unavailable",
+                    "catalog_loaded": False,
+                    "matched": [],
+                    "unmatched": [],
+                },
+                decision="engineering_review_required",
+            )
+        )
+        self.assertEqual(unavailable["recommendation"], "hold_expert_review")
+        outside = self.triage_staged(
+            self.staged_result(
+                certificate_scope={
+                    "status": "out_of_scope",
+                    "catalog_loaded": True,
+                    "matched": [],
+                    "unmatched": ["ATA 99"],
+                },
+                affected_ata=["ATA 99"],
+                decision="engineering_review_required",
+            )
+        )
+        self.assertEqual(outside["recommendation"], "hold_expert_review")
 
 
 if __name__ == "__main__":

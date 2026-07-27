@@ -5,7 +5,9 @@ import re
 
 EXPLICIT_ATA_RE = re.compile(r"\bATA\s*[-:]?\s*(\d{2})(?:\s*[-:]\s*(\d{2}))?\b", re.I)
 DOCUMENT_REFERENCE_RE = re.compile(
-    r"\b(AMM|SRM|IPC|CMM|WDM|NTM|ALS)\s+([A-Z0-9][A-Z0-9./_-]*)", re.I
+    r"\b(AMM|SRM|IPC|CMM|WDM|NTM|ALS)\s+(?:ATA\s+)?"
+    r"(\d{2}(?:-\d{2}){1,2})\b",
+    re.I,
 )
 AD_RE = re.compile(r"\bAD\s+[A-Z0-9][A-Z0-9./_-]*", re.I)
 SB_RE = re.compile(r"\bSB\s+[A-Z0-9][A-Z0-9./_-]*", re.I)
@@ -39,10 +41,17 @@ def extract_identifiers(text: str, fields: dict[str, object] | None = None) -> d
         ata = normalize_ata(match.group(0))
         if ata and ata not in explicit_ata:
             explicit_ata.append(ata)
-    documents = [
-        {"type": match.group(1).upper(), "reference": match.group(0), "value": match.group(2)}
-        for match in DOCUMENT_REFERENCE_RE.finditer(combined)
-    ]
+    documents = []
+    for match in DOCUMENT_REFERENCE_RE.finditer(combined):
+        value = match.group(2)
+        documents.append(
+            {
+                "type": match.group(1).upper(),
+                "reference": match.group(0),
+                "value": value,
+                "ata": f"ATA {value}",
+            }
+        )
     aircraft_match = next(
         (
             match

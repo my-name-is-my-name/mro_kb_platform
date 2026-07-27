@@ -15,6 +15,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from core.config import SQLITE_PATH
+from core.ata_impact.http_contract import (
+    extract_ata_request_text,
+    merge_ata_request_fields,
+    validate_stream_flag,
+)
+from core.ata_impact.modes import validate_ata_runtime_mode
 from core.go_no_go import AtaDiscoveryCatalog, AtaImpactAgent, CertificateCatalog, InternalEvidenceRetriever
 from storage.sqlite.store import SQLiteStore
 
@@ -54,12 +60,27 @@ class AtaHandler(BaseHTTPRequestHandler):
             return self._json({"error": {"message": "JSON body must be an object", "type": "invalid_request_error"}}, 400)
         path = urlparse(self.path).path
         if path == "/api/ata-impact":
-            question = str(payload.get("question") or payload.get("request") or payload.get("q") or "").strip()
-            if not question:
-                return self._json({"ok": False, "error": "request is required"}, 400)
-            fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
-            fields = {**fields, **{key: value for key, value in payload.items() if key in {"aircraft_type", "component", "components", "asset_name", "zone", "zones", "part_number", "ata", "ata_code", "ata_codes"}}}
-            return self._json({"ok": True, "ata_impact": ATA_AGENT.analyze(question, fields, mode=str(payload.get("mode") or "auto"))})
+            try:
+                question = extract_ata_request_text(payload)
+                if not question:
+                    return self._json({"ok": False, "error": "request is required"}, 400)
+                fields = merge_ata_request_fields(payload)
+                mode = validate_ata_runtime_mode(
+                    payload["mode"] if "mode" in payload else "auto",
+                    allow_legacy=True,
+                )
+                result = ATA_AGENT.analyze(question, fields, mode=mode)
+            except ValueError as exc:
+                return self._json(
+                    {"error": {"message": str(exc), "type": "invalid_request_error"}},
+                    400,
+                )
+            except Exception:
+                return self._json(
+                    {"error": {"message": "ATA analysis failed", "type": "server_error"}},
+                    500,
+                )
+            return self._json({"ok": True, "ata_impact": result})
         if path != "/v1/chat/completions":
             return self._json({"error": "not found"}, 404)
         if str(payload.get("model") or "") != "mro-ata-impact":
@@ -68,16 +89,33 @@ class AtaHandler(BaseHTTPRequestHandler):
         question = next((str(item.get("content") or "").strip() for item in reversed(messages) if isinstance(item, dict) and item.get("role") == "user" and str(item.get("content") or "").strip()), "")
         if not question:
             return self._json({"error": {"message": "User message is required", "type": "invalid_request_error"}}, 400)
-        if not payload.get("stream"):
-            result = ATA_AGENT.analyze(question, mode="auto")
+        try:
+            mode = validate_ata_runtime_mode(
+                payload["mode"] if "mode" in payload else "auto",
+                allow_legacy=True,
+            )
+            stream = validate_stream_flag(payload)
+        except ValueError as exc:
+            return self._json(
+                {"error": {"message": str(exc), "type": "invalid_request_error"}},
+                400,
+            )
+        if not stream:
+            try:
+                result = ATA_AGENT.analyze(question, mode=mode)
+            except Exception:
+                return self._json(
+                    {"error": {"message": "ATA analysis failed", "type": "server_error"}},
+                    500,
+                )
             return self._json({"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion", "created": int(time.time()), "model": "mro-ata-impact", "choices": [{"index": 0, "message": {"role": "assistant", "content": result["answer"]}, "finish_reason": "stop"}], "ata_impact": result})
-        self._stream(question)
+        self._stream(question, mode)
 
-    def _stream(self, question: str) -> None:
+    def _stream(self, question: str, mode: str = "auto") -> None:
         completion_id, events, result_box = f"chatcmpl-{uuid.uuid4().hex}", queue.Queue(), {}
         def work() -> None:
             try:
-                result_box["result"] = ATA_AGENT.analyze(question, progress=events.put, mode="auto")
+                result_box["result"] = ATA_AGENT.analyze(question, progress=events.put, mode=mode)
             except Exception:
                 result_box["error"] = True
             finally:

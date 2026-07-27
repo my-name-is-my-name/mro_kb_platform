@@ -11,15 +11,29 @@ def validate_certificate(certificate: object, ata_codes: list[str]) -> list[dict
         ata = normalize_ata(raw)
         chapter = ata[4:6] if ata else ""
         matches = entries.get(chapter, []) if isinstance(entries, dict) else []
+        exact = next(
+            (entry for entry in matches if normalize_ata(getattr(entry, "ata", "")) == ata),
+            None,
+        )
         if not catalog_loaded:
             status = "catalog_unavailable"
         elif not matches:
             status = "not_in_certificate"
-        elif "-" in ata and not any(normalize_ata(getattr(entry, "ata", "")) == ata for entry in matches):
+        elif "-" in ata and exact is None:
             status = "ambiguous_subchapter"
         else:
             status = "in_scope_candidate"
-        entry = matches[0] if matches else None
+        entry = exact
+        if entry is None and matches and "-" not in ata:
+            chapter_entry = next(
+                (
+                    candidate
+                    for candidate in matches
+                    if normalize_ata(getattr(candidate, "ata", "")) == ata
+                ),
+                None,
+            )
+            entry = chapter_entry or (matches[0] if len(matches) == 1 else None)
         result.append(
             {
                 "ata": ata,

@@ -26,7 +26,13 @@ class FakeReActLLM:
         return {"ok": True, "provider": "fake"}
 
 
-@patch.dict("os.environ", {"MRO_KB_ATA_AGENT_LLM_ENABLED": "0"})
+@patch.dict(
+    "os.environ",
+    {
+        "MRO_KB_ATA_AGENT_LLM_ENABLED": "0",
+        "MRO_KB_ENABLE_LEGACY_ATA_MODES": "true",
+    },
+)
 class AtaImpactAgentTests(unittest.TestCase):
     def test_full_pipeline_confirms_secondary_only_from_applicable_controlled_document(self) -> None:
         class Retriever:
@@ -35,6 +41,14 @@ class AtaImpactAgentTests(unittest.TestCase):
                     "document_id": "a320-srm-51", "title": "A320 SRM ATA 51", "snippet": "ATA 51 approved repair data",
                     "document_type": "SRM", "ata": "ATA 51", "aircraft_type": "A320",
                     "trust_level": "controlled_oem", "source_origin": "internal",
+                    "revision": "1", "effectivity": "A320", "section_reference": "51-00",
+                    "applicable": True, "current_revision": True, "verification_status": "confirmed",
+                    "confirmed_candidates": [{
+                        "candidate_id": "candidate:legacy_secondary:request:ATA_51:1",
+                        "ata": "ATA 51", "category": "interface_ata_hypotheses",
+                        "entity_id": "legacy", "verification_status": "confirmed",
+                        "confirmed_claim": "ATA 51 secondary candidate applies",
+                    }],
                 }]}
 
         result = AtaImpactAgent(retriever=Retriever()).analyze(

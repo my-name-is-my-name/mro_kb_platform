@@ -44,7 +44,13 @@ ATA_MAPPING_SCHEMA: dict[str, object] = {
         "user_declared_ata",
     ],
     "properties": {
-        key: {"type": "array", "items": {"type": "object", "required": ["ata", "confidence", "reason"]}}
+        key: {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["candidate_id", "ata", "confidence", "reason"],
+            },
+        }
         for key in (
             "object_ata",
             "structural_ata",
@@ -63,7 +69,7 @@ ATA_CRITIC_SCHEMA: dict[str, object] = {
     "properties": {
         "actions": {
             "type": "array",
-            "items": {"type": "object", "required": ["action", "ata", "category", "reason"]},
+            "items": {"type": "object", "required": ["candidate_id", "action", "reason"]},
         }
     },
 }

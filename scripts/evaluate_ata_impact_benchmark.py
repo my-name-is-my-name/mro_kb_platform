@@ -64,6 +64,12 @@ def main() -> None:
         fields = {key: input_data[key] for key in ("aircraft_type", "msn", "case_type") if input_data.get(key) not in (None, "")}
         request = str(input_data.get("request") or input_data.get("description") or input_data.get("problem_summary") or "")
         started = time.perf_counter()
+        if args.mode == "legacy-rules" and os.getenv(
+            "MRO_KB_ENABLE_LEGACY_ATA_MODES", ""
+        ).strip().lower() not in {"1", "true", "yes", "on"}:
+            raise SystemExit(
+                "legacy-rules requires MRO_KB_ENABLE_LEGACY_ATA_MODES=true"
+            )
         runtime_mode = "rules_only" if args.mode == "legacy-rules" else "auto"
         result = agent.analyze(request, fields, mode=runtime_mode)
         if args.mode == "v2-llm" and result.get("runtime_mode") == "fallback":

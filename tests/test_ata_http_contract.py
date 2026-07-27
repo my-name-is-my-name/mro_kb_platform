@@ -6,15 +6,19 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 import apps.api.ata_server as ata_server
 
 
 class StubAgent:
+    calls: list[tuple[str, dict[str, object], str]] = []
+
     def health(self) -> dict[str, object]:
         return {"pipeline_version": "v2", "default_mode": "auto"}
 
     def analyze(self, request: str, fields: dict[str, object] | None = None, progress: object | None = None, mode: str = "auto") -> dict[str, object]:
+        self.calls.append((request, dict(fields or {}), mode))
         if callable(progress):
             progress({"stage": "completed", "message": "done"})
         return {
@@ -59,6 +63,9 @@ class AtaHttpContractTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read())
 
+    def setUp(self) -> None:
+        StubAgent.calls.clear()
+
     def test_native_ata_wrapper_and_default_mode(self) -> None:
         status, payload = self.request("/api/ata-impact", {"request": "damage"})
         self.assertEqual(status, 200)
@@ -98,6 +105,63 @@ class AtaHttpContractTests(unittest.TestCase):
             {"model": "unknown", "messages": [{"role": "user", "content": "damage"}]},
         )
         self.assertEqual(status, 404)
+
+    def test_conflicting_flat_and_nested_fields_are_rejected(self) -> None:
+        status, payload = self.request(
+            "/api/ata-impact",
+            {
+                "request": "damage",
+                "aircraft_type": "A320",
+                "fields": {"aircraft_type": "B737"},
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        status, _ = self.request(
+            "/api/ata-impact",
+            {
+                "request": "damage",
+                "aircraft_type": "A320",
+                "fields": {"aircraft_type": "A320"},
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(StubAgent.calls[-1][1]["aircraft_type"], "A320")
+
+    def test_invalid_and_disabled_legacy_modes_are_400(self) -> None:
+        for mode in ("standrd", "", "AUTO"):
+            with self.subTest(mode=mode):
+                status, payload = self.request(
+                    "/api/ata-impact",
+                    {"request": "damage", "mode": mode},
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        with patch.dict("os.environ", {}, clear=True):
+            status, payload = self.request(
+                "/api/ata-impact",
+                {"request": "damage", "mode": "rules_only"},
+            )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+
+    def test_valid_mode_and_openai_mode_are_forwarded(self) -> None:
+        status, _ = self.request(
+            "/api/ata-impact",
+            {"request": "damage", "mode": " standard "},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(StubAgent.calls[-1][2], "standard")
+        status, _ = self.request(
+            "/v1/chat/completions",
+            {
+                "model": "mro-ata-impact",
+                "mode": "extended",
+                "messages": [{"role": "user", "content": "damage"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(StubAgent.calls[-1][2], "extended")
 
 
 if __name__ == "__main__":

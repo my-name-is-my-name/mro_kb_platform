@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
+from .evidence import is_controlled_evidence_document
 from .identifiers import normalize_ata
 from .models import CRITIC_ACTIONS, EVIDENCE_TYPES, MAPPING_CATEGORIES, RELATION_TYPES, empty_mapping, empty_validated
 from .schemas import ATA_CRITIC_SCHEMA, ATA_MAPPING_SCHEMA, ENGINEERING_FACTS_SCHEMA
@@ -126,8 +128,9 @@ def validate_mapping(
         if item.get("damage_confirmed") is True or involvement in {"damaged", "repair", "repaired", "modified", "changed", "removed", "replaced"}:
             structural_involved_ids.add(str(item.get("id")))
     relation_ids = {str(item.get("id")) for item in facts.get("relations", []) if isinstance(item, dict) and item.get("id")}
+    candidate_ids: set[str] = set()
     for category in MAPPING_CATEGORIES:
-        seen: set[tuple[str, str, str]] = set()
+        sequence = 0
         for item in _dict_list(raw.get(category)):
             ata = normalize_ata(item.get("ata"))
             if not ata:
@@ -163,12 +166,15 @@ def validate_mapping(
                 continue
             if category == "interface_ata_hypotheses":
                 relation = next(item for item in facts.get("relations", []) if isinstance(item, dict) and item.get("id") == relation_id)
-                if relation.get("relation") == "location_reference":
+                if relation.get("relation") in {"location_reference", "installed_in"}:
                     warnings.append(f"non_interface_relation:{ata}:{relation_id}")
                     continue
                 if relation.get("relation") == "adjacent_to":
-                    condition = " ".join(str(item.get(key) or "") for key in ("condition", "reason", "source_fragment")).lower()
-                    if not any(term in condition for term in ("access", "protect", "доступ", "защит")):
+                    interface_basis = str(relation.get("interface_basis") or "")
+                    if interface_basis not in {
+                        "access_required",
+                        "protection_required",
+                    }:
                         warnings.append(f"adjacent_without_access_or_protection:{ata}:{relation_id}")
                         continue
             if category == "procedure_ata_hypotheses" and not (
@@ -178,15 +184,47 @@ def validate_mapping(
             ):
                 warnings.append(f"procedure_without_factual_anchor:{ata}")
                 continue
-            key = (ata, entity_id, relation_id)
-            if key not in seen:
-                mapping[category].append(item)
-                seen.add(key)
+            sequence += 1
+            candidate_id = str(item.get("candidate_id") or "").strip()
+            if candidate_id and not _valid_candidate_id(
+                candidate_id,
+                category,
+                ata,
+                entity_id,
+                relation_id,
+            ):
+                warnings.append(f"invalid_candidate_id_format:{candidate_id}")
+                candidate_id = ""
+            if not candidate_id:
+                anchor = entity_id or relation_id or "request"
+                ata_token = ata.replace(" ", "_").replace("-", "_")
+                candidate_id = f"candidate:{category}:{anchor}:{ata_token}:{sequence}"
+            if candidate_id in candidate_ids:
+                warnings.append(f"duplicate_candidate_id:{candidate_id}")
+                continue
+            candidate_ids.add(candidate_id)
+            item["candidate_id"] = candidate_id
+            item["candidate_state"] = "candidate_unverified"
+            mapping[category].append(item)
     present_declared = {item["ata"] for item in mapping["user_declared_ata"]}
     for ata in declared:
         if ata not in present_declared:
+            sequence = len(mapping["user_declared_ata"]) + 1
+            candidate_id = (
+                "candidate:user_declared_ata:request:"
+                f"{ata.replace(' ', '_').replace('-', '_')}:{sequence}"
+            )
+            while candidate_id in candidate_ids:
+                sequence += 1
+                candidate_id = (
+                    "candidate:user_declared_ata:request:"
+                    f"{ata.replace(' ', '_').replace('-', '_')}:{sequence}"
+                )
+            candidate_ids.add(candidate_id)
             mapping["user_declared_ata"].append(
                 {
+                    "candidate_id": candidate_id,
+                    "candidate_state": "candidate_unverified",
                     "ata": ata,
                     "confidence": 1.0,
                     "reason": "Explicitly declared in the request; not semantically verified",
@@ -212,43 +250,100 @@ def validate_critic(
     warnings: list[str] = []
     warnings.extend(_schema_warnings(raw, ATA_CRITIC_SCHEMA, "ata_critic"))
     result: list[dict[str, object]] = []
+    known_candidates = {
+        str(candidate.get("candidate_id")): (category, candidate)
+        for category in MAPPING_CATEGORIES
+        if category != "user_declared_ata"
+        for candidate in (mapping or {}).get(category, [])
+        if candidate.get("candidate_id")
+    }
+    action_counts: dict[str, int] = {}
+    reference_counts: dict[str, int] = {}
+    coverage_invalid: set[str] = set()
+    global_coverage_invalid = False
     for item in _dict_list(actions):
         action = str(item.get("action") or "")
-        ata = normalize_ata(item.get("ata"))
-        if action not in CRITIC_ACTIONS or not ata:
+        candidate_id = str(item.get("candidate_id") or "").strip()
+        if candidate_id in known_candidates:
+            reference_counts[candidate_id] = reference_counts.get(candidate_id, 0) + 1
+            if reference_counts[candidate_id] > 1:
+                warnings.append(f"duplicate_critic_action:{candidate_id}")
+                coverage_invalid.add(candidate_id)
+        if action not in CRITIC_ACTIONS or not candidate_id:
             warnings.append("invalid_critic_action")
+            if candidate_id in known_candidates:
+                coverage_invalid.add(candidate_id)
+            else:
+                global_coverage_invalid = True
             continue
         if not str(item.get("reason") or "").strip():
-            warnings.append(f"critic_action_missing_reason:{ata}")
+            warnings.append(f"critic_action_missing_reason:{candidate_id}")
+            if candidate_id in known_candidates:
+                coverage_invalid.add(candidate_id)
+            else:
+                global_coverage_invalid = True
             continue
-        category = str(item.get("category") or "")
-        if category not in MAPPING_CATEGORIES:
-            warnings.append(f"invalid_critic_category:{category}")
+        if action == "add_missing_candidate":
+            category = str(item.get("category") or "")
+            ata = normalize_ata(item.get("ata"))
+            if category not in MAPPING_CATEGORIES or not ata:
+                warnings.append(f"invalid_critic_addition:{candidate_id}")
+                continue
+            item["ata"] = ata
+            result.append(item)
+            continue
+        target = known_candidates.get(candidate_id)
+        if target is None:
+            warnings.append(f"unknown_critic_candidate_id:{candidate_id}")
+            global_coverage_invalid = True
+            continue
+        category, candidate = target
+        ata = str(candidate.get("ata") or "")
+        supplied_ata = normalize_ata(item.get("ata")) if item.get("ata") else ata
+        supplied_category = str(item.get("category") or category)
+        anchor_mismatch = (
+            bool(item.get("entity_id"))
+            and bool(candidate.get("entity_id"))
+            and item.get("entity_id") != candidate.get("entity_id")
+        ) or (
+            bool(item.get("relation_id"))
+            and bool(candidate.get("relation_id"))
+            and item.get("relation_id") != candidate.get("relation_id")
+        )
+        require_document_anchor_mutation = action == "require_document" and (
+            (
+                bool(item.get("entity_id"))
+                and item.get("entity_id") != candidate.get("entity_id")
+            )
+            or (
+                bool(item.get("relation_id"))
+                and item.get("relation_id") != candidate.get("relation_id")
+            )
+        )
+        if (
+            supplied_ata != ata
+            or supplied_category != category
+            or anchor_mismatch
+            or require_document_anchor_mutation
+        ):
+            warnings.append(f"critic_candidate_mismatch:{candidate_id}")
+            coverage_invalid.add(candidate_id)
             continue
         item["ata"] = ata
-        if action != "add_missing_candidate" and mapping is not None:
-            matches = [
-                candidate
-                for candidate in mapping[category]
-                if candidate.get("ata") == ata
-                and (not item.get("entity_id") or candidate.get("entity_id") == item.get("entity_id"))
-                and (
-                    category in {"object_ata", "structural_ata"}
-                    or not item.get("relation_id")
-                    or candidate.get("relation_id") == item.get("relation_id")
-                )
-            ]
-            if len(matches) != 1:
-                warnings.append(f"orphan_or_ambiguous_critic_action:{category}:{ata}")
-                continue
-            item.setdefault("entity_id", matches[0].get("entity_id"))
-            item.setdefault("relation_id", matches[0].get("relation_id"))
+        item["category"] = category
+        item.setdefault("entity_id", candidate.get("entity_id"))
+        item.setdefault("relation_id", candidate.get("relation_id"))
+        action_counts[candidate_id] = action_counts.get(candidate_id, 0) + 1
+        if action_counts[candidate_id] > 1:
+            coverage_invalid.add(candidate_id)
+        if mapping is not None:
             if action == "downgrade_to_location_context" and category not in {
                 "object_ata",
                 "structural_ata",
                 "location_context_ata",
             }:
-                warnings.append(f"incompatible_critic_action:{action}:{category}:{ata}")
+                warnings.append(f"incompatible_critic_action:{action}:{category}:{candidate_id}")
+                coverage_invalid.add(candidate_id)
                 continue
             if action == "downgrade_to_possible" and category not in {
                 "object_ata",
@@ -256,7 +351,8 @@ def validate_critic(
                 "interface_ata_hypotheses",
                 "procedure_ata_hypotheses",
             }:
-                warnings.append(f"incompatible_critic_action:{action}:{category}:{ata}")
+                warnings.append(f"incompatible_critic_action:{action}:{category}:{candidate_id}")
+                coverage_invalid.add(candidate_id)
                 continue
             if action == "downgrade_to_possible" and category in {"object_ata", "structural_ata"}:
                 relation = next(
@@ -267,15 +363,26 @@ def validate_critic(
                     ),
                     None,
                 )
-                candidate_entity = str(matches[0].get("entity_id") or "")
+                candidate_entity = str(candidate.get("entity_id") or "")
                 if (
                     relation is None
-                    or relation.get("relation") in {"location_reference"}
+                    or relation.get("relation") in {"location_reference", "installed_in"}
                     or candidate_entity not in {str(relation.get("source_entity_id") or ""), str(relation.get("target_entity_id") or "")}
                 ):
-                    warnings.append(f"incompatible_critic_action:{action}:{category}:{ata}")
+                    warnings.append(f"incompatible_critic_action:{action}:{category}:{candidate_id}")
+                    coverage_invalid.add(candidate_id)
                     continue
         result.append(item)
+    for item in result:
+        if (
+            global_coverage_invalid
+            or str(item.get("candidate_id") or "") in coverage_invalid
+        ):
+            item["coverage_invalid"] = True
+    for candidate_id in known_candidates:
+        count = action_counts.get(candidate_id, 0)
+        if count == 0:
+            warnings.append(f"missing_critic_action:{candidate_id}")
     return result, warnings
 
 
@@ -293,26 +400,41 @@ def apply_critic_additions(
             accepted_actions.append(action)
             continue
         category = str(action.get("category") or "")
+        existing = {
+            str(item.get("candidate_id"))
+            for existing_category in MAPPING_CATEGORIES
+            for item in mapping[existing_category]
+            if item.get("candidate_id")
+        }
+        if str(action.get("candidate_id") or "") in existing:
+            warnings.append(
+                f"critic_addition_candidate_id_collision:{action.get('candidate_id')}"
+            )
+            continue
         candidate = {
             key: value
             for key, value in action.items()
-            if key in {"ata", "entity_id", "relation_id", "confidence", "reason", "source_fragment", "condition", "basis", "status"}
+            if key in {"candidate_id", "ata", "entity_id", "relation_id", "confidence", "reason", "source_fragment", "condition", "basis", "status"}
         }
         candidate.setdefault("confidence", 0.5)
         candidate.setdefault("reason", str(action.get("reason") or "Candidate added by critic"))
         trial, trial_warnings = validate_mapping({category: [candidate], **{key: [] for key in MAPPING_CATEGORIES if key != category}}, facts, [], request)
         warnings.extend(trial_warnings)
         if trial.get(category):
-            existing = {
-                (item.get("ata"), item.get("entity_id"), item.get("relation_id"))
-                for item in mapping[category]
-            }
+            if any(
+                str(item.get("candidate_id")) in existing
+                for item in trial[category]
+            ):
+                warnings.append(
+                    f"critic_addition_candidate_id_collision:{action.get('candidate_id')}"
+                )
+                continue
             mapping[category].extend(
                 item
                 for item in trial[category]
-                if (item.get("ata"), item.get("entity_id"), item.get("relation_id")) not in existing
+                if str(item.get("candidate_id")) not in existing
             )
-            accepted_actions.append(action)
+            warnings.append(f"critic_addition_requires_review:{action.get('candidate_id')}")
         else:
             warnings.append(f"critic_addition_rejected:{category}:{action.get('ata')}")
     return mapping, accepted_actions, warnings
@@ -325,19 +447,14 @@ def assemble(
     document_verification: dict[str, object],
 ) -> dict[str, object]:
     validated = empty_validated()
-    default_status = {
-        "object_ata": "inferred_from_request",
-        "structural_ata": "direct_confirmed",
-        "location_context_ata": "location_context",
-        "interface_ata_hypotheses": "possible_interface",
-        "procedure_ata_hypotheses": "possible_procedure",
-        "user_declared_ata": "user_declared_unverified",
-    }
     for category in MAPPING_CATEGORIES:
         for item in mapping[category]:
             action = _action_for_item(critic_actions, category, item)
-            status = default_status[category]
-            if action:
+            if category == "user_declared_ata":
+                status = "user_declared_unverified"
+            elif action is None:
+                status = "candidate_unverified"
+            else:
                 verb = action["action"]
                 if verb == "reject":
                     status = "rejected"
@@ -345,57 +462,66 @@ def assemble(
                     status = "location_context"
                     if category == "structural_ata":
                         item["critic_fact_conflict"] = True
-                elif verb in {"downgrade_to_possible", "require_document"}:
+                elif verb == "require_document":
+                    status = "document_verification_required"
+                elif verb == "downgrade_to_possible":
                     if category == "procedure_ata_hypotheses":
                         status = "possible_procedure"
                     elif category == "interface_ata_hypotheses":
                         status = "possible_interface"
-                    elif verb == "downgrade_to_possible" and action.get("relation_id"):
+                    elif action.get("relation_id"):
                         status = "possible_interface"
-                    elif verb == "require_document":
-                        # Keep the fact-derived category visible, but flag that
-                        # the conclusion still requires controlled evidence.
-                        status = default_status[category]
-                        item["document_required"] = True
                     else:
                         status = "rejected"
-                elif verb == "confirm" and category in {"object_ata", "structural_ata"}:
-                    status = "direct_confirmed"
+                elif verb == "confirm":
+                    if category == "object_ata":
+                        status = "inferred_from_request"
+                    elif category == "structural_ata":
+                        status = "direct_confirmed"
+                    elif category == "location_context_ata":
+                        status = "location_context"
+                    elif category == "interface_ata_hypotheses":
+                        status = "possible_interface"
+                    elif category == "procedure_ata_hypotheses":
+                        status = "possible_procedure"
+                    else:
+                        status = "candidate_unverified"
+                else:
+                    status = "candidate_unverified"
             validated[status].append(_trace_item(item, category, action, certificate_validation))
 
     documents = [item for item in document_verification.get("documents", []) if isinstance(item, dict)]
+    valid_candidates = {
+        str(item.get("candidate_id")): item
+        for item in validated["document_verification_required"]
+        if item.get("candidate_id")
+    }
     for document in documents:
-        if not _controlled_applicable(document):
+        if not is_controlled_evidence_document(document, valid_candidates):
             continue
         for confirmation in _document_confirmations(document):
             source = _find_confirmed_candidate(validated, confirmation)
             if source:
-                source_key = (
-                    source.get("ata"),
-                    source.get("mapping_category"),
-                    source.get("entity_id"),
-                    source.get("relation_id"),
-                )
-                for status, items in validated.items():
-                    if status == "document_confirmed":
-                        continue
-                    validated[status] = [
-                        item
-                        for item in items
-                        if (
-                            item.get("ata"),
-                            item.get("mapping_category"),
-                            item.get("entity_id"),
-                            item.get("relation_id"),
-                        )
-                        != source_key
-                    ]
+                candidate_id = source.get("candidate_id")
+                validated["document_verification_required"] = [
+                    item
+                    for item in validated["document_verification_required"]
+                    if item.get("candidate_id") != candidate_id
+                ]
                 validated["document_confirmed"].append(
-                    {**source, "status": "document_confirmed", "document_evidence": [_document_ref(document)]}
+                    {
+                        **source,
+                        "status": "document_confirmed",
+                        "previous_status": "document_verification_required",
+                        "document_evidence": [_document_ref(document)],
+                    }
                 )
     _dedupe_validated(validated)
     affected = _atas(validated, ("direct_confirmed", "inferred_from_request", "document_confirmed"))
-    potential = _atas(validated, ("possible_interface", "possible_procedure"))
+    potential = _atas(
+        validated,
+        ("possible_interface", "possible_procedure", "document_verification_required"),
+    )
     context = _atas(validated, ("location_context",))
     return {
         "validated_ata": validated,
@@ -405,6 +531,7 @@ def assemble(
         # of the same chapter is directly affected.
         "potentially_affected_ata": potential,
         "context_ata": context,
+        "critic_coverage_complete": not bool(validated["candidate_unverified"]),
     }
 
 
@@ -426,18 +553,6 @@ def _trace_item(
     }
 
 
-def _controlled_applicable(document: dict[str, object]) -> bool:
-    trust = str(document.get("trust_level") or "").lower()
-    required_provenance = ("document_id", "document_type", "revision", "effectivity", "section_reference")
-    return (
-        trust in {"controlled_oem", "approved_data"}
-        and document.get("applicable") is True
-        and document.get("current_revision") is True
-        and str(document.get("verification_status") or "").lower() == "confirmed"
-        and all(document.get(key) not in (None, "") for key in required_provenance)
-    )
-
-
 def _document_confirmations(document: dict[str, object]) -> list[dict[str, object]]:
     records = document.get("confirmed_candidates")
     if not isinstance(records, list):
@@ -446,6 +561,7 @@ def _document_confirmations(document: dict[str, object]) -> list[dict[str, objec
     for record in records:
         if not isinstance(record, dict):
             continue
+        candidate_id = str(record.get("candidate_id") or "").strip()
         ata = normalize_ata(record.get("ata"))
         category = str(record.get("category") or "")
         anchor_valid = (
@@ -453,10 +569,25 @@ def _document_confirmations(document: dict[str, object]) -> list[dict[str, objec
             if category in {"object_ata", "structural_ata"}
             else bool(record.get("relation_id"))
             if category == "interface_ata_hypotheses"
-            else bool(record.get("entity_id") or record.get("relation_id") or record.get("source_fragment"))
+            else bool(record.get("entity_id") or record.get("relation_id"))
         )
-        if ata and anchor_valid and category in MAPPING_CATEGORIES and category not in {"location_context_ata", "user_declared_ata"}:
-            result.append({**record, "ata": ata, "category": category})
+        if (
+            candidate_id
+            and ata
+            and anchor_valid
+            and category in MAPPING_CATEGORIES
+            and category not in {"location_context_ata", "user_declared_ata"}
+            and str(record.get("verification_status") or "").lower() == "confirmed"
+            and str(record.get("confirmed_claim") or "").strip()
+        ):
+            result.append(
+                {
+                    **record,
+                    "candidate_id": candidate_id,
+                    "ata": ata,
+                    "category": category,
+                }
+            )
     return result
 
 
@@ -473,16 +604,13 @@ def _find_confirmed_candidate(
     confirmation: dict[str, object],
 ) -> dict[str, object] | None:
     matches: list[dict[str, object]] = []
-    for status, items in validated.items():
-        if status in {"rejected", "document_confirmed"}:
-            continue
-        for item in items:
+    for item in validated["document_verification_required"]:
             if (
-                item.get("ata") == confirmation.get("ata")
+                item.get("candidate_id") == confirmation.get("candidate_id")
+                and item.get("ata") == confirmation.get("ata")
                 and item.get("mapping_category") == confirmation.get("category")
                 and (not confirmation.get("entity_id") or item.get("entity_id") == confirmation.get("entity_id"))
                 and (not confirmation.get("relation_id") or item.get("relation_id") == confirmation.get("relation_id"))
-                and (not confirmation.get("source_fragment") or item.get("source_fragment") == confirmation.get("source_fragment"))
             ):
                 matches.append(item)
     return matches[0] if len(matches) == 1 else None
@@ -494,24 +622,21 @@ def _action_for_item(
     matches = [
         action
         for action in actions
-        if action.get("category") == category
+        if action.get("candidate_id") == item.get("candidate_id")
+        and action.get("action") != "add_missing_candidate"
+        and action.get("coverage_invalid") is not True
+        and action.get("category") == category
         and action.get("ata") == item.get("ata")
-        and (not action.get("entity_id") or action.get("entity_id") == item.get("entity_id"))
-        and (
-            category in {"object_ata", "structural_ata"}
-            or not action.get("relation_id")
-            or action.get("relation_id") == item.get("relation_id")
-        )
     ]
     return matches[0] if len(matches) == 1 else None
 
 
 def _dedupe_validated(validated: dict[str, list[dict[str, object]]]) -> None:
     for status, items in validated.items():
-        seen: set[tuple[str, str, str]] = set()
+        seen: set[str] = set()
         unique: list[dict[str, object]] = []
         for item in items:
-            key = (str(item.get("ata")), str(item.get("entity_id") or ""), str(item.get("relation_id") or ""))
+            key = str(item.get("candidate_id") or "")
             if key not in seen:
                 item["status"] = status
                 unique.append(item)
@@ -575,6 +700,29 @@ def _schema_warnings(payload: dict[str, object], schema: dict[str, object], labe
                 warnings.append(f"schema_type_error:{label}:{key}:array")
             elif expected == "object" and not isinstance(payload[key], dict):
                 warnings.append(f"schema_type_error:{label}:{key}:object")
+            elif expected == "array" and isinstance(payload[key], list):
+                item_schema = definition.get("items")
+                if not isinstance(item_schema, dict):
+                    continue
+                item_type = item_schema.get("type")
+                required = item_schema.get("required", [])
+                for index, item in enumerate(payload[key]):
+                    if item_type == "object" and not isinstance(item, dict):
+                        warnings.append(
+                            f"schema_item_type_error:{label}:{key}:{index}:object"
+                        )
+                        continue
+                    if item_type == "string" and not isinstance(item, str):
+                        warnings.append(
+                            f"schema_item_type_error:{label}:{key}:{index}:string"
+                        )
+                        continue
+                    if isinstance(item, dict):
+                        for required_key in required:
+                            if required_key not in item:
+                                warnings.append(
+                                    f"schema_item_missing_required:{label}:{key}:{index}:{required_key}"
+                                )
     return warnings
 
 
@@ -582,3 +730,21 @@ def _fragment_in_request(fragment: str, request: str) -> bool:
     normalized_fragment = " ".join(fragment.lower().split())
     normalized_request = " ".join(request.lower().split())
     return bool(normalized_fragment) and normalized_fragment in normalized_request
+
+
+def _valid_candidate_id(
+    candidate_id: str,
+    category: str,
+    ata: str,
+    entity_id: str,
+    relation_id: str,
+) -> bool:
+    anchor = entity_id or relation_id or "request"
+    ata_token = ata.replace(" ", "_").replace("-", "_")
+    return bool(
+        re.fullmatch(
+            rf"candidate:{re.escape(category)}:{re.escape(anchor)}:"
+            rf"{re.escape(ata_token)}:[1-9]\d*",
+            candidate_id,
+        )
+    )

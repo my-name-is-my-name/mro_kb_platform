@@ -23,11 +23,13 @@ MAPPING_CATEGORIES: Final = (
     "user_declared_ata",
 )
 FINAL_STATUSES: Final = (
+    "candidate_unverified",
     "direct_confirmed",
     "inferred_from_request",
     "location_context",
     "possible_interface",
     "possible_procedure",
+    "document_verification_required",
     "document_confirmed",
     "user_declared_unverified",
     "rejected",

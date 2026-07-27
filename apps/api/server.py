@@ -16,6 +16,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.config import ensure_runtime_dirs
+from core.ata_impact.http_contract import (
+    extract_ata_request_text,
+    merge_ata_request_fields,
+    validate_stream_flag,
+)
+from core.ata_impact.modes import validate_ata_runtime_mode
 from core.commercial_offers import CommercialOffersService
 from core.go_no_go import AtaImpactAgent, GoNoGoService
 from core.retrieval.service import RetrievalService
@@ -104,7 +110,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
         self.close_connection = True
 
-    def _send_ata_impact_stream(self, question: str) -> None:
+    def _send_ata_impact_stream(self, question: str, mode: str = "auto") -> None:
         """Expose safe tool progress in OpenWebUI's collapsible reasoning area."""
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         events: queue.Queue[dict[str, object]] = queue.Queue()
@@ -112,7 +118,11 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         def run_agent() -> None:
             try:
-                result_box["result"] = SERVICES.ata_impact.analyze(question, progress=events.put)
+                result_box["result"] = SERVICES.ata_impact.analyze(
+                    question,
+                    progress=events.put,
+                    mode=mode,
+                )
             except Exception as exc:
                 result_box["error"] = str(exc)
             finally:
@@ -232,7 +242,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "chunk": payload})
             return self._send_json({"ok": False, "error": "not found"}, status=404)
         except Exception as exc:
-            return self._send_json({"ok": False, "error": f"internal error: {exc}"}, status=500)
+            return self._send_json(
+                {"error": {"message": "Internal server error", "type": "server_error"}},
+                status=500,
+            )
 
     def do_POST(self) -> None:
         try:
@@ -263,12 +276,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 elif model == "mro-go-no-go":
                     result = SERVICES.go_no_go.triage(question)
                 elif model == "mro-ata-impact":
-                    if bool(payload.get("stream")):
-                        return self._send_ata_impact_stream(question)
-                    result = SERVICES.ata_impact.analyze(question)
+                    mode = validate_ata_runtime_mode(
+                        payload["mode"] if "mode" in payload else "auto",
+                        allow_legacy=True,
+                    )
+                    stream = validate_stream_flag(payload)
+                    if stream:
+                        return self._send_ata_impact_stream(question, mode)
+                    result = SERVICES.ata_impact.analyze(question, mode=mode)
                 else:
                     result = SERVICES.retrieval.chat(question)
-                return self._send_openai_completion(model, result, bool(payload.get("stream")))
+                return self._send_openai_completion(
+                    model,
+                    result,
+                    validate_stream_flag(payload),
+                )
             if parsed.path == "/api/triage":
                 request_text = str(payload.get("request") or payload.get("q") or payload.get("question") or "").strip()
                 if not request_text:
@@ -276,12 +298,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
                 return self._send_json({"ok": True, "triage": SERVICES.go_no_go.triage(request_text, fields)})
             if parsed.path == "/api/ata-impact":
-                request_text = str(payload.get("request") or payload.get("q") or payload.get("question") or "").strip()
+                request_text = extract_ata_request_text(payload)
                 if not request_text:
                     return self._send_json({"ok": False, "error": "request is required"}, status=400)
-                fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
-                fields = {**{key: value for key, value in payload.items() if key in {"aircraft_type", "component", "components", "asset_name", "zone", "zones", "part_number", "ata", "ata_code", "ata_codes"}}, **fields}
-                mode = str(payload.get("mode") or "auto")
+                fields = merge_ata_request_fields(payload)
+                mode = validate_ata_runtime_mode(
+                    payload["mode"] if "mode" in payload else "auto",
+                    allow_legacy=True,
+                )
                 return self._send_json({"ok": True, "ata_impact": SERVICES.ata_impact.analyze(request_text, fields, mode=mode)})
             if parsed.path == "/api/chat":
                 question = str(payload.get("q") or payload.get("question") or "").strip()
@@ -291,8 +315,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             return self._send_json({"ok": False, "error": "not found"}, status=404)
         except (json.JSONDecodeError, UnicodeDecodeError):
             return self._send_json({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400)
-        except Exception as exc:
-            return self._send_json({"ok": False, "error": f"internal error: {exc}"}, status=500)
+        except ValueError as exc:
+            return self._send_json(
+                {"error": {"message": str(exc), "type": "invalid_request_error"}},
+                status=400,
+            )
+        except Exception:
+            return self._send_json(
+                {"error": {"message": "Internal server error", "type": "server_error"}},
+                status=500,
+            )
 
     def log_message(self, format: str, *args: object) -> None:
         return

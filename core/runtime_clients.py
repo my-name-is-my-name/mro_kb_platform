@@ -114,6 +114,15 @@ class OpenAICompatibleLLM:
         return model_id
 
     def chat(self, system_prompt: str, user_prompt: str, allow_reasoning_fallback: bool = False) -> str:
+        result = self.chat_response(system_prompt, user_prompt, allow_reasoning_fallback)
+        return str(result.get("content") or "")
+
+    def chat_response(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        allow_reasoning_fallback: bool = False,
+    ) -> dict[str, object]:
         payload = {
             "model": self.resolve_model(),
             "messages": [
@@ -138,9 +147,15 @@ class OpenAICompatibleLLM:
             raise RuntimeError("LLM response has no choices")
         message = choices[0].get("message") or {}
         content = str(message.get("content") or "").strip()
-        if content or not allow_reasoning_fallback:
-            return content
-        return str(message.get("reasoning_content") or "").strip()
+        if not content and allow_reasoning_fallback:
+            content = str(message.get("reasoning_content") or "").strip()
+        result: dict[str, object] = {
+            "content": content,
+            "finish_reason": choices[0].get("finish_reason"),
+        }
+        if isinstance(message.get("parsed"), dict):
+            result["parsed"] = message["parsed"]
+        return result
 
     def health(self) -> dict[str, Any]:
         try:

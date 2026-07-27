@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from core.config import PROJECT_ROOT
+from core.ata_impact.evidence import is_controlled_evidence_document
+from core.ata_impact.modes import (
+    PRODUCTION_ATA_MODES,
+    legacy_ata_modes_enabled,
+    validate_ata_runtime_mode,
+)
 from core.runtime_clients import OpenAICompatibleLLM, RuntimeSettings
 from storage.sqlite.store import SQLiteStore
 
@@ -96,18 +102,54 @@ class CertificateCatalog:
         normalized = sorted({self._normalize_ata(code) for code in ata_codes if self._normalize_ata(code)})
         if not normalized:
             return {"status": "unknown", "matched": [], "unmatched": [], "catalog_loaded": bool(self.entries)}
+        if not self.entries:
+            return {
+                "status": "catalog_unavailable",
+                "matched": [],
+                "unmatched": [],
+                "ambiguous": normalized,
+                "catalog_loaded": False,
+                "source": str(self.path),
+            }
         matched: list[dict[str, str]] = []
         unmatched: list[str] = []
+        ambiguous: list[str] = []
         for code in normalized:
             system = re.search(r"(\d{2})", code)
             system = system.group(1) if system else ""
             entries = self.by_system.get(system, [])
-            if entries:
-                matched.append({"ata": code, "certificate_ata": entries[0].ata, "name": entries[0].name})
+            exact = next(
+                (entry for entry in entries if self._normalize_ata(entry.ata) == code),
+                None,
+            )
+            if "-" in code and exact is None and entries:
+                ambiguous.append(code)
+            elif entries:
+                entry = exact or (entries[0] if len(entries) == 1 else None)
+                matched.append(
+                    {
+                        "ata": code,
+                        "certificate_ata": entry.ata if entry else f"ATA {system}",
+                        "name": entry.name if entry else "",
+                    }
+                )
             else:
                 unmatched.append(code)
-        status = "out_of_scope" if unmatched else "in_scope_candidate"
-        return {"status": status, "matched": matched, "unmatched": unmatched, "catalog_loaded": bool(self.entries), "source": str(self.path)}
+        status = (
+            "out_of_scope"
+            if unmatched
+            else "ambiguous"
+            if ambiguous
+            else "in_scope_candidate"
+        )
+        return {
+            "status": status,
+            "matched": matched,
+            "unmatched": unmatched,
+            "ambiguous": ambiguous,
+            "catalog_loaded": bool(self.entries),
+            "source": str(self.path),
+        }
 
     def description_matches(self, text: str) -> dict[str, list[str]]:
         """Return conservative lexical matches against the certificate's text.
@@ -276,7 +318,7 @@ class AtaImpactAgent:
         self.retriever = retriever
         self.internet_retriever = internet_retriever or DuckDuckGoEvidenceRetriever()
         self.ontology_path = PROJECT_ROOT / "config" / "mro_ontology_v1.json"
-        self.ontology = self._load_ontology()
+        self.ontology = self._load_ontology() if legacy_ata_modes_enabled() else {}
         self.evidence_enabled = True
         settings = RuntimeSettings()
         ata_llm_flag = os.getenv("MRO_KB_ATA_AGENT_LLM_ENABLED")
@@ -293,9 +335,10 @@ class AtaImpactAgent:
         self._llm = llm or (OpenAICompatibleLLM(ata_settings) if enabled and settings.llm_enabled and settings.llm_provider == "openai" else None)
 
     def analyze(self, request: str, fields: dict[str, object] | None = None, progress: Callable[[dict[str, object]], None] | None = None, mode: str = "auto") -> dict[str, object]:
+        mode = validate_ata_runtime_mode(mode, allow_legacy=True)
         # v2 is the default. The old modes remain as explicit, deprecated
         # compatibility fallbacks while consumers migrate.
-        if mode in {"auto", "standard", "extended"}:
+        if mode in PRODUCTION_ATA_MODES:
             from core.ata_impact.evidence import LegacyEvidenceRetrieverAdapter, NullAtaEvidenceRetriever
             from core.ata_impact.service import AtaImpactService
 
@@ -312,7 +355,6 @@ class AtaImpactAgent:
                 progress({"stage": stage, "message": message, **extra})
 
         fields = fields if isinstance(fields, dict) else {}
-        mode = mode if mode in {"rules_only", "ontology_llm", "full_pipeline"} else "ontology_llm"
         text = " ".join(str(x) for x in (request, *[fields.get(k) or "" for k in ("component", "components", "asset_name", "zone", "zones", "part_number")])).strip()
         facts = self._extract_intake_facts(text, fields)
         matches = self._ontology_matches(text, facts)
@@ -335,6 +377,11 @@ class AtaImpactAgent:
                 trace.append({"step": "llm_critic", "status": "completed", "allowed_candidates": allowed, "selected": sorted(selected)})
         direct = sorted({i["ata"] for i in direct_system + direct_structural})
         secondary = self._secondary_from_relationships(text, direct, secondary)
+        for sequence, item in enumerate(secondary, start=1):
+            item.setdefault(
+                "candidate_id",
+                f"candidate:legacy_secondary:request:{str(item.get('ata') or '').replace(' ', '_').replace('-', '_')}:{sequence}",
+            )
         controlled_documents: list[dict[str, object]] = []
         internet_documents: list[dict[str, object]] = []
         confirmed_secondary: list[str] = []
@@ -575,12 +622,20 @@ class AtaImpactAgent:
         accepted: list[dict[str, object]] = []
         rejected: list[dict[str, str]] = []
         required_types = {str(t).lower() for item in secondary for t in item.get("required_document_types", [])}
+        candidate_ids = {
+            str(item.get("candidate_id")): {
+                **item,
+                "mapping_category": "interface_ata_hypotheses",
+                "entity_id": "legacy",
+            }
+            for item in secondary
+            if item.get("candidate_id")
+        }
         for document in documents:
-            trust = str(document.get("trust_level") or "internal_reference").lower()
             doc_type = str(document.get("document_type") or document.get("document_family") or "").lower()
             reason = ""
-            if trust not in {"controlled_oem", "approved_data"}:
-                reason = "trust_level_not_controlled"
+            if not is_controlled_evidence_document(document, candidate_ids):
+                reason = "controlled_evidence_contract_failed"
             elif not self._applicable_aircraft(document, fields):
                 reason = "aircraft_type_or_effectivity_mismatch"
             elif document.get("current_revision") is False:
@@ -597,10 +652,18 @@ class AtaImpactAgent:
     def _secondary_supported_by_documents(secondary: list[dict[str, object]], documents: list[dict[str, object]]) -> list[dict[str, object]]:
         supported: list[dict[str, object]] = []
         for item in secondary:
-            ata = str(item.get("ata") or "")
-            chapter = re.search(r"(\d{2})", ata)
-            chapter = chapter.group(1) if chapter else ""
-            cards = [doc for doc in documents if chapter and (chapter in str(doc.get("ata") or doc.get("document_ata") or "") or bool(re.search(rf"\bATA\s*{chapter}\b", " ".join(str(doc.get(k) or "") for k in ("title", "snippet", "text")), re.I)))]
+            candidate_id = str(item.get("candidate_id") or "")
+            cards = [
+                document
+                for document in documents
+                if candidate_id
+                and candidate_id
+                in {
+                    str(record.get("candidate_id") or "")
+                    for record in document.get("confirmed_candidates", [])
+                    if isinstance(record, dict)
+                }
+            ]
             if cards:
                 supported.append({**item, "evidence_cards": cards})
         return supported
@@ -1021,16 +1084,65 @@ class GoNoGoService:
         if self._llm is not None and os.getenv("MRO_KB_GO_NO_GO_LLM_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
             facts = self._llm_enrich_facts(request, facts)
         staged = self.ata_impact.analyze(request, fields, mode="auto")
+        staged_validated = (
+            staged.get("validated_ata")
+            if isinstance(staged.get("validated_ata"), dict)
+            else {}
+        )
+        affected_ata = list(staged.get("affected_ata") or [])
+        potential_ata = list(staged.get("potentially_affected_ata") or [])
+        context_ata = list(staged.get("context_ata") or [])
+        staged_required = [str(item) for item in staged.get("required_input_data") or []]
+        uncertainties = [
+            str(item)
+            for item in (
+                (staged.get("engineering_facts") or {}).get("uncertainties", [])
+                if isinstance(staged.get("engineering_facts"), dict)
+                else []
+            )
+        ]
+        document_required = list(staged_validated.get("document_verification_required") or [])
+        candidate_unverified = list(staged_validated.get("candidate_unverified") or [])
+        user_declared_unverified = list(
+            staged_validated.get("user_declared_unverified") or []
+        )
+        staged_warnings = [str(item) for item in staged.get("warnings") or []]
+        critical_staged_warning = any(
+            warning.startswith(
+                (
+                    "schema_",
+                    "duplicate_",
+                    "invalid_",
+                    "missing_critic_action:",
+                    "unknown_critic_candidate_id:",
+                    "critic_candidate_mismatch:",
+                    "incompatible_critic_action:",
+                )
+            )
+            for warning in staged_warnings
+        )
         impact = {
-            "direct_ata": list(staged.get("affected_ata") or []),
-            "potentially_affected_ata": list(staged.get("potentially_affected_ata") or []),
-            "confirmed_affected_ata": list(staged.get("affected_ata") or []),
+            "direct_ata": affected_ata,
+            "potentially_affected_ata": potential_ata,
+            "confirmed_affected_ata": affected_ata,
             "unresolved_ata": (
-                ["ATA scope"] if staged.get("decision") == "engineering_review_required" else []
+                ["ATA scope"]
+                if (
+                    staged.get("decision") != "completed"
+                    or potential_ata
+                    or document_required
+                    or candidate_unverified
+                    or user_declared_unverified
+                    or uncertainties
+                    or critical_staged_warning
+                )
+                else []
             ),
         }
         certificate = staged.get("certificate_scope") or self.certificate.match(impact["direct_ata"])
-        missing = self._missing_inputs(facts)
+        missing = list(
+            dict.fromkeys([*self._missing_inputs(facts), *staged_required])
+        )
         requested_ata = impact["confirmed_affected_ata"] or impact["direct_ata"]
         evidence_result = (
             self.retriever.retrieve(request, {"ata_codes": requested_ata, "aircraft_type": facts.get("aircraft_type", "")})
@@ -1038,6 +1150,22 @@ class GoNoGoService:
             else {"documents": [], "retrieval_mode": "skipped_no_validated_ata", "warnings": []}
         )
         evidence = evidence_result.get("documents") or []
+        mapping_candidates = {
+            str(item.get("candidate_id")): {
+                **item,
+                "mapping_category": category,
+            }
+            for category, items in (staged.get("ata_mapping") or {}).items()
+            if isinstance(items, list)
+            for item in items
+            if isinstance(item, dict) and item.get("candidate_id")
+        } if isinstance(staged.get("ata_mapping"), dict) else set()
+        controlled_evidence = [
+            item
+            for item in staged.get("controlled_evidence") or []
+            if isinstance(item, dict)
+            and is_controlled_evidence_document(item, mapping_candidates)
+        ]
         evidence_ata = self.ata_catalog.evidence_candidates([item for item in evidence if isinstance(item, dict)], impact["confirmed_affected_ata"])
         # Evidence search hits remain diagnostic candidates. They must not
         # bypass v2 relation/category/critic validation or mutate ATA impact.
@@ -1052,10 +1180,39 @@ class GoNoGoService:
         if certificate.get("status") == "out_of_scope":
             recommendation = "hold_expert_review"
             reason = "техническая ATA не найдена в текущей области сертификата; требуется отдельная capability-проверка"
+        elif not affected_ata and context_ata:
+            recommendation = "hold_expert_review"
+            reason = "технически затронутый объект не определён; присутствует только ATA местоположения/контекста"
+        elif not affected_ata:
+            recommendation = "need_more_info" if missing else "hold_expert_review"
+            reason = (
+                "не определена ни одна подтверждённо затронутая ATA"
+                if not missing
+                else "для определения затронутого объекта и ATA не хватает исходных данных"
+            )
         elif missing:
             recommendation = "need_more_info"
             reason = "для проверки применимости и обоснования не хватает исходных данных"
-        elif unresolved or certificate.get("status") in {"unknown", "ambiguous"} or not certificate.get("catalog_loaded"):
+        elif uncertainties:
+            recommendation = "need_more_info"
+            reason = "инженерные неопределённости заявки должны быть закрыты до assessment"
+        elif document_required:
+            recommendation = "hold_expert_review"
+            reason = "требуемое controlled OEM подтверждение не найдено или не прошло проверку"
+        elif (
+            potential_ata
+            or candidate_unverified
+            or user_declared_unverified
+            or critical_staged_warning
+        ):
+            recommendation = "hold_expert_review"
+            reason = "потенциальные или непроверенные ATA остаются открытыми"
+        elif (
+            unresolved
+            or staged.get("decision") != "completed"
+            or certificate.get("status") in {"unknown", "ambiguous", "catalog_unavailable"}
+            or not certificate.get("catalog_loaded")
+        ):
             recommendation = "hold_expert_review"
             reason = "область работ или покрытие сертификатом не подтверждены однозначно"
         else:
@@ -1075,6 +1232,7 @@ class GoNoGoService:
             },
             "direct_ata": impact["direct_ata"],
             "potentially_affected_ata": impact["potentially_affected_ata"],
+            "context_ata": context_ata,
             "confirmed_affected_ata": impact["confirmed_affected_ata"],
             "unresolved_ata": unresolved,
             "certificate_scope": certificate,
@@ -1082,6 +1240,8 @@ class GoNoGoService:
             "missing_inputs": missing,
             "required_documents": self._required_documents(facts, impact),
             "evidence": evidence,
+            "retrieved_documents": evidence,
+            "controlled_evidence": controlled_evidence,
             "risks": risks,
             "questions_for_expert": self._expert_questions(facts, impact, evidence),
             "explanation": reason,
