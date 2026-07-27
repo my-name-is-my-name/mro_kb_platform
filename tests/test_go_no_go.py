@@ -124,11 +124,15 @@ class GoNoGoTests(unittest.TestCase):
             "required_input_data": [],
             "decision": "completed",
             "warnings": [],
+            "validation_gate": {"critical": False, "reasons": []},
             "engineering_facts": {"uncertainties": []},
             "validated_ata": {
                 "document_verification_required": [],
                 "candidate_unverified": [],
                 "user_declared_unverified": [],
+                "user_declared_conflicting": [],
+                "user_declared_not_in_certificate": [],
+                "user_declared_consistent": [],
             },
             "certificate_scope": {
                 "status": "in_scope_candidate",
@@ -137,6 +141,13 @@ class GoNoGoTests(unittest.TestCase):
                 "unmatched": [],
             },
             "ata_mapping": {},
+            "document_verification": {
+                "status": "completed",
+                "documents": [],
+                "warnings": [],
+            },
+            "retrieved_documents": [],
+            "controlled_evidence": [],
         }
         result.update(overrides)
         return result
@@ -215,6 +226,91 @@ class GoNoGoTests(unittest.TestCase):
 
     def test_valid_closed_staged_case_can_go_to_assessment(self) -> None:
         result = self.triage_staged(self.staged_result())
+        self.assertEqual(result["recommendation"], "go_to_assessment")
+
+    def test_closed_staged_case_does_not_require_legacy_flat_object_fields(self) -> None:
+        staged = self.staged_result(
+            engineering_facts={
+                "aircraft": {"family": "A320", "model": None},
+                "physical_objects": [
+                    {"id": "object_1", "name": "cargo roller track"}
+                ],
+                "uncertainties": [],
+            }
+        )
+
+        class StubImpact:
+            def analyze(self, *args: object, **kwargs: object) -> dict[str, object]:
+                return staged
+
+        service = self.make_service()
+        service.ata_impact = StubImpact()  # type: ignore[assignment]
+        result = service.triage("Engineering work package", {})
+        self.assertEqual(result["missing_inputs"], [])
+        self.assertEqual(result["recommendation"], "go_to_assessment")
+
+    def test_go_no_go_reuses_staged_facts_and_evidence_without_duplicate_calls(self) -> None:
+        staged_document = {"document_id": "amm-25", "title": "AMM 25"}
+        staged = self.staged_result(
+            engineering_facts={
+                "uncertainties": [],
+                "physical_objects": [{"id": "object_1", "name": "roller track"}],
+            },
+            document_verification={
+                "status": "completed",
+                "documents": [staged_document],
+                "warnings": [],
+            },
+            retrieved_documents=[staged_document],
+        )
+
+        class StubImpact:
+            def analyze(self, *args: object, **kwargs: object) -> dict[str, object]:
+                return staged
+
+        class BombRetriever:
+            def retrieve(self, *args: object, **kwargs: object) -> dict[str, object]:
+                raise AssertionError("duplicate technical retrieval")
+
+        class BombLLM:
+            def chat(self, *args: object, **kwargs: object) -> str:
+                raise AssertionError("duplicate technical fact extraction")
+
+        service = self.make_service()
+        service.ata_impact = StubImpact()  # type: ignore[assignment]
+        service.retriever = BombRetriever()  # type: ignore[assignment]
+        service._llm = BombLLM()  # type: ignore[assignment]
+        result = service.triage(
+            "Engineering work package",
+            {
+                "aircraft_type": "A320",
+                "components": "cargo equipment",
+                "work_type": "assessment",
+            },
+        )
+        self.assertEqual(result["recommendation"], "go_to_assessment")
+        self.assertEqual(result["evidence"], [staged_document])
+        self.assertEqual(
+            result["case_facts"]["engineering_facts"],
+            staged["engineering_facts"],
+        )
+        self.assertEqual(
+            result["search_trace"]["source"],
+            "ata_impact_staged_result",
+        )
+
+    def test_consistent_declared_ata_does_not_block_go_no_go(self) -> None:
+        staged = self.staged_result(
+            validated_ata={
+                "document_verification_required": [],
+                "candidate_unverified": [],
+                "user_declared_unverified": [],
+                "user_declared_conflicting": [],
+                "user_declared_not_in_certificate": [],
+                "user_declared_consistent": [{"ata": "ATA 25"}],
+            }
+        )
+        result = self.triage_staged(staged)
         self.assertEqual(result["recommendation"], "go_to_assessment")
 
     def test_unverified_user_declared_ata_blocks_assessment(self) -> None:

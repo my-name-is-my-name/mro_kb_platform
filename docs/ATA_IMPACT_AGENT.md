@@ -8,11 +8,12 @@
 
 ```text
 formal identifiers
-→ LLM engineering facts (без ATA)
-→ LLM ATA mapping (без legacy allowlist)
+→ structured LLM engineering facts (без ATA)
+→ structured LLM ATA mapping (без legacy allowlist и candidate_id)
 → deterministic mapping validation
+→ Python candidate_id allocation
 → deterministic certificate validation
-→ independent critic
+→ independent structured LLM critic
 → OEM evidence retriever
 → deterministic status assembly
 ```
@@ -22,6 +23,23 @@ mapping и critic. Critic получает уже провалидированн
 уникальными `candidate_id` и результат certificate validation. `standard`,
 `extended` и `auto` могут отличаться глубиной critic и retrieval, но не
 объединяют mapper и critic в одном контексте.
+
+Для stages `engineering_fact_extraction`, `ata_mapping`,
+`independent_critic` и `json_repair` ATA-specific transport передаёт
+generation schema через OpenAI-compatible `response_format`. Профиль
+`json_schema` использует strict schema adapter; `json_schema_no_strict`,
+`json_object` и `prompt_only` явно отражаются в trace без ложного признака
+server enforcement. Любой результат повторно проходит полную локальную
+shape-validation и MRO cross-reference validation. Пустой `content`,
+`finish_reason=length`, reasoning-only ответ и произвольный embedded JSON
+завершаются repair/fail-safe, не извлечением chain-of-thought.
+
+Mapper возвращает только инженерные поля. После deterministic validation
+Python назначает уникальный request-scoped ID формата
+`candidate:<category>:<anchor>:<ata-token>:<sequence>`. Critic может ссылаться
+на него, но не менять ATA, category или identity anchor. Relation, нужная
+только для downgrade transition, хранится отдельно как
+`transition_relation_id`.
 
 Результат разделяет `affected_ata`, `potentially_affected_ata` и `context_ata`.
 Location reference никогда автоматически не становится affected. Interface
@@ -66,6 +84,12 @@ Compatibility-поля v1 разделяют:
   `additional_input_required` или `document_verification_required`;
 - `certificate_chapter_match` — только совпадение главы сертификата, не capability.
 
+User-declared ATA детерминированно reconciles после critic и certificate
+validation: `user_declared_consistent` не блокирует закрытый анализ;
+`user_declared_conflicting`, `user_declared_unverified` и
+`user_declared_not_in_certificate` требуют review. Mapper assessment остаётся
+неавторитетным полем `declared_assessment`.
+
 Production mode HTTP API — `auto`; также доступны `standard` и `extended`.
 `rules_only`, `ontology_llm` и `full_pipeline` сохранены как deprecated explicit
 legacy fallback и не используются по умолчанию.
@@ -75,6 +99,12 @@ Legacy mode разрешён только при точном имени mode и
 В v2 LLM самостоятельно создаёт кандидатов; certificate catalog используется
 только после mapping. Legacy ontology не ограничивает список. Только applicable
 controlled OEM/approved data может дать `document_confirmed`.
+
+Go/No-Go использует готовые staged `engineering_facts`,
+`document_verification`, `retrieved_documents` и `controlled_evidence`. Он не
+запускает второй technical fact extractor и не повторяет technical evidence
+retrieval. Authoritative `validation_gate` формируется ATA service; flat intake
+fields сохраняются только как compatibility projection.
 
 В OpenWebUI этапы передаются в сворачиваемом `reasoning`-блоке. Это журнал действий инструмента, а не скрытые рассуждения модели.
 

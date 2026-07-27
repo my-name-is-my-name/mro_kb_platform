@@ -31,7 +31,10 @@ FINAL_STATUSES: Final = (
     "possible_procedure",
     "document_verification_required",
     "document_confirmed",
+    "user_declared_consistent",
+    "user_declared_conflicting",
     "user_declared_unverified",
+    "user_declared_not_in_certificate",
     "rejected",
 )
 CRITIC_ACTIONS: Final = {

@@ -26,8 +26,7 @@ You are an aviation ATA classification mapper. Return one JSON object only with 
 object_ata, structural_ata, location_context_ata, interface_ata_hypotheses,
 procedure_ata_hypotheses, user_declared_ata.
 Create candidates from the request and engineering facts using aviation knowledge; the
-certificate catalog is only a normalization/scope reference and is not proof of technical
-classification. Do not restrict candidates to certificate scope.
+organization certificate is checked later and must not constrain technical classification.
 Object ATA is for the damaged/changed/inspected functional object. Structural ATA requires
 actual damage, repair or modification of structure. Installation location alone is context,
 not affected ATA. A neighboring system is not automatically affected.
@@ -37,10 +36,10 @@ Procedure ATA is only possible
 until an applicable controlled OEM document confirms it. Keep explicit user ATA separate
 with status consistent, conflicting, unverified, or not_in_certificate; it never suppresses
 independent classification. Do not mix ATA impact with organizational capability.
-Each item needs a unique candidate_id, ata, confidence and a short engineering reason plus
-entity_id or relation_id as applicable. candidate_id format is
-candidate:<category>:<entity-or-relation>:<ata>:<sequence>. Include source_fragment when
-available. All mapping items are unverified candidates. Return no chain-of-thought.
+Each item needs ata, confidence and a short engineering reason plus entity_id or relation_id
+as applicable. Do not generate candidate_id; the Python orchestration layer assigns it after
+deterministic validation. Include source_fragment when available. All mapping items are
+unverified candidates. Return no chain-of-thought.
 """.strip()
 
 
@@ -59,14 +58,6 @@ procedure. Certificate scope is not technical evidence and is not capability app
 Procedural/interface confirmation requires applicable controlled OEM evidence. Preserve
 conflicting user ATA separately. Do not provide chain-of-thought.
 """.strip()
-
-
-# Deprecated experimental-only contract. Production modes never call this prompt.
-ATA_MAPPING_AND_CRITIC_PROMPT = (
-    ATA_MAPPING_PROMPT
-    + "\nAlso self-audit the mapping independently and return "
-    '{"ata_mapping":{...},"critic":{"actions":[...]}} using the same critic rules.'
-)
 
 
 ATA_JSON_REPAIR_PROMPT = """

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,9 +31,57 @@ class RuntimeSettings:
     llm_api_key: str = os.getenv("MRO_KB_LLM_API_KEY", "local").strip()
     llm_temperature: float = float(os.getenv("MRO_KB_LLM_TEMPERATURE", "0"))
     llm_max_tokens: int = int(os.getenv("MRO_KB_LLM_MAX_TOKENS", "1200"))
+    ata_structured_output_mode: str = os.getenv(
+        "MRO_KB_ATA_STRUCTURED_OUTPUT_MODE",
+        "json_schema",
+    ).strip()
     # The intake agent must fail closed to the ontology result instead of leaving
     # an OpenWebUI stream in a perpetual "thinking" state.
     llm_timeout_seconds: float = float(os.getenv("MRO_KB_LLM_TIMEOUT_SECONDS", "30"))
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredLLMResponse:
+    parsed: dict[str, object] | None
+    content: str
+    finish_reason: str | None
+    structured_output_mode: str
+    schema_enforced: bool
+    repair_attempted: bool = False
+    error: str | None = None
+    latency_ms: float = 0.0
+
+
+def _strict_transport_schema(schema: dict[str, object]) -> dict[str, object]:
+    """Adapt the portable business schema to strict structured-output rules."""
+
+    result = deepcopy(schema)
+
+    def visit(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            originally_required = {
+                str(item) for item in node.get("required", [])
+            }
+            for name, definition in properties.items():
+                visit(definition)
+                if name not in originally_required and isinstance(definition, dict):
+                    value_type = definition.get("type")
+                    if isinstance(value_type, str):
+                        definition["type"] = [value_type, "null"]
+                    elif isinstance(value_type, list) and "null" not in value_type:
+                        definition["type"] = [*value_type, "null"]
+                    enum = definition.get("enum")
+                    if isinstance(enum, list) and None not in enum:
+                        definition["enum"] = [*enum, None]
+            node["required"] = list(properties)
+        items = node.get("items")
+        visit(items)
+
+    visit(result)
+    return result
 
 
 class ExternalReranker:
@@ -156,6 +207,114 @@ class OpenAICompatibleLLM:
         if isinstance(message.get("parsed"), dict):
             result["parsed"] = message["parsed"]
         return result
+
+    def structured_chat(
+        self,
+        *,
+        stage: str,
+        system_prompt: str,
+        input_payload: dict[str, object],
+        response_schema: dict[str, object],
+    ) -> StructuredLLMResponse:
+        mode = self.settings.ata_structured_output_mode
+        if mode not in {
+            "json_schema",
+            "json_schema_no_strict",
+            "json_object",
+            "prompt_only",
+        }:
+            return StructuredLLMResponse(
+                parsed=None,
+                content="",
+                finish_reason=None,
+                structured_output_mode=mode,
+                schema_enforced=False,
+                error=f"unsupported_structured_output_mode:{mode}",
+            )
+        schema_enforced = mode == "json_schema"
+        started = time.monotonic()
+        try:
+            payload: dict[str, object] = {
+                "model": self.resolve_model(),
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(input_payload, ensure_ascii=False),
+                    },
+                ],
+                "temperature": self.settings.llm_temperature,
+                "stream": False,
+            }
+            schema_name = (
+                re.sub(r"[^a-zA-Z0-9_-]", "_", stage)[:64]
+                or "structured_response"
+            )
+            if mode in {"json_schema", "json_schema_no_strict"}:
+                json_schema: dict[str, object] = {
+                    "name": schema_name,
+                    "schema": (
+                        _strict_transport_schema(response_schema)
+                        if mode == "json_schema"
+                        else response_schema
+                    ),
+                }
+                if mode == "json_schema":
+                    json_schema["strict"] = True
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": json_schema,
+                }
+            elif mode == "json_object":
+                payload["response_format"] = {"type": "json_object"}
+            if self.settings.llm_max_tokens > 0:
+                payload["max_tokens"] = self.settings.llm_max_tokens
+            request = urllib.request.Request(
+                f"{self.settings.llm_base_url}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers=self._headers(),
+                method="POST",
+            )
+            with urllib.request.urlopen(
+                request,
+                timeout=self.settings.llm_timeout_seconds,
+            ) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            choices = body.get("choices") or []
+            if not choices:
+                raise RuntimeError("LLM response has no choices")
+            choice = choices[0]
+            message = choice.get("message") or {}
+            content = str(message.get("content") or "").strip()
+            parsed = message.get("parsed")
+            if not isinstance(parsed, dict):
+                parsed = None
+            error = None
+            if not content and parsed is None:
+                error = (
+                    "reasoning_content_without_content"
+                    if str(message.get("reasoning_content") or "").strip()
+                    else "empty_content"
+                )
+            return StructuredLLMResponse(
+                parsed=parsed,
+                content=content,
+                finish_reason=str(choice.get("finish_reason") or "") or None,
+                structured_output_mode=mode,
+                schema_enforced=schema_enforced,
+                error=error,
+                latency_ms=(time.monotonic() - started) * 1000,
+            )
+        except Exception as exc:
+            return StructuredLLMResponse(
+                parsed=None,
+                content="",
+                finish_reason=None,
+                structured_output_mode=mode,
+                schema_enforced=schema_enforced,
+                error=f"transport_error:{type(exc).__name__}",
+                latency_ms=(time.monotonic() - started) * 1000,
+            )
 
     def health(self) -> dict[str, Any]:
         try:

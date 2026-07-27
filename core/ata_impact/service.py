@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import Callable, Protocol, TypeVar
+from dataclasses import replace
+from typing import Callable, Protocol
+
+from core.runtime_clients import StructuredLLMResponse
 
 from .certificate_validator import validate_certificate
 from .evidence import (
@@ -18,7 +21,15 @@ from .prompts import (
     ATA_MAPPING_PROMPT,
     ENGINEERING_FACT_EXTRACTION_PROMPT,
 )
-from .validator import apply_critic_additions, assemble, validate_critic, validate_facts, validate_mapping
+from .schemas import ATA_CRITIC_SCHEMA, ATA_MAPPING_SCHEMA, ENGINEERING_FACTS_SCHEMA
+from .validator import (
+    apply_critic_additions,
+    assemble,
+    critical_ata_warning_reasons,
+    validate_critic,
+    validate_facts,
+    validate_mapping,
+)
 
 
 class StructuredLLM(Protocol):
@@ -58,63 +69,55 @@ class AtaImpactService:
         if self.llm is None:
             return self._fallback(request, fields, identifiers, trace)
 
-        facts_payload, fact_error, fact_repair, fact_finish = self._call_json(
+        facts_input = {"request": request, "fields": fields, "identifiers": identifiers}
+        facts_payload, fact_response = self._call_json(
             ENGINEERING_FACT_EXTRACTION_PROMPT,
-            {"request": request, "fields": fields, "identifiers": identifiers},
+            facts_input,
             "engineering_fact_extraction",
+            ENGINEERING_FACTS_SCHEMA,
         )
         facts, fact_warnings = validate_facts(facts_payload, identifiers)
         if (
             _has_schema_error(fact_warnings)
-            and not fact_error
-            and fact_repair == "not_needed"
+            and not fact_response.error
+            and not fact_response.repair_attempted
         ):
-            facts_payload, fact_error, fact_repair, fact_finish = self._repair_json(
+            facts_payload, fact_response = self._repair_json(
                 "engineering_fact_extraction",
                 ENGINEERING_FACT_EXTRACTION_PROMPT,
-                {"request": request, "fields": fields, "identifiers": identifiers},
+                facts_input,
+                ENGINEERING_FACTS_SCHEMA,
                 fact_warnings,
             )
             facts, fact_warnings = validate_facts(facts_payload, identifiers)
-        if _has_schema_error(fact_warnings) and fact_repair == "completed":
-            fact_error = "schema_validation_failed"
-            fact_repair = "repair_failed"
+        if _has_schema_error(fact_warnings) and fact_response.repair_attempted:
+            fact_response = replace(fact_response, error="schema_validation_failed")
         warnings.extend(fact_warnings)
-        trace.append(
-            {
-                "step": "engineering_fact_extraction",
-                "status": (
-                    "repair_failed"
-                    if fact_repair == "repair_failed"
-                    else "error"
-                    if fact_error
-                    else "completed"
-                ),
-                "warning": fact_error,
-                "reason": fact_error,
-                "repair": fact_repair,
-                "finish_reason": fact_finish,
-            }
-        )
-        if fact_error:
-            return self._fallback(request, fields, identifiers, trace, [fact_error, *warnings])
+        trace.append(self._structured_trace("engineering_fact_extraction", fact_response))
+        if fact_response.error:
+            return self._fallback(
+                request,
+                fields,
+                identifiers,
+                trace,
+                [fact_response.error, *warnings],
+            )
         if _has_schema_error(fact_warnings):
             return self._fallback(request, fields, identifiers, trace, fact_warnings, facts=facts)
         self._report(progress, "engineering_fact_extraction", "Инженерная модель заявки сформирована.")
 
         mode = self._select_mode(requested_mode, identifiers, facts)
-        catalog = self._catalog_payload()
         mapping_input = {
             "request": request,
             "engineering_facts": facts,
             "relations": facts.get("relations", []),
-            "certificate_catalog": catalog,
             "explicit_user_ata": identifiers["explicit_ata"],
         }
-        mapping_payload, mapping_error, mapping_repair, mapping_finish = self._call_json(
+        mapping_payload, mapping_response = self._call_json(
             ATA_MAPPING_PROMPT,
             mapping_input,
             "ata_mapping",
+            ATA_MAPPING_SCHEMA,
         )
         mapping, mapping_warnings = validate_mapping(
             mapping_payload,
@@ -124,13 +127,14 @@ class AtaImpactService:
         )
         if (
             _has_schema_error(mapping_warnings)
-            and not mapping_error
-            and mapping_repair == "not_needed"
+            and not mapping_response.error
+            and not mapping_response.repair_attempted
         ):
-            mapping_payload, mapping_error, mapping_repair, mapping_finish = self._repair_json(
+            mapping_payload, mapping_response = self._repair_json(
                 "ata_mapping",
                 ATA_MAPPING_PROMPT,
                 mapping_input,
+                ATA_MAPPING_SCHEMA,
                 mapping_warnings,
             )
             mapping, mapping_warnings = validate_mapping(
@@ -139,29 +143,19 @@ class AtaImpactService:
                 list(identifiers["explicit_ata"]),
                 request,
             )
-        if _has_schema_error(mapping_warnings) and mapping_repair == "completed":
-            mapping_error = "schema_validation_failed"
-            mapping_repair = "repair_failed"
-        trace.append(
-            {
-                "step": "ata_mapping",
-                "status": (
-                    "repair_failed"
-                    if mapping_repair == "repair_failed"
-                    else "error"
-                    if mapping_error
-                    else "completed"
-                ),
-                "combined_runtime_call": False,
-                "repair": mapping_repair,
-                "reason": mapping_error,
-                "finish_reason": mapping_finish,
-            }
-        )
+        if _has_schema_error(mapping_warnings) and mapping_response.repair_attempted:
+            mapping_response = replace(mapping_response, error="schema_validation_failed")
+        trace.append(self._structured_trace("ata_mapping", mapping_response, combined_runtime_call=False))
 
-        if mapping_error:
-            trace[-1]["warning"] = mapping_error
-            return self._fallback(request, fields, identifiers, trace, [mapping_error, *warnings], facts=facts)
+        if mapping_response.error:
+            return self._fallback(
+                request,
+                fields,
+                identifiers,
+                trace,
+                [mapping_response.error, *warnings],
+                facts=facts,
+            )
 
         warnings.extend(mapping_warnings)
         if _has_schema_error(mapping_warnings):
@@ -180,45 +174,37 @@ class AtaImpactService:
             "certificate_validation": certificate_validation,
             "critic_depth": mode,
         }
-        critic_payload, critic_error, critic_repair, critic_finish = self._call_json(
+        critic_payload, critic_response = self._call_json(
             ATA_CRITIC_PROMPT,
             critic_input,
             "independent_critic",
+            ATA_CRITIC_SCHEMA,
         )
         critic_actions, critic_warnings = validate_critic(critic_payload, mapping, facts)
         if (
             _has_schema_error(critic_warnings)
-            and not critic_error
-            and critic_repair == "not_needed"
+            and not critic_response.error
+            and not critic_response.repair_attempted
         ):
-            critic_payload, critic_error, critic_repair, critic_finish = self._repair_json(
+            critic_payload, critic_response = self._repair_json(
                 "independent_critic",
                 ATA_CRITIC_PROMPT,
                 critic_input,
+                ATA_CRITIC_SCHEMA,
                 critic_warnings,
             )
             critic_actions, critic_warnings = validate_critic(critic_payload, mapping, facts)
-        if _has_schema_error(critic_warnings) and critic_repair == "completed":
-            critic_error = "schema_validation_failed"
-            critic_repair = "repair_failed"
+        if _has_schema_error(critic_warnings) and critic_response.repair_attempted:
+            critic_response = replace(critic_response, error="schema_validation_failed")
         trace.append(
-            {
-                "step": "independent_critic",
-                "status": (
-                    "repair_failed"
-                    if critic_repair == "repair_failed"
-                    else "error"
-                    if critic_error
-                    else "completed"
-                ),
-                "combined_runtime_call": False,
-                "repair": critic_repair,
-                "reason": critic_error,
-                "finish_reason": critic_finish,
-            }
+            self._structured_trace(
+                "independent_critic",
+                critic_response,
+                combined_runtime_call=False,
+            )
         )
-        if critic_error:
-            warnings.append(critic_error)
+        if critic_response.error:
+            warnings.append(critic_response.error)
         warnings.extend(critic_warnings)
         mapping, critic_actions, addition_warnings = apply_critic_additions(mapping, critic_actions, facts, request)
         warnings.extend(addition_warnings)
@@ -277,11 +263,21 @@ class AtaImpactService:
             for item in retrieved_documents
             if is_controlled_evidence_document(item, valid_candidates)
         ]
+        all_warnings = list(
+            dict.fromkeys(
+                [*warnings, *[str(item) for item in evidence.get("warnings", [])]]
+            )
+        )
+        validation_reasons = critical_ata_warning_reasons(all_warnings)
+        validation_gate = {
+            "critical": bool(validation_reasons),
+            "reasons": validation_reasons,
+        }
         decision, decision_reasons = self._decision(
             assembled,
             facts,
             required,
-            [*warnings, *[str(item) for item in evidence.get("warnings", [])]],
+            validation_gate,
             evidence,
             certificate_validation,
         )
@@ -303,9 +299,10 @@ class AtaImpactService:
             "controlled_evidence": controlled_evidence,
             "decision": decision,
             "decision_reasons": decision_reasons,
+            "validation_gate": validation_gate,
             "needs_human_approval": True,
             "agent_trace": trace,
-            "warnings": list(dict.fromkeys([*warnings, *evidence["warnings"]])),
+            "warnings": all_warnings,
             "capability_screening": "not_assessed",
         }
         self._add_compatibility(result, identifiers)
@@ -329,10 +326,10 @@ class AtaImpactService:
                     "candidate:user_declared_ata:request:"
                     f"{ata.replace(' ', '_').replace('-', '_')}:{sequence}"
                 ),
-                "candidate_state": "candidate_unverified",
+                "initial_state": "candidate_unverified",
                 "ata": ata,
                 "confidence": 1.0,
-                "status": "unverified",
+                "declared_assessment": "unverified",
                 "reason": "Explicitly declared ATA; semantic LLM analysis unavailable",
                 "source_fragment": ata,
             }
@@ -378,6 +375,10 @@ class AtaImpactService:
             "controlled_evidence": [],
             "decision": "engineering_review_required",
             "decision_reasons": ["semantic_analysis_unavailable"],
+            "validation_gate": {
+                "critical": True,
+                "reasons": ["semantic_analysis_unavailable"],
+            },
             "needs_human_approval": True,
             "agent_trace": trace,
             "warnings": list(dict.fromkeys([*(warnings or []), *fact_warnings, "llm_unavailable_or_invalid", *evidence["warnings"]])),
@@ -392,56 +393,172 @@ class AtaImpactService:
         system: str,
         payload: dict[str, object],
         stage: str,
-    ) -> tuple[dict[str, object], str | None, str, str | None]:
+        schema: dict[str, object],
+    ) -> tuple[dict[str, object], StructuredLLMResponse]:
         if self.llm is None:
-            return {}, "llm_unavailable", "not_attempted", None
+            return {}, self._empty_structured_response("llm_unavailable")
+        response = self._structured_request(stage, system, payload, schema)
+        if response.finish_reason == "length":
+            return {}, replace(response, error="truncated_response")
+        if response.error and response.error.startswith(
+            ("transport_error:", "unsupported_structured_output_mode:")
+        ):
+            return {}, response
         try:
-            raw = self._chat(system, payload)
-            raw_finish = _response_finish_reason(raw)
-            if raw_finish == "length":
-                return {}, "truncated_response", "repair_failed", raw_finish
-            value, finish_reason = _parse_llm_response(raw)
-            if finish_reason == "length":
-                return {}, "truncated_response", "repair_failed", finish_reason
+            if response.error:
+                raise ValueError(response.error)
+            value = response.parsed
+            if value is None:
+                value, _ = _parse_llm_response(response.content)
             if not isinstance(value, dict):
                 raise ValueError("llm_response_not_object")
-            return value, None, "not_needed", finish_reason
+            return _drop_optional_null_properties(value, schema), response
         except Exception as exc:
-            error = (
-                str(exc)
-                if str(exc) in {"llm_response_not_object", "truncated_response"}
-                else f"llm_stage_failed:{type(exc).__name__}"
-            )
-            return self._repair_json(stage, system, payload, [error])
+            error = str(exc) or f"llm_stage_failed:{type(exc).__name__}"
+            return self._repair_json(stage, system, payload, schema, [error])
 
     def _repair_json(
         self,
         stage: str,
         original_system: str,
         payload: dict[str, object],
+        schema: dict[str, object],
         errors: list[str],
-    ) -> tuple[dict[str, object], str | None, str, str | None]:
+    ) -> tuple[dict[str, object], StructuredLLMResponse]:
         if self.llm is None:
-            return {}, "llm_unavailable", "repair_failed", None
+            return {}, replace(
+                self._empty_structured_response("llm_unavailable"),
+                repair_attempted=True,
+            )
         repair_payload = {
             "stage": stage,
             "validation_errors": errors,
             "stage_contract": original_system,
+            "response_schema": schema,
             "original_input": payload,
         }
+        response = replace(
+            self._structured_request(
+                "json_repair",
+                ATA_JSON_REPAIR_PROMPT,
+                repair_payload,
+                schema,
+            ),
+            repair_attempted=True,
+        )
+        if response.finish_reason == "length":
+            return {}, replace(response, error="truncated_response")
         try:
-            raw = self._chat(ATA_JSON_REPAIR_PROMPT, repair_payload)
-            raw_finish = _response_finish_reason(raw)
-            if raw_finish == "length":
-                return {}, "truncated_response", "repair_failed", raw_finish
-            value, finish_reason = _parse_llm_response(raw)
-            if finish_reason == "length":
-                return {}, "truncated_response", "repair_failed", finish_reason
+            if response.error:
+                raise ValueError(response.error)
+            value = response.parsed
+            if value is None:
+                value, _ = _parse_llm_response(response.content)
             if not isinstance(value, dict):
-                return {}, "llm_response_not_object", "repair_failed", finish_reason
-            return value, None, "completed", finish_reason
+                raise ValueError("llm_response_not_object")
+            return _drop_optional_null_properties(value, schema), response
         except Exception as exc:
-            return {}, f"repair_failed:{type(exc).__name__}", "repair_failed", None
+            error = str(exc) or f"repair_failed:{type(exc).__name__}"
+            return {}, replace(response, error=error)
+
+    def _structured_request(
+        self,
+        stage: str,
+        system: str,
+        payload: dict[str, object],
+        schema: dict[str, object],
+    ) -> StructuredLLMResponse:
+        if self.llm is None:
+            return self._empty_structured_response("llm_unavailable")
+        structured = getattr(self.llm, "structured_chat", None)
+        if callable(structured):
+            try:
+                response = structured(
+                    stage=stage,
+                    system_prompt=system,
+                    input_payload=payload,
+                    response_schema=schema,
+                )
+                if isinstance(response, StructuredLLMResponse):
+                    return response
+                return self._empty_structured_response(
+                    "invalid_structured_transport_response"
+                )
+            except Exception as exc:
+                return self._empty_structured_response(
+                    f"transport_error:{type(exc).__name__}"
+                )
+        try:
+            raw = self._chat(system, payload)
+            parsed = raw.get("parsed") if isinstance(raw, dict) else None
+            content = (
+                str(raw.get("content") or "")
+                if isinstance(raw, dict)
+                else str(raw or "")
+            )
+            finish_reason = _response_finish_reason(raw)
+            error = None
+            if not content.strip() and not isinstance(parsed, dict):
+                error = "empty_content"
+            return StructuredLLMResponse(
+                parsed=parsed if isinstance(parsed, dict) else None,
+                content=content,
+                finish_reason=finish_reason,
+                structured_output_mode="prompt_only",
+                schema_enforced=False,
+                error=error,
+            )
+        except Exception as exc:
+            return self._empty_structured_response(
+                f"transport_error:{type(exc).__name__}"
+            )
+
+    @staticmethod
+    def _empty_structured_response(error: str) -> StructuredLLMResponse:
+        return StructuredLLMResponse(
+            parsed=None,
+            content="",
+            finish_reason=None,
+            structured_output_mode="unavailable",
+            schema_enforced=False,
+            error=error,
+        )
+
+    @staticmethod
+    def _structured_trace(
+        stage: str,
+        response: StructuredLLMResponse,
+        **extra: object,
+    ) -> dict[str, object]:
+        return {
+            "step": stage,
+            "status": (
+                "repair_failed"
+                if response.error
+                and (
+                    response.repair_attempted
+                    or response.error == "truncated_response"
+                )
+                else "error"
+                if response.error
+                else "completed"
+            ),
+            "reason": response.error,
+            "warning": response.error,
+            "repair": (
+                "completed"
+                if response.repair_attempted and not response.error
+                else "repair_failed"
+                if response.repair_attempted
+                or response.error == "truncated_response"
+                else "not_needed"
+            ),
+            "finish_reason": response.finish_reason,
+            "structured_output_mode": response.structured_output_mode,
+            "schema_enforced_by_server": response.schema_enforced,
+            "latency_ms": round(response.latency_ms, 3),
+            **extra,
+        }
 
     def _chat(self, system: str, payload: dict[str, object]) -> object:
         if self.llm is None:
@@ -458,17 +575,6 @@ class AtaImpactService:
             json.dumps(payload, ensure_ascii=False),
             allow_reasoning_fallback=False,
         )
-
-    def _catalog_payload(self) -> list[dict[str, object]]:
-        entries = getattr(self.certificate, "entries", [])
-        return [
-            {
-                "ata": str(getattr(entry, "ata", "")),
-                "name": str(getattr(entry, "name", "")),
-                "description": str(getattr(entry, "explanation", "")),
-            }
-            for entry in entries
-        ]
 
     @staticmethod
     def _select_mode(requested: str, identifiers: dict[str, object], facts: dict[str, object]) -> str:
@@ -502,7 +608,10 @@ class AtaImpactService:
         facts: dict[str, object],
     ) -> bool:
         potential_count = len(mapping["interface_ata_hypotheses"]) + len(mapping["procedure_ata_hypotheses"])
-        conflict = any(item.get("status") == "conflicting" for item in mapping["user_declared_ata"])
+        conflict = any(
+            item.get("declared_assessment") == "conflicting"
+            for item in mapping["user_declared_ata"]
+        )
         confidences = [
             float(item.get("confidence") or 0.0)
             for category in MAPPING_CATEGORIES
@@ -533,7 +642,7 @@ class AtaImpactService:
         assembled: dict[str, object],
         facts: dict[str, object],
         required: list[str],
-        warnings: list[str],
+        validation_gate: dict[str, object],
         evidence: dict[str, object],
         certificate_validation: list[dict[str, object]],
     ) -> tuple[str, list[str]]:
@@ -547,7 +656,11 @@ class AtaImpactService:
             reasons.append("document_verification_required")
         if validated["candidate_unverified"]:
             reasons.append("critic_coverage_incomplete")
-        if validated["user_declared_unverified"]:
+        if (
+            validated["user_declared_unverified"]
+            or validated["user_declared_conflicting"]
+            or validated["user_declared_not_in_certificate"]
+        ):
             reasons.append("user_declared_ata_unresolved")
         if required:
             reasons.append("required_input_data_open")
@@ -566,27 +679,7 @@ class AtaImpactService:
             reasons.append("certificate_scope_ambiguous")
         if "not_in_certificate" in certificate_statuses:
             reasons.append("certificate_scope_review_required")
-        critical_prefixes = (
-            "schema_",
-            "duplicate_",
-            "invalid_",
-            "missing_critic_action:",
-            "unknown_critic_candidate_id:",
-            "critic_candidate_mismatch:",
-            "critic_addition_",
-            "incompatible_critic_action:",
-            "mapping_item_missing_required:",
-            "object_ata_wrong_entity_role:",
-            "structural_ata_without_involvement:",
-            "interface_without_valid_relation:",
-            "non_interface_relation:",
-            "missing_entity_id:",
-            "location_context_wrong_entity_role:",
-            "procedure_without_factual_anchor:",
-            "adjacent_without_access_or_protection:",
-            "critic_action_missing_reason:",
-        )
-        if any(warning.startswith(critical_prefixes) for warning in warnings):
+        if validation_gate.get("critical") is True:
             reasons.append("critical_validation_warning")
         reasons = list(dict.fromkeys(reasons))
         if not reasons:
@@ -722,10 +815,7 @@ def _has_schema_error(warnings: list[str]) -> bool:
     return any(
         warning.startswith(
             (
-                "schema_missing_required:",
-                "schema_item_missing_required:",
-                "schema_item_type_error:",
-                "schema_type_error:",
+                "schema_",
                 "duplicate_entity_id",
                 "duplicate_relation_id",
                 "duplicate_candidate_id:",
@@ -738,6 +828,44 @@ def _has_schema_error(warnings: list[str]) -> bool:
         )
         for warning in warnings
     )
+
+
+def _drop_optional_null_properties(
+    value: object,
+    schema: dict[str, object],
+) -> object:
+    if isinstance(value, dict):
+        required = {
+            str(item)
+            for item in schema.get("required", [])
+            if isinstance(item, str)
+        }
+        properties = (
+            schema.get("properties")
+            if isinstance(schema.get("properties"), dict)
+            else {}
+        )
+        return {
+            key: _drop_optional_null_properties(
+                item,
+                properties.get(key)
+                if isinstance(properties.get(key), dict)
+                else {},
+            )
+            for key, item in value.items()
+            if item is not None or key in required
+        }
+    if isinstance(value, list):
+        item_schema = (
+            schema.get("items")
+            if isinstance(schema.get("items"), dict)
+            else {}
+        )
+        return [
+            _drop_optional_null_properties(item, item_schema)
+            for item in value
+        ]
+    return value
 
 
 def _parse_llm_response(raw: object) -> tuple[dict[str, object], str | None]:

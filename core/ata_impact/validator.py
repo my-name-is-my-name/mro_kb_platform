@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Iterable
 
 from .evidence import is_controlled_evidence_document
@@ -11,6 +10,38 @@ from .schemas import ATA_CRITIC_SCHEMA, ATA_MAPPING_SCHEMA, ENGINEERING_FACTS_SC
 
 class ValidationWarning(ValueError):
     pass
+
+
+_CRITICAL_WARNING_PREFIXES = (
+    "schema_",
+    "duplicate_",
+    "invalid_",
+    "missing_critic_action:",
+    "unknown_critic_candidate_id:",
+    "critic_candidate_mismatch:",
+    "critic_addition_",
+    "incompatible_critic_action:",
+    "mapping_item_missing_required:",
+    "object_ata_wrong_entity_role:",
+    "structural_ata_without_involvement:",
+    "interface_without_valid_relation:",
+    "non_interface_relation:",
+    "missing_entity_id:",
+    "location_context_wrong_entity_role:",
+    "procedure_without_factual_anchor:",
+    "adjacent_without_access_or_protection:",
+    "critic_action_missing_reason:",
+)
+
+
+def critical_ata_warning_reasons(warnings: Iterable[str]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            warning
+            for warning in warnings
+            if warning.startswith(_CRITICAL_WARNING_PREFIXES)
+        )
+    )
 
 
 def validate_facts(payload: object, identifiers: dict[str, object]) -> tuple[dict[str, object], list[str]]:
@@ -136,6 +167,11 @@ def validate_mapping(
             if not ata:
                 warnings.append(f"invalid_ata:{category}")
                 continue
+            if category == "user_declared_ata" and ata not in declared:
+                warnings.append(
+                    f"mapper_user_declared_not_formally_extracted:{ata}"
+                )
+                continue
             if "confidence" not in item or not str(item.get("reason") or "").strip():
                 warnings.append(f"mapping_item_missing_required:{category}:{ata}")
                 continue
@@ -166,17 +202,15 @@ def validate_mapping(
                 continue
             if category == "interface_ata_hypotheses":
                 relation = next(item for item in facts.get("relations", []) if isinstance(item, dict) and item.get("id") == relation_id)
-                if relation.get("relation") in {"location_reference", "installed_in"}:
+                if not _is_interface_relation(relation):
                     warnings.append(f"non_interface_relation:{ata}:{relation_id}")
                     continue
-                if relation.get("relation") == "adjacent_to":
-                    interface_basis = str(relation.get("interface_basis") or "")
-                    if interface_basis not in {
-                        "access_required",
-                        "protection_required",
-                    }:
-                        warnings.append(f"adjacent_without_access_or_protection:{ata}:{relation_id}")
-                        continue
+                if (
+                    relation.get("relation") == "adjacent_to"
+                    and not _has_adjacent_interface_basis(relation)
+                ):
+                    warnings.append(f"adjacent_without_access_or_protection:{ata}:{relation_id}")
+                    continue
             if category == "procedure_ata_hypotheses" and not (
                 relation_id in relation_ids
                 or entity_id in entity_ids
@@ -185,26 +219,22 @@ def validate_mapping(
                 warnings.append(f"procedure_without_factual_anchor:{ata}")
                 continue
             sequence += 1
-            candidate_id = str(item.get("candidate_id") or "").strip()
-            if candidate_id and not _valid_candidate_id(
-                candidate_id,
-                category,
-                ata,
-                entity_id,
-                relation_id,
-            ):
-                warnings.append(f"invalid_candidate_id_format:{candidate_id}")
-                candidate_id = ""
-            if not candidate_id:
-                anchor = entity_id or relation_id or "request"
-                ata_token = ata.replace(" ", "_").replace("-", "_")
-                candidate_id = f"candidate:{category}:{anchor}:{ata_token}:{sequence}"
-            if candidate_id in candidate_ids:
-                warnings.append(f"duplicate_candidate_id:{candidate_id}")
-                continue
+            anchor = entity_id or relation_id or "request"
+            anchor_token = _candidate_token(anchor)
+            ata_token = _candidate_token(ata)
+            candidate_id = (
+                f"candidate:{category}:{anchor_token}:{ata_token}:{sequence}"
+            )
+            while candidate_id in candidate_ids:
+                sequence += 1
+                candidate_id = (
+                    f"candidate:{category}:{anchor_token}:{ata_token}:{sequence}"
+                )
             candidate_ids.add(candidate_id)
+            if category == "user_declared_ata" and "status" in item:
+                item["declared_assessment"] = item.pop("status")
             item["candidate_id"] = candidate_id
-            item["candidate_state"] = "candidate_unverified"
+            item["initial_state"] = "candidate_unverified"
             mapping[category].append(item)
     present_declared = {item["ata"] for item in mapping["user_declared_ata"]}
     for ata in declared:
@@ -224,18 +254,18 @@ def validate_mapping(
             mapping["user_declared_ata"].append(
                 {
                     "candidate_id": candidate_id,
-                    "candidate_state": "candidate_unverified",
+                    "initial_state": "candidate_unverified",
                     "ata": ata,
                     "confidence": 1.0,
                     "reason": "Explicitly declared in the request; not semantically verified",
-                    "status": "unverified",
+                    "declared_assessment": "unverified",
                     "source_fragment": ata,
                 }
             )
     allowed_user_status = {"consistent", "conflicting", "unverified", "not_in_certificate"}
     for item in mapping["user_declared_ata"]:
-        if str(item.get("status") or "") not in allowed_user_status:
-            item["status"] = "unverified"
+        if str(item.get("declared_assessment") or "") not in allowed_user_status:
+            item["declared_assessment"] = "unverified"
             warnings.append(f"invalid_user_declared_status:{item['ata']}")
     return mapping, warnings
 
@@ -301,36 +331,38 @@ def validate_critic(
         ata = str(candidate.get("ata") or "")
         supplied_ata = normalize_ata(item.get("ata")) if item.get("ata") else ata
         supplied_category = str(item.get("category") or category)
-        anchor_mismatch = (
-            bool(item.get("entity_id"))
-            and bool(candidate.get("entity_id"))
-            and item.get("entity_id") != candidate.get("entity_id")
-        ) or (
-            bool(item.get("relation_id"))
-            and bool(candidate.get("relation_id"))
-            and item.get("relation_id") != candidate.get("relation_id")
+        supplied_entity = str(item.get("entity_id") or "")
+        supplied_relation = str(item.get("relation_id") or "")
+        transition_relation = (
+            supplied_relation
+            if (
+                action == "downgrade_to_possible"
+                and category in {"object_ata", "structural_ata"}
+                and not candidate.get("relation_id")
+            )
+            else ""
         )
-        require_document_anchor_mutation = action == "require_document" and (
-            (
-                bool(item.get("entity_id"))
-                and item.get("entity_id") != candidate.get("entity_id")
-            )
-            or (
-                bool(item.get("relation_id"))
-                and item.get("relation_id") != candidate.get("relation_id")
-            )
+        anchor_mismatch = (
+            bool(supplied_entity)
+            and supplied_entity != str(candidate.get("entity_id") or "")
+        ) or (
+            bool(supplied_relation)
+            and not transition_relation
+            and supplied_relation != str(candidate.get("relation_id") or "")
         )
         if (
             supplied_ata != ata
             or supplied_category != category
             or anchor_mismatch
-            or require_document_anchor_mutation
         ):
             warnings.append(f"critic_candidate_mismatch:{candidate_id}")
             coverage_invalid.add(candidate_id)
             continue
         item["ata"] = ata
         item["category"] = category
+        if transition_relation:
+            item["transition_relation_id"] = transition_relation
+            item.pop("relation_id", None)
         item.setdefault("entity_id", candidate.get("entity_id"))
         item.setdefault("relation_id", candidate.get("relation_id"))
         action_counts[candidate_id] = action_counts.get(candidate_id, 0) + 1
@@ -359,14 +391,20 @@ def validate_critic(
                     (
                         relation
                         for relation in (facts or {}).get("relations", [])
-                        if isinstance(relation, dict) and relation.get("id") == item.get("relation_id")
+                        if isinstance(relation, dict)
+                        and relation.get("id")
+                        == item.get("transition_relation_id")
                     ),
                     None,
                 )
                 candidate_entity = str(candidate.get("entity_id") or "")
                 if (
                     relation is None
-                    or relation.get("relation") in {"location_reference", "installed_in"}
+                    or not _is_interface_relation(relation)
+                    or (
+                        relation.get("relation") == "adjacent_to"
+                        and not _has_adjacent_interface_basis(relation)
+                    )
                     or candidate_entity not in {str(relation.get("source_entity_id") or ""), str(relation.get("target_entity_id") or "")}
                 ):
                     warnings.append(f"incompatible_critic_action:{action}:{category}:{candidate_id}")
@@ -469,7 +507,7 @@ def assemble(
                         status = "possible_procedure"
                     elif category == "interface_ata_hypotheses":
                         status = "possible_interface"
-                    elif action.get("relation_id"):
+                    elif action.get("transition_relation_id"):
                         status = "possible_interface"
                     else:
                         status = "rejected"
@@ -516,6 +554,7 @@ def assemble(
                         "document_evidence": [_document_ref(document)],
                     }
                 )
+    _reconcile_user_declared(validated, certificate_validation)
     _dedupe_validated(validated)
     affected = _atas(validated, ("direct_confirmed", "inferred_from_request", "document_confirmed"))
     potential = _atas(
@@ -535,6 +574,48 @@ def assemble(
     }
 
 
+def _reconcile_user_declared(
+    validated: dict[str, list[dict[str, object]]],
+    certificate_validation: list[dict[str, object]],
+) -> None:
+    independently_affected = {
+        str(item.get("ata") or "")
+        for status in ("direct_confirmed", "inferred_from_request", "document_confirmed")
+        for item in validated[status]
+        if item.get("mapping_category") != "user_declared_ata"
+    }
+    declarations = list(validated["user_declared_unverified"])
+    validated["user_declared_unverified"] = []
+    for item in declarations:
+        ata = str(item.get("ata") or "")
+        scope_matches = [
+            scope
+            for scope in certificate_validation
+            if isinstance(scope, dict) and scope.get("ata") == ata
+        ]
+        scope_statuses = {
+            str(scope.get("certificate_scope_status") or "")
+            for scope in scope_matches
+        }
+        if "not_in_certificate" in scope_statuses:
+            status = "user_declared_not_in_certificate"
+        elif (
+            not scope_matches
+            or "catalog_unavailable" in scope_statuses
+            or "ambiguous_subchapter" in scope_statuses
+        ):
+            status = "user_declared_unverified"
+        elif str(item.get("declared_assessment") or "") == "conflicting":
+            status = "user_declared_conflicting"
+        elif ata in independently_affected:
+            status = "user_declared_consistent"
+        elif independently_affected:
+            status = "user_declared_conflicting"
+        else:
+            status = "user_declared_unverified"
+        validated[status].append(item)
+
+
 def _trace_item(
     item: dict[str, object],
     category: str,
@@ -548,6 +629,11 @@ def _trace_item(
         "critic_action": action.get("action") if action else "not_run",
         "critic_reason": action.get("reason") if action else None,
         **({"relation_id": action.get("relation_id")} if action and action.get("relation_id") else {}),
+        **(
+            {"transition_relation_id": action.get("transition_relation_id")}
+            if action and action.get("transition_relation_id")
+            else {}
+        ),
         "certificate_scope": scope,
         "document_evidence": list(item.get("document_evidence") or []),
     }
@@ -685,66 +771,106 @@ def _dict_list(value: object) -> list[dict[str, object]]:
 
 
 def _schema_warnings(payload: dict[str, object], schema: dict[str, object], label: str) -> list[str]:
-    """Dependency-free validation for the checked-in JSON Schema contracts."""
     warnings: list[str] = []
-    for key in schema.get("required", []):
-        if key not in payload:
-            warnings.append(f"schema_missing_required:{label}:{key}")
-    properties = schema.get("properties", {})
-    if isinstance(properties, dict):
-        for key, definition in properties.items():
-            if key not in payload or not isinstance(definition, dict):
-                continue
-            expected = definition.get("type")
-            if expected == "array" and not isinstance(payload[key], list):
-                warnings.append(f"schema_type_error:{label}:{key}:array")
-            elif expected == "object" and not isinstance(payload[key], dict):
-                warnings.append(f"schema_type_error:{label}:{key}:object")
-            elif expected == "array" and isinstance(payload[key], list):
-                item_schema = definition.get("items")
-                if not isinstance(item_schema, dict):
-                    continue
-                item_type = item_schema.get("type")
-                required = item_schema.get("required", [])
-                for index, item in enumerate(payload[key]):
-                    if item_type == "object" and not isinstance(item, dict):
-                        warnings.append(
-                            f"schema_item_type_error:{label}:{key}:{index}:object"
-                        )
-                        continue
-                    if item_type == "string" and not isinstance(item, str):
-                        warnings.append(
-                            f"schema_item_type_error:{label}:{key}:{index}:string"
-                        )
-                        continue
-                    if isinstance(item, dict):
-                        for required_key in required:
-                            if required_key not in item:
-                                warnings.append(
-                                    f"schema_item_missing_required:{label}:{key}:{index}:{required_key}"
-                                )
+    _validate_schema_value(payload, schema, label, warnings)
     return warnings
+
+
+def _validate_schema_value(
+    value: object,
+    schema: dict[str, object],
+    path: str,
+    warnings: list[str],
+) -> None:
+    expected = schema.get("type")
+    if expected and not _matches_schema_type(value, expected):
+        warnings.append(f"schema_type_error:{path}:{expected}")
+        return
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        warnings.append(f"schema_enum_error:{path}")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            warnings.append(f"schema_minimum_error:{path}")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            warnings.append(f"schema_maximum_error:{path}")
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            for key in required:
+                if key not in value:
+                    warnings.append(f"schema_missing_required:{path}:{key}")
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            if schema.get("additionalProperties") is False:
+                for key in value:
+                    if key not in properties:
+                        warnings.append(f"schema_additional_property:{path}:{key}")
+            for key, definition in properties.items():
+                if key in value and isinstance(definition, dict):
+                    _validate_schema_value(
+                        value[key],
+                        definition,
+                        f"{path}:{key}",
+                        warnings,
+                    )
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            warnings.append(f"schema_min_items_error:{path}")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_schema_value(
+                    item,
+                    item_schema,
+                    f"{path}:{index}",
+                    warnings,
+                )
+
+
+def _matches_schema_type(value: object, expected: object) -> bool:
+    if isinstance(expected, list):
+        return any(_matches_schema_type(value, item) for item in expected)
+    return {
+        "object": lambda: isinstance(value, dict),
+        "array": lambda: isinstance(value, list),
+        "string": lambda: isinstance(value, str),
+        "number": lambda: isinstance(value, (int, float)) and not isinstance(value, bool),
+        "integer": lambda: isinstance(value, int) and not isinstance(value, bool),
+        "boolean": lambda: isinstance(value, bool),
+        "null": lambda: value is None,
+    }.get(str(expected), lambda: True)()
+
+
+def _candidate_token(value: object) -> str:
+    token = "".join(
+        character if character.isalnum() or character == "_" else "_"
+        for character in str(value)
+    )
+    return token.strip("_") or "request"
+
+
+def _is_interface_relation(relation: dict[str, object]) -> bool:
+    return str(relation.get("relation") or "") in {
+        "attached_to",
+        "possibly_attached_to",
+        "connected_to",
+        "requires_access_through",
+        "adjacent_to",
+    }
+
+
+def _has_adjacent_interface_basis(relation: dict[str, object]) -> bool:
+    return str(relation.get("interface_basis") or "") in {
+        "access_required",
+        "protection_required",
+    }
 
 
 def _fragment_in_request(fragment: str, request: str) -> bool:
     normalized_fragment = " ".join(fragment.lower().split())
     normalized_request = " ".join(request.lower().split())
     return bool(normalized_fragment) and normalized_fragment in normalized_request
-
-
-def _valid_candidate_id(
-    candidate_id: str,
-    category: str,
-    ata: str,
-    entity_id: str,
-    relation_id: str,
-) -> bool:
-    anchor = entity_id or relation_id or "request"
-    ata_token = ata.replace(" ", "_").replace("-", "_")
-    return bool(
-        re.fullmatch(
-            rf"candidate:{re.escape(category)}:{re.escape(anchor)}:"
-            rf"{re.escape(ata_token)}:[1-9]\d*",
-            candidate_id,
-        )
-    )

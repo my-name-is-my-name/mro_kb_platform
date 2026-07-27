@@ -1,5 +1,10 @@
 # ATA Impact v2: отчёт о критических исправлениях
 
+> Historical snapshot для baseline `023e61d`. Состояние HEAD, working tree и
+> test results ниже не относится к structured-output simplification на базе
+> `c8c77d9`; актуальный итог находится в
+> `2026-07-27_ata_impact_structured_output_simplification.md`.
+
 Дата: 2026-07-27
 
 Репозиторий: `my-name-is-my-name/mro_kb_platform`

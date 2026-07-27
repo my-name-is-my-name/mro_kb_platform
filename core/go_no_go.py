@@ -571,9 +571,8 @@ class AtaImpactAgent:
         if self._llm is None:
             return None
         try:
-            raw = self._llm.chat(system, user, allow_reasoning_fallback=True)
-            start, end = raw.find("{"), raw.rfind("}")
-            payload = json.loads(raw[start : end + 1]) if start >= 0 and end > start else {}
+            raw = self._llm.chat(system, user, allow_reasoning_fallback=False)
+            payload = json.loads(raw.strip())
             return payload if isinstance(payload, dict) else None
         except Exception:
             return None
@@ -1081,9 +1080,13 @@ class GoNoGoService:
     def triage(self, request: str, fields: dict[str, object] | None = None) -> dict[str, object]:
         fields = fields if isinstance(fields, dict) else {}
         facts = self._extract_facts(request, fields)
-        if self._llm is not None and os.getenv("MRO_KB_GO_NO_GO_LLM_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
-            facts = self._llm_enrich_facts(request, facts)
         staged = self.ata_impact.analyze(request, fields, mode="auto")
+        staged_engineering_facts = (
+            staged.get("engineering_facts")
+            if isinstance(staged.get("engineering_facts"), dict)
+            else {}
+        )
+        facts["engineering_facts"] = staged_engineering_facts
         staged_validated = (
             staged.get("validated_ata")
             if isinstance(staged.get("validated_ata"), dict)
@@ -1095,32 +1098,26 @@ class GoNoGoService:
         staged_required = [str(item) for item in staged.get("required_input_data") or []]
         uncertainties = [
             str(item)
-            for item in (
-                (staged.get("engineering_facts") or {}).get("uncertainties", [])
-                if isinstance(staged.get("engineering_facts"), dict)
-                else []
-            )
+            for item in staged_engineering_facts.get("uncertainties", [])
         ]
         document_required = list(staged_validated.get("document_verification_required") or [])
         candidate_unverified = list(staged_validated.get("candidate_unverified") or [])
         user_declared_unverified = list(
             staged_validated.get("user_declared_unverified") or []
         )
-        staged_warnings = [str(item) for item in staged.get("warnings") or []]
-        critical_staged_warning = any(
-            warning.startswith(
-                (
-                    "schema_",
-                    "duplicate_",
-                    "invalid_",
-                    "missing_critic_action:",
-                    "unknown_critic_candidate_id:",
-                    "critic_candidate_mismatch:",
-                    "incompatible_critic_action:",
-                )
-            )
-            for warning in staged_warnings
+        user_declared_unresolved = [
+            *user_declared_unverified,
+            *list(staged_validated.get("user_declared_conflicting") or []),
+            *list(
+                staged_validated.get("user_declared_not_in_certificate") or []
+            ),
+        ]
+        validation_gate = (
+            staged.get("validation_gate")
+            if isinstance(staged.get("validation_gate"), dict)
+            else {"critical": staged.get("decision") == "engineering_review_required"}
         )
+        critical_staged_warning = validation_gate.get("critical") is True
         impact = {
             "direct_ata": affected_ata,
             "potentially_affected_ata": potential_ata,
@@ -1132,7 +1129,7 @@ class GoNoGoService:
                     or potential_ata
                     or document_required
                     or candidate_unverified
-                    or user_declared_unverified
+                    or user_declared_unresolved
                     or uncertainties
                     or critical_staged_warning
                 )
@@ -1141,30 +1138,31 @@ class GoNoGoService:
         }
         certificate = staged.get("certificate_scope") or self.certificate.match(impact["direct_ata"])
         missing = list(
-            dict.fromkeys([*self._missing_inputs(facts), *staged_required])
+            dict.fromkeys(
+                [
+                    *self._missing_inputs(facts, staged_engineering_facts),
+                    *staged_required,
+                ]
+            )
         )
-        requested_ata = impact["confirmed_affected_ata"] or impact["direct_ata"]
         evidence_result = (
-            self.retriever.retrieve(request, {"ata_codes": requested_ata, "aircraft_type": facts.get("aircraft_type", "")})
-            if requested_ata
-            else {"documents": [], "retrieval_mode": "skipped_no_validated_ata", "warnings": []}
-        )
-        evidence = evidence_result.get("documents") or []
-        mapping_candidates = {
-            str(item.get("candidate_id")): {
-                **item,
-                "mapping_category": category,
+            staged.get("document_verification")
+            if isinstance(staged.get("document_verification"), dict)
+            else {
+                "status": "unavailable",
+                "documents": [],
+                "warnings": ["staged_document_verification_unavailable"],
             }
-            for category, items in (staged.get("ata_mapping") or {}).items()
-            if isinstance(items, list)
-            for item in items
-            if isinstance(item, dict) and item.get("candidate_id")
-        } if isinstance(staged.get("ata_mapping"), dict) else set()
+        )
+        evidence = [
+            item
+            for item in staged.get("retrieved_documents") or []
+            if isinstance(item, dict)
+        ]
         controlled_evidence = [
             item
             for item in staged.get("controlled_evidence") or []
             if isinstance(item, dict)
-            and is_controlled_evidence_document(item, mapping_candidates)
         ]
         evidence_ata = self.ata_catalog.evidence_candidates([item for item in evidence if isinstance(item, dict)], impact["confirmed_affected_ata"])
         # Evidence search hits remain diagnostic candidates. They must not
@@ -1202,7 +1200,7 @@ class GoNoGoService:
         elif (
             potential_ata
             or candidate_unverified
-            or user_declared_unverified
+            or user_declared_unresolved
             or critical_staged_warning
         ):
             recommendation = "hold_expert_review"
@@ -1245,7 +1243,14 @@ class GoNoGoService:
             "risks": risks,
             "questions_for_expert": self._expert_questions(facts, impact, evidence),
             "explanation": reason,
-            "search_trace": {"retrieval_mode": evidence_result.get("retrieval_mode", ""), "warnings": evidence_result.get("warnings", [])},
+            "search_trace": {
+                "retrieval_mode": evidence_result.get(
+                    "retrieval_mode",
+                    evidence_result.get("status", ""),
+                ),
+                "warnings": evidence_result.get("warnings", []),
+                "source": "ata_impact_staged_result",
+            },
             "ata_impact": staged,
             "capability_screening": "not_assessed",
         }
@@ -1307,35 +1312,6 @@ class GoNoGoService:
         merged.update({"request": text, "aircraft_type": aircraft, "direct_ata": direct_ata, "ata_candidates": candidates, "identifiers": identifiers})
         return merged
 
-    def _llm_enrich_facts(self, request: str, facts: dict[str, object]) -> dict[str, object]:
-        if self._llm is None:
-            return facts
-        system = "Верни только JSON. Извлеки из MRO-заявки факты, не придумывай значения и не принимай решение GO/NO-GO."
-        user = f"Поля: direct_ata, affected_systems, components, zones, defect, work_type, required_inputs, required_documents, confidence.\nЗаявка:\n{request}"
-        try:
-            raw = self._llm.chat(system, user, allow_reasoning_fallback=True)
-            payload = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
-            if isinstance(payload, dict):
-                for key, value in payload.items():
-                    if value not in (None, "", []):
-                        facts[key] = value
-        except Exception:
-            facts.setdefault("warnings", []).append("llm_fact_extraction_failed")
-        return facts
-
-    def _impact_analysis(self, request: str, facts: dict[str, object]) -> dict[str, list[str]]:
-        direct = sorted(set(str(item) for item in facts.get("direct_ata", []) if item))
-        text = (request + " " + " ".join(str(facts.get(key, "")) for key in ("components", "zones", "work_type", "affected_systems"))).lower()
-        potential = set(direct)
-        unresolved: list[str] = []
-        related = self.ata_catalog.related(text, direct)
-        facts["related_ata_candidates"] = related
-        potential.update(str(item.get("ata")) for item in related if item.get("ata"))
-        if not direct and not facts.get("components") and not facts.get("zones"):
-            unresolved.append("ATA scope")
-        confirmed = sorted(potential - set(unresolved))
-        return {"direct_ata": direct, "potentially_affected_ata": sorted(potential - set(direct)), "confirmed_affected_ata": confirmed, "unresolved_ata": sorted(unresolved)}
-
     @staticmethod
     def _ata_codes(text: str) -> list[str]:
         values = set()
@@ -1350,13 +1326,39 @@ class GoNoGoService:
         return sorted(values)
 
     @staticmethod
-    def _missing_inputs(facts: dict[str, object]) -> list[str]:
+    def _missing_inputs(
+        facts: dict[str, object],
+        engineering_facts: dict[str, object] | None = None,
+    ) -> list[str]:
         missing: list[str] = []
+        engineering_facts = (
+            engineering_facts if isinstance(engineering_facts, dict) else {}
+        )
         text = " ".join(str(facts.get(key) or "") for key in ("request", "component", "components", "zone", "zones", "damage_type", "defect_type")).lower()
         available_documents = " ".join(str(item) for item in (facts.get("documents_available") or [])).lower()
-        if not facts.get("aircraft_type"):
+        aircraft = (
+            engineering_facts.get("aircraft")
+            if isinstance(engineering_facts.get("aircraft"), dict)
+            else {}
+        )
+        if not facts.get("aircraft_type") and not (
+            aircraft.get("family") or aircraft.get("model")
+        ):
             missing.append("тип ВС")
-        if not facts.get("components") and not facts.get("zones") and not facts.get("direct_ata"):
+        staged_objects = engineering_facts.get("physical_objects")
+        has_staged_object = bool(
+            [
+                item
+                for item in staged_objects
+                if isinstance(item, dict) and item.get("id") and item.get("name")
+            ]
+        ) if isinstance(staged_objects, list) else False
+        if (
+            not has_staged_object
+            and not facts.get("components")
+            and not facts.get("zones")
+            and not facts.get("direct_ata")
+        ):
             missing.append("точный объект/зона или ATA")
         if any(term in text for term in ("поврежден", "damage", "трещин", "корроз", "вмятин", "царап", "скол", "crack", "corrosion", "scratch", "chip")):
             if not any(term in text for term in ("размер", "мм", "mm", "координат")):

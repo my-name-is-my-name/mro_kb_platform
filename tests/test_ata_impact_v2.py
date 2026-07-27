@@ -8,7 +8,7 @@ from pathlib import Path
 from core.ata_impact.evidence import EvidenceSearchResult, NullAtaEvidenceRetriever
 from core.ata_impact.identifiers import extract_identifiers
 from core.ata_impact.service import AtaImpactService
-from core.ata_impact.prompts import ATA_CRITIC_PROMPT, ATA_MAPPING_AND_CRITIC_PROMPT
+from core.ata_impact.prompts import ATA_CRITIC_PROMPT
 from core.go_no_go import CertificateCatalog
 
 
@@ -34,11 +34,29 @@ def facts(
     return {
         "aircraft": {"family": "A320", "model": None, "msn": None, "confidence": 0.9},
         "event": {"type": "corrosion", "maintenance_action": "inspection_finding"},
-        "physical_objects": [{"id": "object_1", "name": object_name, "original_text": object_name, "damage_confirmed": True}],
+        "physical_objects": [{
+            "id": "object_1",
+            "name": object_name,
+            "original_text": object_name,
+            "involvement": "damaged",
+            "damage_confirmed": True,
+            "confidence": 0.9,
+        }],
         "functional_purposes": [{"object_id": "object_1", "description": purpose, "confidence": 0.9}],
-        "locations": [{"id": "location_1", "description": "near frame 58", "role": "location_reference"}],
+        "locations": [{
+            "id": "location_1",
+            "description": "near frame 58",
+            "role": "location_reference",
+            "confidence": 0.9,
+        }],
         "structural_elements": [
-            {"id": "structure_1", "name": "frame 58", "involvement": "damaged" if structure_damage else "location_reference", "damage_confirmed": structure_damage}
+            {
+                "id": "structure_1",
+                "name": "frame 58",
+                "involvement": "damaged" if structure_damage else "location_reference",
+                "damage_confirmed": structure_damage,
+                "confidence": 0.9,
+            }
         ],
         "damage": [{"type": "corrosion", "affected_entity_id": "object_1"}],
         "relations": [
@@ -86,35 +104,34 @@ def combined_mapping(
             else []
         ),
     }
-    for category, items in mapping.items():
-        for sequence, item in enumerate(items, start=1):
-            item["candidate_id"] = (
-                f"candidate:{category}:"
-                f"{item.get('entity_id') or item.get('relation_id') or 'request'}:"
-                f"{str(item['ata']).replace(' ', '_').replace('-', '_')}:{sequence}"
-            )
     return {"ata_mapping": mapping, "critic": {"actions": []}}
 
 
+def expected_candidate_id(
+    mapping: dict[str, list[dict[str, object]]],
+    category: str,
+    index: int = 0,
+) -> str:
+    item = mapping[category][index]
+    return (
+        f"candidate:{category}:"
+        f"{item.get('entity_id') or item.get('relation_id') or 'request'}:"
+        f"{str(item.get('ata') or '').replace(' ', '_').replace('-', '_')}:"
+        f"{index + 1}"
+    )
+
+
 def confirm_actions(mapping: dict[str, list[dict[str, object]]]) -> dict[str, object]:
-    for category, items in mapping.items():
-        for sequence, item in enumerate(items, start=1):
-            item.setdefault(
-                "candidate_id",
-                f"candidate:{category}:"
-                f"{item.get('entity_id') or item.get('relation_id') or 'request'}:"
-                f"{str(item.get('ata') or '').replace(' ', '_').replace('-', '_')}:{sequence}",
-            )
     return {
         "actions": [
             {
-                "candidate_id": item["candidate_id"],
+                "candidate_id": expected_candidate_id(mapping, category, index),
                 "action": "confirm",
                 "reason": "candidate is supported by the validated engineering facts",
             }
             for category, items in mapping.items()
             if category != "user_declared_ata"
-            for item in items
+            for index, item in enumerate(items)
         ]
     }
 
@@ -130,7 +147,7 @@ class AtaImpactV2Tests(unittest.TestCase):
         result = AtaImpactService(self.certificate, llm).analyze(request, fields, runtime_mode="standard")
         self.assertEqual(len(llm.calls), 3)
         self.assertEqual(llm.calls[2][0], ATA_CRITIC_PROMPT)
-        self.assertNotIn(ATA_MAPPING_AND_CRITIC_PROMPT, [call[0] for call in llm.calls])
+        self.assertFalse(any("self-audit the mapping" in call[0] for call in llm.calls))
         self.assertNotIn("ATA", json.loads(llm.calls[0][1])["identifiers"].get("aircraft_type_raw") or "")
         return result
 
@@ -197,7 +214,10 @@ class AtaImpactV2Tests(unittest.TestCase):
         )
         self.assertIn("ATA 25", result["affected_ata"])
         self.assertNotIn("ATA 34", result["affected_ata"])
-        self.assertEqual(result["ata_mapping"]["user_declared_ata"][0]["status"], "conflicting")
+        self.assertEqual(
+            result["ata_mapping"]["user_declared_ata"][0]["declared_assessment"],
+            "conflicting",
+        )
 
     def test_llm_unavailable_is_explicit_only_fallback(self) -> None:
         result = AtaImpactService(self.certificate, None).analyze("Повреждение неизвестного объекта ATA 34", runtime_mode="standard")
@@ -217,7 +237,7 @@ class AtaImpactV2Tests(unittest.TestCase):
         self.assertEqual([item["ata"] for item in candidates], ["ATA 25", "ATA 34"])
         self.assertEqual(len({item["candidate_id"] for item in candidates}), 2)
         self.assertTrue(
-            all(item["candidate_state"] == "candidate_unverified" for item in candidates)
+            all(item["initial_state"] == "candidate_unverified" for item in candidates)
         )
         self.assertEqual(result["affected_ata"], [])
         self.assertEqual(result["decision"], "engineering_review_required")
@@ -244,7 +264,13 @@ class AtaImpactV2Tests(unittest.TestCase):
 
     def test_unaffected_neighbor_object_cannot_become_affected(self) -> None:
         f = facts()
-        f["physical_objects"].append({"id": "object_2", "name": "neighbor system", "damage_confirmed": False})  # type: ignore[union-attr]
+        f["physical_objects"].append({  # type: ignore[union-attr]
+            "id": "object_2",
+            "name": "neighbor system",
+            "involvement": "mentioned",
+            "damage_confirmed": False,
+            "confidence": 0.8,
+        })
         mapping = combined_mapping("ATA 25")
         mapping["ata_mapping"]["object_ata"].append(  # type: ignore[index]
             {"ata": "ATA 34", "entity_id": "object_2", "confidence": 0.9, "reason": "nearby object"}
@@ -284,7 +310,7 @@ class AtaImpactV2Tests(unittest.TestCase):
             {"actions": [
                 *confirm_actions(mapping)["actions"],
                 {
-                    "candidate_id": mapping["structural_ata"][0]["candidate_id"],
+                    "candidate_id": expected_candidate_id(mapping, "structural_ata"),
                     "action": "downgrade_to_location_context",
                     "reason": "request only uses frame as location",
                 },
@@ -293,7 +319,7 @@ class AtaImpactV2Tests(unittest.TestCase):
         llm.responses[-1]["actions"] = [  # type: ignore[index]
             action
             for action in llm.responses[-1]["actions"]  # type: ignore[index]
-            if action["candidate_id"] != mapping["structural_ata"][0]["candidate_id"]  # type: ignore[index]
+            if action["candidate_id"] != expected_candidate_id(mapping, "structural_ata")  # type: ignore[index]
             or action["action"] != "confirm"  # type: ignore[index]
         ]
         result = AtaImpactService(self.certificate, llm).analyze("AD 2024-01 equipment near frame", runtime_mode="extended")
@@ -314,7 +340,7 @@ class AtaImpactV2Tests(unittest.TestCase):
                             "relation_id": "relation_1",
                             "reason": "object involvement is conditional",
                         }
-                        if action["candidate_id"] == mapping["object_ata"][0]["candidate_id"]
+                        if action["candidate_id"] == expected_candidate_id(mapping, "object_ata")
                         else {}
                     ),
                 }
@@ -324,7 +350,16 @@ class AtaImpactV2Tests(unittest.TestCase):
         result = AtaImpactService(self.certificate, llm).analyze("AD 2024-01 equipment near attachment", runtime_mode="extended")
         self.assertNotIn("ATA 25", result["affected_ata"])
         self.assertIn("ATA 25", result["potentially_affected_ata"])
-        self.assertEqual(result["validated_ata"]["possible_interface"][0]["relation_id"], "relation_1")
+        possible = result["validated_ata"]["possible_interface"][0]
+        self.assertNotIn("relation_id", possible)
+        self.assertEqual(possible["transition_relation_id"], "relation_1")
+        self.assertEqual(possible["critic_action"], "downgrade_to_possible")
+        action = next(
+            item
+            for item in result["critic_actions"]
+            if item["candidate_id"] == expected_candidate_id(mapping, "object_ata")
+        )
+        self.assertEqual(action["transition_relation_id"], "relation_1")
 
     def test_adjacent_protection_can_be_possible_interface(self) -> None:
         f = facts()
@@ -412,7 +447,7 @@ class AtaImpactV2Tests(unittest.TestCase):
             "verification_status": "confirmed",
             "confirmed_candidates": [
                 {
-                    "candidate_id": mapping["object_ata"][0]["candidate_id"],
+                    "candidate_id": expected_candidate_id(mapping, "object_ata"),
                     "ata": "ATA 25",
                     "category": "object_ata",
                     "entity_id": "object_1",
@@ -424,7 +459,7 @@ class AtaImpactV2Tests(unittest.TestCase):
         mapping = combined_mapping("ATA 25")["ata_mapping"]
         actions = confirm_actions(mapping)
         actions["actions"][0]["action"] = "require_document"  # type: ignore[index]
-        complete["confirmed_candidates"][0]["candidate_id"] = mapping["object_ata"][0]["candidate_id"]  # type: ignore[index]
+        complete["confirmed_candidates"][0]["candidate_id"] = expected_candidate_id(mapping, "object_ata")  # type: ignore[index]
         llm = SequenceLLM(facts(), mapping, actions)
         result = AtaImpactService(self.certificate, llm, Retriever(complete)).analyze("Повреждение оборудования", runtime_mode="standard")
         self.assertEqual([item["ata"] for item in result["validated_ata"]["document_confirmed"]], ["ATA 25"])
@@ -450,7 +485,7 @@ class AtaImpactV2Tests(unittest.TestCase):
                     **action,
                     **(
                         {"action": "downgrade_to_possible", "reason": "uncertain"}
-                        if action["candidate_id"] == mapping["object_ata"][0]["candidate_id"]
+                        if action["candidate_id"] == expected_candidate_id(mapping, "object_ata")
                         else {}
                     ),
                 }
@@ -525,7 +560,10 @@ class RealLLMIntegrationTests(unittest.TestCase):
     def test_repeated_semantic_matrix(self) -> None:
         from core.runtime_clients import OpenAICompatibleLLM, RuntimeSettings
 
-        service = AtaImpactService(CertificateCatalog(), OpenAICompatibleLLM(RuntimeSettings()))
+        settings = RuntimeSettings()
+        client = OpenAICompatibleLLM(settings)
+        model_id = client.resolve_model()
+        service = AtaImpactService(CertificateCatalog(), client)
         requests = {
             "Коррозия roller track в районе шпангоута 58; шпангоут используется только как ориентир.": ({"ATA 25"}, set(), {"ATA 53"}, {"ATA 53"}),
             "Corrosion damaged the cargo roller track and its mechanical attachment to frame 58; repair of the attachment and frame is required.": ({"ATA 25", "ATA 53"}, set(), set(), set()),
@@ -585,6 +623,27 @@ class RealLLMIntegrationTests(unittest.TestCase):
                             item.get("reason") == "truncated_response"
                             for item in result["agent_trace"]
                         ),
+                        "server_profile": settings.ata_structured_output_mode,
+                        "model_id": model_id,
+                        "structured_stages": [
+                            {
+                                "stage": item.get("step"),
+                                "mode": item.get("structured_output_mode"),
+                                "schema_enforced": item.get(
+                                    "schema_enforced_by_server"
+                                ),
+                                "finish_reason": item.get("finish_reason"),
+                                "latency_ms": item.get("latency_ms"),
+                                "success": item.get("status") == "completed",
+                            }
+                            for item in result["agent_trace"]
+                            if item.get("step")
+                            in {
+                                "engineering_fact_extraction",
+                                "ata_mapping",
+                                "independent_critic",
+                            }
+                        ],
                     }
                 )
         for request, runs in observations.items():
