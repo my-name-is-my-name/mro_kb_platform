@@ -67,12 +67,27 @@ class GoNoGoTests(unittest.TestCase):
         self.assertFalse(unavailable_result["catalog_loaded"])
         self.assertEqual(unavailable_result["ambiguous"], ["ATA 25-10"])
 
-    def test_direct_ata_repair_without_damage_dimensions_requests_info(self) -> None:
+        chapter_catalog = object.__new__(CertificateCatalog)
+        chapter_catalog.path = Path("chapter-certificate.docx")
+        chapter_catalog.entries = [
+            CertificateEntry("53", "", "Фюзеляж", "")
+        ]
+        chapter_catalog.by_system = {"53": chapter_catalog.entries}
+        inherited = chapter_catalog.match(["ATA 53-10"])
+        self.assertEqual(inherited["status"], "in_scope_candidate")
+        self.assertEqual(inherited["matched"][0]["certificate_ata"], "ATA 53")
+        self.assertEqual(inherited["matched"][0]["match_type"], "chapter")
+
+    def test_fallback_uses_staged_missing_inputs_not_text_heuristics(self) -> None:
         result = self.make_service().triage("Ремонт повреждения фюзеляжа ATA 53 на Airbus A320")
         self.assertEqual(result["recommendation"], "need_more_info")
         self.assertIn("Запросить дополнительную информацию", result["answer"])
-        self.assertIn("размеры/координаты повреждения", result["missing_inputs"])
-        self.assertIn("фотографии повреждения", result["missing_inputs"])
+        self.assertIn(
+            "engineering semantic classification by LLM or engineer",
+            result["missing_inputs"],
+        )
+        self.assertNotIn("размеры/координаты повреждения", result["missing_inputs"])
+        self.assertNotIn("фотографии повреждения", result["missing_inputs"])
         self.assertEqual(result["confirmed_affected_ata"], [])
         self.assertEqual(
             [item["ata"] for item in result["ata_impact"]["validated_ata"]["user_declared_unverified"]],
@@ -95,6 +110,13 @@ class GoNoGoTests(unittest.TestCase):
         self.assertFalse(result.enabled)
         self.assertEqual(result.retrieve("test", {}, limit=1)["status"], "disabled")
 
+    def test_go_no_go_service_has_no_separate_unused_llm_client(self) -> None:
+        service = self.make_service()
+        self.assertFalse(hasattr(service, "_llm"))
+        health = service.health()
+        self.assertNotIn("llm_expert", health)
+        self.assertIn("ata_impact", health)
+
     def test_additional_data_output_is_searchable_evidence(self) -> None:
         service = self.make_service()
         evidence = service.retriever._search_local_documents("технического обоснования отчета по прочности", 5)
@@ -114,7 +136,11 @@ class GoNoGoTests(unittest.TestCase):
         self.assertEqual(result["direct_ata"], [])
         self.assertEqual(result["ata_impact"]["decision"], "engineering_review_required")
         self.assertNotIn("фотографии повреждения", result["missing_inputs"])
-        self.assertIn("размеры/координаты повреждения", result["missing_inputs"])
+        self.assertNotIn("размеры/координаты повреждения", result["missing_inputs"])
+        self.assertIn(
+            "engineering semantic classification by LLM or engineer",
+            result["missing_inputs"],
+        )
 
     def staged_result(self, **overrides: object) -> dict[str, object]:
         result: dict[str, object] = {
@@ -139,6 +165,12 @@ class GoNoGoTests(unittest.TestCase):
                 "catalog_loaded": True,
                 "matched": [{"ata": "ATA 25"}],
                 "unmatched": [],
+            },
+            "certificate_assessment": {
+                "status": "covered",
+                "catalog_loaded": True,
+                "matches": [{"ata": "ATA 25", "match_type": "exact"}],
+                "missing": [],
             },
             "ata_mapping": {},
             "document_verification": {
@@ -248,6 +280,52 @@ class GoNoGoTests(unittest.TestCase):
         result = service.triage("Engineering work package", {})
         self.assertEqual(result["missing_inputs"], [])
         self.assertEqual(result["recommendation"], "go_to_assessment")
+
+    def test_closed_staged_damage_is_not_reopened_by_text_heuristics(
+        self,
+    ) -> None:
+        staged = self.staged_result(
+            engineering_facts={
+                "aircraft": {"family": "A320", "model": None},
+                "physical_objects": [
+                    {"id": "object_1", "name": "cargo roller track"}
+                ],
+                "damage": [
+                    {
+                        "type": "corrosion",
+                        "affected_entity_id": "object_1",
+                    }
+                ],
+                "uncertainties": [],
+            }
+        )
+
+        class StubImpact:
+            def analyze(self, *args: object, **kwargs: object) -> dict[str, object]:
+                return staged
+
+        service = self.make_service()
+        service.ata_impact = StubImpact()  # type: ignore[assignment]
+        result = service.triage(
+            "A320 corrosion damaged cargo roller track",
+            {},
+        )
+        self.assertEqual(result["missing_inputs"], [])
+        self.assertEqual(result["recommendation"], "go_to_assessment")
+
+    def test_certificate_assessment_does_not_replace_legacy_scope(self) -> None:
+        staged = self.staged_result()
+        result = self.triage_staged(staged)
+        self.assertEqual(
+            result["certificate_scope"]["status"],  # type: ignore[index]
+            "in_scope_candidate",
+        )
+        self.assertIn("matched", result["certificate_scope"])  # type: ignore[operator]
+        self.assertEqual(
+            result["certificate_assessment"]["status"],  # type: ignore[index]
+            "covered",
+        )
+        self.assertIn("matches", result["certificate_assessment"])  # type: ignore[operator]
 
     def test_go_no_go_reuses_staged_facts_and_evidence_without_duplicate_calls(self) -> None:
         staged_document = {"document_id": "amm-25", "title": "AMM 25"}
@@ -361,6 +439,20 @@ class GoNoGoTests(unittest.TestCase):
             )
         )
         self.assertEqual(outside["recommendation"], "hold_expert_review")
+
+    def test_partial_certificate_assessment_blocks_go_to_assessment(self) -> None:
+        result = self.triage_staged(
+            self.staged_result(
+                certificate_assessment={
+                    "status": "partially_covered",
+                    "catalog_loaded": True,
+                    "matches": [{"ata": "ATA 53-10", "match_type": "chapter"}],
+                    "missing": [{"ata": "ATA 34"}],
+                }
+            )
+        )
+        self.assertEqual(result["recommendation"], "hold_expert_review")
+        self.assertIn("Сертификат: область найдена частично", result["answer"])
 
 
 if __name__ == "__main__":

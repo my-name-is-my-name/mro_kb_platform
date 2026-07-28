@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from typing import Callable, Protocol
 
 from core.runtime_clients import StructuredLLMResponse
 
-from .certificate_validator import validate_certificate
+from .certificate_validator import assess_certificate, validate_certificate
 from .evidence import (
     AtaEvidenceRetriever,
     NullAtaEvidenceRetriever,
@@ -21,7 +22,12 @@ from .prompts import (
     ATA_MAPPING_PROMPT,
     ENGINEERING_FACT_EXTRACTION_PROMPT,
 )
-from .schemas import ATA_CRITIC_SCHEMA, ATA_MAPPING_SCHEMA, ENGINEERING_FACTS_SCHEMA
+from .reference_catalog import AtaClassificationReferenceCatalog
+from .schemas import (
+    ATA_CRITIC_GENERATION_SCHEMA,
+    ATA_MAPPING_GENERATION_SCHEMA,
+    ENGINEERING_FACTS_SCHEMA,
+)
 from .validator import (
     apply_critic_additions,
     assemble,
@@ -45,10 +51,14 @@ class AtaImpactService:
         certificate: object,
         llm: StructuredLLM | None = None,
         evidence_retriever: AtaEvidenceRetriever | None = None,
+        reference_catalog: AtaClassificationReferenceCatalog | None = None,
     ) -> None:
         self.certificate = certificate
         self.llm = llm
         self.evidence_retriever = evidence_retriever or NullAtaEvidenceRetriever()
+        self.reference_catalog = (
+            reference_catalog or AtaClassificationReferenceCatalog()
+        )
 
     def analyze(
         self,
@@ -91,7 +101,12 @@ class AtaImpactService:
             )
             facts, fact_warnings = validate_facts(facts_payload, identifiers)
         if _has_schema_error(fact_warnings) and fact_response.repair_attempted:
-            fact_response = replace(fact_response, error="schema_validation_failed")
+            fact_response = replace(
+                fact_response,
+                error="schema_validation_failed",
+                repair_error=fact_response.repair_error or "schema_validation_failed",
+                validation_errors=list(fact_warnings),
+            )
         warnings.extend(fact_warnings)
         trace.append(self._structured_trace("engineering_fact_extraction", fact_response))
         if fact_response.error:
@@ -106,18 +121,61 @@ class AtaImpactService:
             return self._fallback(request, fields, identifiers, trace, fact_warnings, facts=facts)
         self._report(progress, "engineering_fact_extraction", "Инженерная модель заявки сформирована.")
 
+        reference_context = self.reference_catalog.context(request, facts)
+        if reference_context["status"] != "completed":
+            warnings.append("classification_reference_unavailable")
+        trace.append(
+            {
+                "step": "ata_classification_reference_retrieval",
+                "status": reference_context["status"],
+                "source": reference_context["source"],
+                "section": reference_context["section"],
+                "source_file_sha256": reference_context[
+                    "source_file_sha256"
+                ],
+                "chapter_count": len(reference_context["chapter_index"]),
+                "definition_count": len(
+                    reference_context["relevant_definitions"]
+                ),
+                "retrieval_mode": reference_context.get("retrieval_mode"),
+                "retrieved_reference_ids": list(
+                    reference_context["retrieved_reference_ids"]
+                ),
+                "errors": list(reference_context["errors"]),
+            }
+        )
+        self._report(
+            progress,
+            "ata_classification_reference_retrieval",
+            "Релевантные определения ATA из ГОСТ подготовлены.",
+        )
+
         mode = self._select_mode(requested_mode, identifiers, facts)
+        required_affected_entities = _required_affected_entities(facts)
         mapping_input = {
             "request": request,
             "engineering_facts": facts,
             "relations": facts.get("relations", []),
+            "required_affected_entities": required_affected_entities,
+            "required_affected_entity_count": len(
+                required_affected_entities
+            ),
             "explicit_user_ata": identifiers["explicit_ata"],
+            "ata_reference": {
+                "source": reference_context["source"],
+                "section": reference_context["section"],
+                "revision": reference_context["revision"],
+                "chapter_index": reference_context["chapter_index"],
+                "relevant_definitions": reference_context[
+                    "relevant_definitions"
+                ],
+            },
         }
         mapping_payload, mapping_response = self._call_json(
             ATA_MAPPING_PROMPT,
             mapping_input,
             "ata_mapping",
-            ATA_MAPPING_SCHEMA,
+            ATA_MAPPING_GENERATION_SCHEMA,
         )
         mapping, mapping_warnings = validate_mapping(
             mapping_payload,
@@ -134,7 +192,7 @@ class AtaImpactService:
                 "ata_mapping",
                 ATA_MAPPING_PROMPT,
                 mapping_input,
-                ATA_MAPPING_SCHEMA,
+                ATA_MAPPING_GENERATION_SCHEMA,
                 mapping_warnings,
             )
             mapping, mapping_warnings = validate_mapping(
@@ -144,7 +202,12 @@ class AtaImpactService:
                 request,
             )
         if _has_schema_error(mapping_warnings) and mapping_response.repair_attempted:
-            mapping_response = replace(mapping_response, error="schema_validation_failed")
+            mapping_response = replace(
+                mapping_response,
+                error="schema_validation_failed",
+                repair_error=mapping_response.repair_error or "schema_validation_failed",
+                validation_errors=list(mapping_warnings),
+            )
         trace.append(self._structured_trace("ata_mapping", mapping_response, combined_runtime_call=False))
 
         if mapping_response.error:
@@ -155,30 +218,68 @@ class AtaImpactService:
                 trace,
                 [mapping_response.error, *warnings],
                 facts=facts,
+                reference_context=reference_context,
             )
 
         warnings.extend(mapping_warnings)
         if _has_schema_error(mapping_warnings):
-            return self._fallback(request, fields, identifiers, trace, mapping_warnings, facts=facts)
+            return self._fallback(
+                request,
+                fields,
+                identifiers,
+                trace,
+                mapping_warnings,
+                facts=facts,
+                reference_context=reference_context,
+            )
+        warnings.extend(
+            self.reference_catalog.enforce_mapping_roles(mapping)
+        )
+        synth_warnings = _synthesize_reference_candidates(
+            mapping,
+            facts,
+            reference_context,
+        )
+        warnings.extend(synth_warnings)
+        ungrounded_candidate_ids = set(
+            self.reference_catalog.attach_references(mapping)
+        )
+        warnings.extend(
+            f"classification_reference_missing:{candidate_id}"
+            for candidate_id in sorted(ungrounded_candidate_ids)
+        )
         certificate_validation = validate_certificate(self.certificate, _mapping_atas(mapping))
         trace.append({"step": "certificate_scope_validation", "status": "completed", "entries": len(certificate_validation)})
         self._report(progress, "certificate_scope_validation", "ATA отдельно проверены по области сертификата.")
 
         if requested_mode == "auto" and self._needs_post_mapping_extended(mapping, facts):
             mode = "extended"
+        critic_reference = self.reference_catalog.context_for_atas(
+            _mapping_atas(mapping)
+        )
+        required_candidate_ids = [
+            str(item["candidate_id"])
+            for category in MAPPING_CATEGORIES
+            if category != "user_declared_ata"
+            for item in mapping[category]
+            if item.get("candidate_id")
+        ]
         critic_input = {
             "request": request,
             "engineering_facts": facts,
             "relations": facts.get("relations", []),
             "ata_mapping": mapping,
+            "required_candidate_ids": required_candidate_ids,
+            "required_candidate_count": len(required_candidate_ids),
             "certificate_validation": certificate_validation,
+            "ata_reference": critic_reference,
             "critic_depth": mode,
         }
         critic_payload, critic_response = self._call_json(
             ATA_CRITIC_PROMPT,
             critic_input,
             "independent_critic",
-            ATA_CRITIC_SCHEMA,
+            ATA_CRITIC_GENERATION_SCHEMA,
         )
         critic_actions, critic_warnings = validate_critic(critic_payload, mapping, facts)
         if (
@@ -190,12 +291,17 @@ class AtaImpactService:
                 "independent_critic",
                 ATA_CRITIC_PROMPT,
                 critic_input,
-                ATA_CRITIC_SCHEMA,
+                ATA_CRITIC_GENERATION_SCHEMA,
                 critic_warnings,
             )
             critic_actions, critic_warnings = validate_critic(critic_payload, mapping, facts)
         if _has_schema_error(critic_warnings) and critic_response.repair_attempted:
-            critic_response = replace(critic_response, error="schema_validation_failed")
+            critic_response = replace(
+                critic_response,
+                error="schema_validation_failed",
+                repair_error=critic_response.repair_error or "schema_validation_failed",
+                validation_errors=list(critic_warnings),
+            )
         trace.append(
             self._structured_trace(
                 "independent_critic",
@@ -206,8 +312,18 @@ class AtaImpactService:
         if critic_response.error:
             warnings.append(critic_response.error)
         warnings.extend(critic_warnings)
+        critic_actions = _remove_ungrounded_confirms(
+            critic_actions,
+            mapping,
+            ungrounded_candidate_ids,
+        )
         mapping, critic_actions, addition_warnings = apply_critic_additions(mapping, critic_actions, facts, request)
         warnings.extend(addition_warnings)
+        added_ungrounded = set(self.reference_catalog.attach_references(mapping))
+        warnings.extend(
+            f"classification_reference_missing:{candidate_id}"
+            for candidate_id in sorted(added_ungrounded - ungrounded_candidate_ids)
+        )
         # Critic additions are validated and then receive the same deterministic
         # certificate/document processing as mapper candidates.
         certificate_validation = validate_certificate(self.certificate, _mapping_atas(mapping))
@@ -245,7 +361,15 @@ class AtaImpactService:
             }
         )
         assembled = assemble(mapping, critic_actions, certificate_validation, evidence)
-        required = self._required_inputs(facts, bool(assembled["affected_ata"]))
+        certificate_assessment = assess_certificate(
+            self.certificate,
+            list(assembled["affected_ata"]),
+            list(assembled["potentially_affected_ata"]),
+        )
+        required = self._required_inputs(
+            facts,
+            bool(assembled["affected_ata"]),
+        )
         valid_candidates = {
             str(item.get("candidate_id")): {
                 **item,
@@ -279,7 +403,7 @@ class AtaImpactService:
             required,
             validation_gate,
             evidence,
-            certificate_validation,
+            certificate_assessment,
         )
         result = {
             "agent": "ata_impact",
@@ -290,7 +414,9 @@ class AtaImpactService:
             "engineering_facts": facts,
             "ata_mapping": mapping,
             "critic_actions": critic_actions,
+            "classification_reference": _reference_summary(reference_context),
             "certificate_validation": certificate_validation,
+            "certificate_assessment": certificate_assessment,
             "certificate_catalog_available": bool(getattr(self.certificate, "entries", [])),
             **assembled,
             "required_input_data": required,
@@ -318,6 +444,7 @@ class AtaImpactService:
         trace: list[dict[str, object]],
         warnings: list[str] | None = None,
         facts: dict[str, object] | None = None,
+        reference_context: dict[str, object] | None = None,
     ) -> dict[str, object]:
         mapping = empty_mapping()
         mapping["user_declared_ata"] = [
@@ -350,6 +477,11 @@ class AtaImpactService:
             0,
         ).as_dict()  # type: ignore[arg-type]
         assembled = assemble(mapping, [], certificate_validation, evidence)
+        certificate_assessment = assess_certificate(
+            self.certificate,
+            list(assembled["affected_ata"]),
+            list(assembled["potentially_affected_ata"]),
+        )
         trace.append(
             {
                 "step": "fallback",
@@ -366,10 +498,26 @@ class AtaImpactService:
             "engineering_facts": facts,
             "ata_mapping": mapping,
             "critic_actions": [],
+            "classification_reference": _reference_summary(
+                reference_context
+                if isinstance(reference_context, dict)
+                else self.reference_catalog.context(request, facts)
+            ),
             "certificate_validation": certificate_validation,
+            "certificate_assessment": certificate_assessment,
             "certificate_catalog_available": bool(getattr(self.certificate, "entries", [])),
             **assembled,
-            "required_input_data": ["engineering semantic classification by LLM or engineer"],
+            "required_input_data": list(
+                dict.fromkeys(
+                    [
+                        *self._required_inputs(
+                            facts,
+                            False,
+                        ),
+                        "engineering semantic classification by LLM or engineer",
+                    ]
+                )
+            ),
             "document_verification": evidence,
             "retrieved_documents": [],
             "controlled_evidence": [],
@@ -399,7 +547,11 @@ class AtaImpactService:
             return {}, self._empty_structured_response("llm_unavailable")
         response = self._structured_request(stage, system, payload, schema)
         if response.finish_reason == "length":
-            return {}, replace(response, error="truncated_response")
+            return {}, replace(
+                response,
+                error="truncated_response",
+                primary_error=response.primary_error or "truncated_response",
+            )
         if response.error and response.error.startswith(
             ("transport_error:", "unsupported_structured_output_mode:")
         ):
@@ -414,8 +566,26 @@ class AtaImpactService:
                 raise ValueError("llm_response_not_object")
             return _drop_optional_null_properties(value, schema), response
         except Exception as exc:
-            error = str(exc) or f"llm_stage_failed:{type(exc).__name__}"
-            return self._repair_json(stage, system, payload, schema, [error])
+            primary_error = (
+                response.primary_error
+                or response.error
+                or str(exc)
+                or f"llm_stage_failed:{type(exc).__name__}"
+            )
+            validation_errors = list(response.validation_errors or [])
+            repair_errors = validation_errors or [primary_error]
+            repaired_payload, repair_response = self._repair_json(
+                stage,
+                system,
+                payload,
+                schema,
+                repair_errors,
+            )
+            return repaired_payload, replace(
+                repair_response,
+                primary_error=primary_error,
+                validation_errors=validation_errors,
+            )
 
     def _repair_json(
         self,
@@ -447,7 +617,11 @@ class AtaImpactService:
             repair_attempted=True,
         )
         if response.finish_reason == "length":
-            return {}, replace(response, error="truncated_response")
+            return {}, replace(
+                response,
+                error="truncated_response",
+                repair_error=response.repair_error or "truncated_response",
+            )
         try:
             if response.error:
                 raise ValueError(response.error)
@@ -459,7 +633,11 @@ class AtaImpactService:
             return _drop_optional_null_properties(value, schema), response
         except Exception as exc:
             error = str(exc) or f"repair_failed:{type(exc).__name__}"
-            return {}, replace(response, error=error)
+            return {}, replace(
+                response,
+                error=error,
+                repair_error=response.repair_error or error,
+            )
 
     def _structured_request(
         self,
@@ -521,7 +699,11 @@ class AtaImpactService:
             finish_reason=None,
             structured_output_mode="unavailable",
             schema_enforced=False,
+            schema_enforcement_requested=False,
+            server_profile_accepted=False,
+            local_schema_valid=False,
             error=error,
+            primary_error=error,
         )
 
     @staticmethod
@@ -554,8 +736,15 @@ class AtaImpactService:
                 else "not_needed"
             ),
             "finish_reason": response.finish_reason,
+            "requested_structured_output_mode": response.requested_structured_output_mode,
             "structured_output_mode": response.structured_output_mode,
+            "schema_enforcement_requested": response.schema_enforcement_requested,
+            "server_profile_accepted": response.server_profile_accepted,
+            "local_schema_valid": response.local_schema_valid,
             "schema_enforced_by_server": response.schema_enforced,
+            "primary_error": response.primary_error,
+            "repair_error": response.repair_error,
+            "validation_errors": list(response.validation_errors or []),
             "latency_ms": round(response.latency_ms, 3),
             **extra,
         }
@@ -626,7 +815,10 @@ class AtaImpactService:
         return potential_count > 0 or conflict or low_confidence or avionics
 
     @staticmethod
-    def _required_inputs(facts: dict[str, object], has_affected: bool) -> list[str]:
+    def _required_inputs(
+        facts: dict[str, object],
+        has_affected: bool,
+    ) -> list[str]:
         missing: list[str] = []
         aircraft = facts.get("aircraft", {})
         if not isinstance(aircraft, dict) or not (aircraft.get("family") or aircraft.get("model")):
@@ -644,7 +836,7 @@ class AtaImpactService:
         required: list[str],
         validation_gate: dict[str, object],
         evidence: dict[str, object],
-        certificate_validation: list[dict[str, object]],
+        certificate_assessment: dict[str, object],
     ) -> tuple[str, list[str]]:
         validated = assembled["validated_ata"]
         reasons: list[str] = []
@@ -668,16 +860,10 @@ class AtaImpactService:
             reasons.append("engineering_uncertainties_open")
         if str(evidence.get("status") or "") != "completed":
             reasons.append("evidence_stage_incomplete")
-        certificate_statuses = {
-            str(item.get("certificate_scope_status") or "")
-            for item in certificate_validation
-            if isinstance(item, dict)
-        }
-        if not certificate_validation or "catalog_unavailable" in certificate_statuses:
+        certificate_status = str(certificate_assessment.get("status") or "")
+        if certificate_status == "catalog_unavailable":
             reasons.append("certificate_catalog_unavailable")
-        if "ambiguous_subchapter" in certificate_statuses:
-            reasons.append("certificate_scope_ambiguous")
-        if "not_in_certificate" in certificate_statuses:
+        if certificate_status in {"partially_covered", "not_covered"}:
             reasons.append("certificate_scope_review_required")
         if validation_gate.get("critical") is True:
             reasons.append("critical_validation_warning")
@@ -729,21 +915,10 @@ class AtaImpactService:
             )
             for item in validated[status]
         ]
-        certificate_scope = {
-            "status": _certificate_summary(result["certificate_validation"]),
-            "catalog_loaded": bool(result.get("certificate_catalog_available")),
-            "matched": [
-                {
-                    "ata": item["ata"],
-                    "certificate_ata": item["ata"],
-                    "name": (item.get("certificate_entry") or {}).get("name", ""),
-                }
-                for item in result["certificate_validation"]
-                if item.get("catalog_present")
-            ],
-            "unmatched": [item["ata"] for item in result["certificate_validation"] if not item.get("catalog_present")],
-            "deprecated": True,
-        }
+        certificate_scope = _legacy_certificate_scope(
+            result.get("certificate_validation"),
+            bool(result.get("certificate_catalog_available")),
+        )
         result.update(
             {
                 "extracted_facts": result["engineering_facts"],
@@ -763,6 +938,7 @@ class AtaImpactService:
                 "provenance": {
                     "semantic_classifier": "unavailable" if result["runtime_mode"] == "fallback" else "llm",
                     "legacy_ontology": "disabled",
+                    "classification_reference": "gost_18675_2012_appendix_a",
                     "certificate": "scope_validation_only",
                 },
                 "compatibility": {"version": "v1", "deprecated_fields": True},
@@ -771,7 +947,25 @@ class AtaImpactService:
 
     @staticmethod
     def _answer(result: dict[str, object]) -> str:
-        lines = ["## Предварительная оценка ATA", "", "Техническая классификация не является подтверждением capability."]
+        assessment = result.get("certificate_assessment")
+        assessment_status = (
+            str(assessment.get("status") or "undetermined")
+            if isinstance(assessment, dict)
+            else "undetermined"
+        )
+        certificate_labels = {
+            "covered": "область найдена",
+            "partially_covered": "область найдена частично",
+            "not_covered": "область отсутствует",
+            "undetermined": "невозможно определить до подтверждения ATA",
+            "catalog_unavailable": "каталог недоступен",
+        }
+        lines = [
+            "## Предварительная оценка ATA",
+            "",
+            f"- Сертификат: {certificate_labels.get(assessment_status, assessment_status)}",
+            "- Совпадение с сертификатом не является окончательным capability approval.",
+        ]
         for key, label in (
             ("affected_ata", "Затронутые ATA"),
             ("potentially_affected_ata", "Потенциально затронутые ATA"),
@@ -796,6 +990,259 @@ class AtaImpactService:
 
 def _mapping_atas(mapping: dict[str, list[dict[str, object]]]) -> list[str]:
     return sorted({str(item["ata"]) for category in MAPPING_CATEGORIES for item in mapping[category] if item.get("ata")})
+
+
+def _remove_ungrounded_confirms(
+    actions: list[dict[str, object]],
+    mapping: dict[str, list[dict[str, object]]],
+    ungrounded_candidate_ids: set[str],
+) -> list[dict[str, object]]:
+    affected_candidates = {
+        str(candidate.get("candidate_id") or "")
+        for category in ("object_ata", "structural_ata")
+        for candidate in mapping[category]
+    }
+    return [
+        action
+        for action in actions
+        if not (
+            action.get("action") == "confirm"
+            and str(action.get("candidate_id") or "")
+            in ungrounded_candidate_ids
+            and str(action.get("candidate_id") or "") in affected_candidates
+        )
+    ]
+
+
+def _reference_summary(context: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": context.get("status"),
+        "source": context.get("source"),
+        "section": context.get("section"),
+        "revision": context.get("revision"),
+        "source_file_sha256": context.get("source_file_sha256"),
+        "retrieval_mode": context.get("retrieval_mode"),
+        "chapter_count": len(context.get("chapter_index") or []),
+        "definition_count": len(
+            context.get("relevant_definitions") or []
+        ),
+        "retrieved_reference_ids": list(
+            context.get("retrieved_reference_ids") or []
+        ),
+        "errors": list(context.get("errors") or []),
+    }
+
+
+def _synthesize_reference_candidates(
+    mapping: dict[str, list[dict[str, object]]],
+    facts: dict[str, object],
+    reference_context: dict[str, object],
+) -> list[str]:
+    chapter_index = reference_context.get("chapter_index")
+    if not isinstance(chapter_index, list):
+        return []
+    existing_ids = {
+        str(item.get("entity_id") or "")
+        for category in ("object_ata", "structural_ata")
+        for item in mapping.get(category, [])
+        if isinstance(item, dict)
+    }
+    warnings: list[str] = []
+    for entity in _required_affected_entities(facts):
+        entity_id = str(entity.get("entity_id") or "")
+        entity_type = str(entity.get("entity_type") or "")
+        if not entity_id or entity_id in existing_ids:
+            continue
+        category = (
+            "structural_ata"
+            if entity_type == "structure"
+            else "object_ata"
+        )
+        ata = _first_allowed_reference_chapter(
+            chapter_index,
+            category,
+        )
+        if not ata:
+            continue
+        candidate = {
+            "candidate_id": _next_candidate_id(
+                mapping,
+                category,
+                entity_id,
+                ata,
+            ),
+            "initial_state": "candidate_unverified",
+            "ata": ata,
+            "confidence": 0.55,
+            "reason": (
+                "Deterministic GOST shortlist fallback for affected "
+                f"{entity_type}"
+            ),
+            "entity_id": entity_id,
+            "source_fragment": str(entity.get("name") or ""),
+        }
+        mapping[category].append(candidate)
+        existing_ids.add(entity_id)
+        warnings.append(
+            f"reference_shortlist_candidate_added:{category}:{entity_id}:{ata}"
+        )
+    return warnings
+
+
+def _required_affected_entities(
+    facts: dict[str, object],
+) -> list[dict[str, str]]:
+    damaged_ids = {
+        str(item.get("affected_entity_id"))
+        for item in facts.get("damage", [])
+        if isinstance(item, dict) and item.get("affected_entity_id")
+    }
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key, entity_type in (
+        ("physical_objects", "object"),
+        ("structural_elements", "structure"),
+    ):
+        for item in facts.get(key, []):
+            if not isinstance(item, dict):
+                continue
+            entity_id = str(item.get("id") or "")
+            involvement = str(item.get("involvement") or "")
+            affected = (
+                entity_id in damaged_ids
+                or item.get("damage_confirmed") is True
+                or involvement.lower()
+                in {
+                    "damaged",
+                    "changed",
+                    "modified",
+                    "removed",
+                    "replaced",
+                    "repair",
+                    "repaired",
+                    "work_target",
+                }
+            )
+            identity = (entity_type, entity_id)
+            if not entity_id or not affected or identity in seen:
+                continue
+            seen.add(identity)
+            result.append(
+                {
+                    "entity_id": entity_id,
+                    "entity_type": entity_type,
+                    "name": str(item.get("name") or ""),
+                    "involvement": involvement,
+                }
+            )
+    return result
+
+
+def _first_allowed_reference_chapter(
+    chapter_index: list[object],
+    category: str,
+) -> str:
+    for item in chapter_index:
+        if not isinstance(item, dict):
+            continue
+        ata = str(item.get("ata") or "")
+        allowed = item.get("allowed_mapping_categories")
+        if (
+            ata
+            and isinstance(allowed, list)
+            and category in {str(value) for value in allowed}
+        ):
+            return ata
+    return ""
+
+
+def _next_candidate_id(
+    mapping: dict[str, list[dict[str, object]]],
+    category: str,
+    anchor: str,
+    ata: str,
+) -> str:
+    existing = {
+        str(item.get("candidate_id") or "")
+        for mapping_category in MAPPING_CATEGORIES
+        for item in mapping.get(mapping_category, [])
+        if isinstance(item, dict) and item.get("candidate_id")
+    }
+    sequence = 1
+    anchor_token = _candidate_token(anchor)
+    ata_token = _candidate_token(ata)
+    candidate_id = (
+        f"candidate:{category}:{anchor_token}:{ata_token}:{sequence}"
+    )
+    while candidate_id in existing:
+        sequence += 1
+        candidate_id = (
+            f"candidate:{category}:{anchor_token}:{ata_token}:{sequence}"
+        )
+    return candidate_id
+
+
+def _candidate_token(value: object) -> str:
+    token = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        str(value or "").lower(),
+    ).strip("_")
+    return token or "request"
+
+
+def _legacy_certificate_scope(
+    validation: object,
+    catalog_loaded: bool,
+) -> dict[str, object]:
+    entries = [
+        item for item in (validation or []) if isinstance(item, dict)
+    ]
+    matched = [
+        {
+            "ata": item.get("ata"),
+            "certificate_ata": item.get("certificate_ata"),
+            "match_type": item.get("match_type"),
+            "name": (item.get("certificate_entry") or {}).get("name", "")
+            if isinstance(item.get("certificate_entry"), dict)
+            else "",
+        }
+        for item in entries
+        if item.get("certificate_scope_status") == "in_scope_candidate"
+    ]
+    unmatched = [
+        str(item.get("ata"))
+        for item in entries
+        if item.get("certificate_scope_status") == "not_in_certificate"
+    ]
+    ambiguous = [
+        str(item.get("ata"))
+        for item in entries
+        if item.get("certificate_scope_status") == "ambiguous_subchapter"
+    ]
+    statuses = {
+        str(item.get("certificate_scope_status")) for item in entries
+    }
+    status = (
+        "catalog_unavailable"
+        if not catalog_loaded or "catalog_unavailable" in statuses
+        else "out_of_scope"
+        if unmatched
+        else "ambiguous"
+        if ambiguous
+        else "in_scope_candidate"
+        if entries
+        else "unknown"
+    )
+    return {
+        "status": status,
+        "catalog_loaded": catalog_loaded,
+        "matched": matched,
+        "unmatched": unmatched,
+        "ambiguous": ambiguous,
+        "capability_approval": False,
+        "deprecated": True,
+    }
 
 
 def _certificate_summary(items: object) -> str:

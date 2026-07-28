@@ -301,6 +301,21 @@ class AtaImpactV2Tests(unittest.TestCase):
         result = self.analyze("Повреждение оборудования", facts(), mapping)
         self.assertEqual(result["validated_ata"]["possible_procedure"], [])
 
+        mapping = combined_mapping("ATA 25", interface_ata=None)
+        mapping["ata_mapping"]["procedure_ata_hypotheses"] = [  # type: ignore[index]
+            {
+                "ata": "ATA 34",
+                "confidence": 0.7,
+                "reason": "possible documented procedure",
+                "source_fragment": "AMM ATA 34-11 procedure",
+            }
+        ]
+        result = self.analyze("Использовать AMM ATA 34-11 для оборудования", facts(), mapping)
+        self.assertEqual(
+            [item["ata"] for item in result["validated_ata"]["possible_procedure"]],
+            ["ATA 34"],
+        )
+
     def test_critic_can_downgrade_structural_candidate_to_location(self) -> None:
         f = facts(structure_damage=True)
         mapping = combined_mapping("ATA 25", structure_affected=True, interface_ata=None)["ata_mapping"]
@@ -565,12 +580,12 @@ class RealLLMIntegrationTests(unittest.TestCase):
         model_id = client.resolve_model()
         service = AtaImpactService(CertificateCatalog(), client)
         requests = {
-            "Коррозия roller track в районе шпангоута 58; шпангоут используется только как ориентир.": ({"ATA 25"}, set(), {"ATA 53"}, {"ATA 53"}),
-            "Corrosion damaged the cargo roller track and its mechanical attachment to frame 58; repair of the attachment and frame is required.": ({"ATA 25", "ATA 53"}, set(), set(), set()),
+            "В заднем багажном отсеке обнаружена коррозия направляющей системы роликов (roller track) в районе шпангоута 58; шпангоут используется только как ориентир.": ({"ATA 50"}, set(), {"ATA 53"}, {"ATA 53"}),
+            "Corrosion damaged the cargo-compartment roller track and its mechanical attachment to frame 58; repair of the attachment and frame is required.": ({"ATA 50", "ATA 53"}, set(), set(), set()),
             "Царапины обшивки фюзеляжа рядом с приёмником статического давления; демонтаж и доступ к приёмнику не требуются.": ({"ATA 53"}, set(), {"ATA 34"}, {"ATA 34"}),
             "Повреждена установочная поверхность приёмника статического давления; требуется демонтаж и повторная установка приёмника.": ({"ATA 34"}, set(), set(), set()),
             "Работа указана только в грузовом отсеке; технически затронутый объект и вид работ не определены.": (set(), set(), set(), set()),
-            "Обнаружены повреждения двух объектов: cargo roller track и штока амортизатора основной опоры шасси. Оба объекта требуют ремонта.": ({"ATA 25", "ATA 32"}, set(), set(), set()),
+            "Обнаружены повреждения двух объектов: cargo roller track и штока амортизатора основной опоры шасси. Оба объекта требуют ремонта.": ({"ATA 50", "ATA 32"}, set(), set(), set()),
         }
         observations: dict[str, list[dict[str, object]]] = {}
         for request in requests:

@@ -37,8 +37,8 @@ ENGINEERING_FACTS_SCHEMA: dict[str, object] = {
             "additionalProperties": False,
             "required": ["type", "maintenance_action"],
             "properties": {
-                "type": {"type": "string"},
-                "maintenance_action": {"type": "string"},
+                "type": _NULLABLE_STRING,
+                "maintenance_action": _NULLABLE_STRING,
                 "target_entity_ids": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -183,8 +183,10 @@ def _mapping_item(*, anchor: str | None, extra: dict[str, object] | None = None)
     properties: dict[str, object] = {
         "ata": {"type": "string"},
         "confidence": _CONFIDENCE,
-        "reason": {"type": "string"},
-        "source_fragment": {"type": "string"},
+        "reason": {"type": "string", "maxLength": 500},
+        "source_fragment": {"type": "string", "maxLength": 300},
+        # Compatibility-only optional fields. Production prompts do not request
+        # them; deterministic Python code owns candidate state and provenance.
         "basis": {"type": "array", "items": {"type": "string"}},
         "condition": {"type": "string"},
         "status": {
@@ -196,6 +198,14 @@ def _mapping_item(*, anchor: str | None, extra: dict[str, object] | None = None)
                 "not_in_certificate",
                 "context_only",
                 "hypothesis",
+            ],
+        },
+        "technical_role": {
+            "type": "string",
+            "enum": [
+                "functional_object",
+                "actual_structure",
+                "location_context",
             ],
         },
     }
@@ -258,6 +268,78 @@ ATA_MAPPING_SCHEMA: dict[str, object] = {
     },
 }
 
+
+def _generation_mapping_item(
+    *,
+    anchor: str | None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "ata": {"type": "string"},
+        "confidence": _CONFIDENCE,
+        "reason": {"type": "string", "maxLength": 500},
+        "source_fragment": {"type": "string", "maxLength": 300},
+    }
+    required = ["ata", "confidence", "reason"]
+    if anchor:
+        properties[anchor] = {"type": "string"}
+        required.append(anchor)
+    if extra:
+        properties.update(extra)
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": required,
+        "properties": properties,
+    }
+
+
+ATA_MAPPING_GENERATION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": list(ATA_MAPPING_SCHEMA["required"]),
+    "properties": {
+        "object_ata": {
+            "type": "array",
+            "items": _generation_mapping_item(anchor="entity_id"),
+        },
+        "structural_ata": {
+            "type": "array",
+            "items": _generation_mapping_item(
+                anchor="entity_id",
+                extra={
+                    "technical_role": {
+                        "type": "string",
+                        "enum": ["actual_structure"],
+                    }
+                },
+            ),
+        },
+        "location_context_ata": {
+            "type": "array",
+            "items": _generation_mapping_item(anchor="entity_id"),
+        },
+        "interface_ata_hypotheses": {
+            "type": "array",
+            "items": _generation_mapping_item(anchor="relation_id"),
+        },
+        "procedure_ata_hypotheses": {
+            "type": "array",
+            "items": _generation_mapping_item(
+                anchor=None,
+                extra={
+                    "entity_id": {"type": "string"},
+                    "relation_id": {"type": "string"},
+                },
+            ),
+        },
+        "user_declared_ata": {
+            "type": "array",
+            "items": _generation_mapping_item(anchor=None),
+        },
+    },
+}
+
 ATA_CRITIC_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
@@ -289,9 +371,36 @@ ATA_CRITIC_SCHEMA: dict[str, object] = {
                     "relation_id": {"type": "string"},
                     "confidence": _CONFIDENCE,
                     "source_fragment": {"type": "string"},
+                    # Accepted for compatibility with older critic fixtures;
+                    # orchestration does not trust these fields as state.
                     "condition": {"type": "string"},
                     "basis": {"type": "array", "items": {"type": "string"}},
                     "status": {"type": "string"},
+                },
+            },
+        }
+    },
+}
+
+ATA_CRITIC_GENERATION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["actions"],
+    "properties": {
+        "actions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["candidate_id", "action", "reason"],
+                "properties": {
+                    "candidate_id": {"type": "string"},
+                    "action": ATA_CRITIC_SCHEMA["properties"]["actions"]["items"]["properties"]["action"],  # type: ignore[index]
+                    "reason": {"type": "string"},
+                    "ata": {"type": "string"},
+                    "category": {"type": "string"},
+                    "entity_id": {"type": "string"},
+                    "relation_id": {"type": "string"},
                 },
             },
         }

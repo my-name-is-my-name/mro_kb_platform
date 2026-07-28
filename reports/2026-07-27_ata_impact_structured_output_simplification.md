@@ -4,7 +4,11 @@
 
 - Base SHA: `c8c77d95d9250e5fd3bc9078d58835f1b04322f7`
 - Base subject: `Harden ATA Impact v2 safety pipeline`
-- Final HEAD: commit, содержащий этот отчёт; точный SHA фиксируется в итоговом handoff после commit.
+- Final HEAD: `f99821872478cbacedfc1811ddd733b6965e18dc`
+- Final subject: `Simplify ATA structured output pipeline`
+- Branch: `experiment/mro-similar-cases-structured-profiles`
+- Push status: local `HEAD` and `origin/experiment/mro-similar-cases-structured-profiles`
+  both point to `f99821872478cbacedfc1811ddd733b6965e18dc`.
 - Scope: ATA Impact v2, его OpenAI-compatible structured transport, непосредственная
   интеграция staged ATA result с Go/No-Go, тесты и ATA-документация.
 
@@ -155,6 +159,13 @@ prefixes и не изменяет ATA mapping через evidence.
 registry, event bus, state-machine dependency или provider class hierarchy не добавлялись.
 
 ## Проверки
+
+Post-commit repository state:
+
+- `git status --short` — clean before this report update;
+- `git rev-parse HEAD` — `f99821872478cbacedfc1811ddd733b6965e18dc`;
+- `git rev-parse origin/experiment/mro-similar-cases-structured-profiles` —
+  `f99821872478cbacedfc1811ddd733b6965e18dc`.
 
 Targeted:
 

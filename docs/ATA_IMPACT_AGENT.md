@@ -9,6 +9,7 @@
 ```text
 formal identifiers
 → structured LLM engineering facts (без ATA)
+→ ГОСТ 18675-2012 civil classification reference retrieval
 → structured LLM ATA mapping (без legacy allowlist и candidate_id)
 → deterministic mapping validation
 → Python candidate_id allocation
@@ -24,10 +25,29 @@ mapping и critic. Critic получает уже провалидированн
 `extended` и `auto` могут отличаться глубиной critic и retrieval, но не
 объединяют mapper и critic в одном контексте.
 
+ГОСТ-справочник и сертификат имеют разные роли. Приложение А ГОСТ
+18675-2012 индексируется отдельно по главам ATA; mapper получает не весь
+документ, а максимум восемь коротких релевантных карточек.
+`sertifikat_glavy_new.docx` проверяет область
+сертификата только после mapping и не может подавлять технически правильную
+ATA. Справочник ГОСТ не является OEM evidence и не подтверждает процедуры.
+
+При `MRO_KB_ATA_REFERENCE_VECTORS_ENABLED=true` используется локальный
+кешированный индекс embeddings (`MRO_KB_EMBEDDING_MODEL`, по умолчанию
+`bge-m3:latest`) и один query-embedding на заявку. Индекс не перестраивается
+при каждом запросе. Если индекс или embedding endpoint недоступен, retrieval
+явно переходит в `lexical_fallback`; локальная schema/MRO validation остаётся
+обязательной.
+
 Для stages `engineering_fact_extraction`, `ata_mapping`,
 `independent_critic` и `json_repair` ATA-specific transport передаёт
 generation schema через OpenAI-compatible `response_format`. Профиль
-`json_schema` использует strict schema adapter; `json_schema_no_strict`,
+`qwen_completion` используется по умолчанию для текущего Qwen endpoint и
+сразу закрывает thinking-блок, не выполняя скрытых capability generations.
+Явный профиль `auto` может последовательно проверить несколько transport modes,
+кеширует выбранный профиль и предназначен только для диагностики неизвестного
+endpoint. `json_schema` использует strict schema
+adapter; `json_schema_no_strict`,
 `json_object` и `prompt_only` явно отражаются в trace без ложного признака
 server enforcement. Любой результат повторно проходит полную локальную
 shape-validation и MRO cross-reference validation. Пустой `content`,
@@ -82,7 +102,16 @@ Compatibility-поля v1 разделяют:
   но authoritative `decision` использует v2 states `completed`,
   `completed_with_hypotheses`, `engineering_review_required`,
   `additional_input_required` или `document_verification_required`;
-- `certificate_chapter_match` — только совпадение главы сертификата, не capability.
+- `certificate_assessment` — основной business gate по
+  `sertifikat_glavy_new.docx`: `covered`, `partially_covered`, `not_covered`,
+  `undetermined` или `catalog_unavailable`;
+- `certificate_chapter_match` — deprecated compatibility projection, не
+  окончательное capability approval.
+
+Запись сертификата на уровне главы покрывает её подглавы: например, кандидат
+`ATA 53-10` сопоставляется со строкой `ATA 53` с `match_type=chapter`.
+`match_type=exact` используется только для точной строки. Context-only ATA не
+участвует в итоговой оценке сертификата.
 
 User-declared ATA детерминированно reconciles после critic и certificate
 validation: `user_declared_consistent` не блокирует закрытый анализ;
@@ -110,9 +139,16 @@ fields сохраняются только как compatibility projection.
 
 ## Источники и границы
 
-Онтология находится в `config/mro_ontology_v1.json`, имеет версию, источник, владельца, дату ревью и условия применимости каждой связи. Рабочая применимость на уровне subchapter, процедуры или ограничения подтверждается только контролируемо загруженными OEM AMM/SRM/IPC/CMM/ALS.
+Первичная система нумерации v2 загружается из нормализованного приложения А
+ГОСТ 18675-2012. Источник используется как классификационный справочник, но не
+как OEM evidence и не как подтверждение capability. SHA-256 предоставленного
+исходного PDF хранится в метаданных справочника; сам PDF не входит в Git.
 
-Публичные EASA/FAA материалы допускаются как дополнительный контекст. Нормативная схема ATA должна загружаться из лицензированной ATA iSpec 2200, когда она будет предоставлена владельцем лицензии.
+АП-25 описывает требования лётной годности и не используется для определения
+ATA. Рабочая применимость процедуры или ремонта подтверждается только
+контролируемо загруженными OEM AMM/SRM/IPC/CMM/ALS. Для иностранного ВС
+классификация по ГОСТ остаётся предварительной до появления применимой
+OEM-документации.
 
 ## Проверка
 

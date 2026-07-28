@@ -122,15 +122,26 @@ class CertificateCatalog:
                 (entry for entry in entries if self._normalize_ata(entry.ata) == code),
                 None,
             )
-            if "-" in code and exact is None and entries:
+            chapter_entry = next(
+                (
+                    entry
+                    for entry in entries
+                    if self._normalize_ata(entry.ata) == f"ATA {system}"
+                ),
+                None,
+            )
+            if "-" in code and exact is None and chapter_entry is None and entries:
                 ambiguous.append(code)
             elif entries:
-                entry = exact or (entries[0] if len(entries) == 1 else None)
+                entry = exact or chapter_entry or (
+                    entries[0] if len(entries) == 1 else None
+                )
                 matched.append(
                     {
                         "ata": code,
                         "certificate_ata": entry.ata if entry else f"ATA {system}",
                         "name": entry.name if entry else "",
+                        "match_type": "exact" if exact else "chapter",
                     }
                 )
             else:
@@ -1065,8 +1076,6 @@ class GoNoGoService:
         self.certificate = CertificateCatalog()
         self.ata_catalog = AtaDiscoveryCatalog(self.certificate)
         self.retriever = InternalEvidenceRetriever(store, commercial_offers)
-        settings = RuntimeSettings()
-        self._llm = OpenAICompatibleLLM(settings) if settings.llm_enabled and settings.llm_provider == "openai" else None
         self.ata_impact = AtaImpactAgent(self.certificate, self.ata_catalog, self.retriever)
 
     def health(self) -> dict[str, object]:
@@ -1074,7 +1083,7 @@ class GoNoGoService:
             "certificate": {"path": str(self.certificate.path), "loaded": bool(self.certificate.entries), "entries": len(self.certificate.entries)},
             "ata_catalog": {"path": str(self.ata_catalog.path), "version": self.ata_catalog.version, "loaded": bool(self.ata_catalog.payload)},
             "tsearch": {"enabled": self.retriever.tsearch.enabled, "url": self.retriever.tsearch.url},
-            "llm_expert": self._llm.health() if self._llm is not None else {"ok": False, "disabled": True},
+            "ata_impact": self.ata_impact.health(),
         }
 
     def triage(self, request: str, fields: dict[str, object] | None = None) -> dict[str, object]:
@@ -1136,15 +1145,21 @@ class GoNoGoService:
                 else []
             ),
         }
-        certificate = staged.get("certificate_scope") or self.certificate.match(impact["direct_ata"])
-        missing = list(
-            dict.fromkeys(
-                [
-                    *self._missing_inputs(facts, staged_engineering_facts),
-                    *staged_required,
-                ]
-            )
+        certificate_assessment = (
+            staged.get("certificate_assessment")
+            if isinstance(staged.get("certificate_assessment"), dict)
+            else {}
         )
+        certificate_scope = (
+            staged.get("certificate_scope")
+            if isinstance(staged.get("certificate_scope"), dict)
+            else self.certificate.match(impact["direct_ata"])
+        )
+        certificate = certificate_assessment or certificate_scope
+        # ATA Impact is the authoritative source of technical completeness.
+        # Re-deriving dimensions/photos from free text here can contradict a
+        # closed staged decision and previously duplicated technical triage.
+        missing = list(dict.fromkeys(staged_required))
         evidence_result = (
             staged.get("document_verification")
             if isinstance(staged.get("document_verification"), dict)
@@ -1175,7 +1190,11 @@ class GoNoGoService:
             risks.append("каталог сертификата не загружен")
         if not evidence:
             risks.append("внутренние доказательные документы не найдены")
-        if certificate.get("status") == "out_of_scope":
+        if certificate.get("status") in {
+            "not_covered",
+            "partially_covered",
+            "out_of_scope",
+        }:
             recommendation = "hold_expert_review"
             reason = "техническая ATA не найдена в текущей области сертификата; требуется отдельная capability-проверка"
         elif not affected_ata and context_ata:
@@ -1208,7 +1227,8 @@ class GoNoGoService:
         elif (
             unresolved
             or staged.get("decision") != "completed"
-            or certificate.get("status") in {"unknown", "ambiguous", "catalog_unavailable"}
+            or certificate.get("status")
+            in {"unknown", "undetermined", "ambiguous", "catalog_unavailable"}
             or not certificate.get("catalog_loaded")
         ):
             recommendation = "hold_expert_review"
@@ -1233,7 +1253,8 @@ class GoNoGoService:
             "context_ata": context_ata,
             "confirmed_affected_ata": impact["confirmed_affected_ata"],
             "unresolved_ata": unresolved,
-            "certificate_scope": certificate,
+            "certificate_scope": certificate_scope,
+            "certificate_assessment": certificate_assessment or certificate,
             "input_completeness": {"status": "insufficient" if missing else "sufficient", "missing_count": len(missing)},
             "missing_inputs": missing,
             "required_documents": self._required_documents(facts, impact),
@@ -1265,11 +1286,29 @@ class GoNoGoService:
             "need_more_info": "Запросить дополнительную информацию",
             "hold_expert_review": "Нужна экспертная проверка",
         }
+        certificate = (
+            result.get("certificate_assessment")
+            if isinstance(result.get("certificate_assessment"), dict)
+            else result.get("certificate_scope")
+        )
+        certificate_status = (
+            str(certificate.get("status") or "unknown")
+            if isinstance(certificate, dict)
+            else "unknown"
+        )
+        certificate_label = {
+            "covered": "область найдена",
+            "partially_covered": "область найдена частично",
+            "not_covered": "область отсутствует",
+            "undetermined": "невозможно определить до подтверждения ATA",
+            "catalog_unavailable": "каталог недоступен",
+        }.get(certificate_status, certificate_status)
         lines = [
             f"## {recommendation_labels.get(str(result.get('recommendation')), 'Требуется проверка')}",
             "",
             str(result.get("explanation") or ""),
             "",
+            f"- Сертификат: {certificate_label}",
             f"- Уверенность: {float(result.get('confidence') or 0.0):.0%}",
             "- Требуется подтверждение экспертом: да",
         ]
@@ -1279,9 +1318,6 @@ class GoNoGoService:
             lines.append("- Прямые ATA: " + ", ".join(str(item) for item in direct_ata))
         if confirmed_ata and confirmed_ata != direct_ata:
             lines.append("- Подтверждённо затронутые ATA: " + ", ".join(str(item) for item in confirmed_ata))
-        certificate = result.get("certificate_scope")
-        if isinstance(certificate, dict):
-            lines.append("- Сертификат: " + str(certificate.get("status") or "unknown"))
         missing = result.get("missing_inputs") or []
         if missing:
             lines.extend(["", "### Нужно запросить", *[f"- {item}" for item in missing]])
@@ -1324,50 +1360,6 @@ class GoNoGoService:
                 continue
             values.add(f"ATA {system}" + (f"-{subsystem}" if subsystem else ""))
         return sorted(values)
-
-    @staticmethod
-    def _missing_inputs(
-        facts: dict[str, object],
-        engineering_facts: dict[str, object] | None = None,
-    ) -> list[str]:
-        missing: list[str] = []
-        engineering_facts = (
-            engineering_facts if isinstance(engineering_facts, dict) else {}
-        )
-        text = " ".join(str(facts.get(key) or "") for key in ("request", "component", "components", "zone", "zones", "damage_type", "defect_type")).lower()
-        available_documents = " ".join(str(item) for item in (facts.get("documents_available") or [])).lower()
-        aircraft = (
-            engineering_facts.get("aircraft")
-            if isinstance(engineering_facts.get("aircraft"), dict)
-            else {}
-        )
-        if not facts.get("aircraft_type") and not (
-            aircraft.get("family") or aircraft.get("model")
-        ):
-            missing.append("тип ВС")
-        staged_objects = engineering_facts.get("physical_objects")
-        has_staged_object = bool(
-            [
-                item
-                for item in staged_objects
-                if isinstance(item, dict) and item.get("id") and item.get("name")
-            ]
-        ) if isinstance(staged_objects, list) else False
-        if (
-            not has_staged_object
-            and not facts.get("components")
-            and not facts.get("zones")
-            and not facts.get("direct_ata")
-        ):
-            missing.append("точный объект/зона или ATA")
-        if any(term in text for term in ("поврежден", "damage", "трещин", "корроз", "вмятин", "царап", "скол", "crack", "corrosion", "scratch", "chip")):
-            if not any(term in text for term in ("размер", "мм", "mm", "координат")):
-                missing.append("размеры/координаты повреждения")
-            if not any(term in text or term in available_documents for term in ("фото", "photo", "изображен", "снимок")):
-                missing.append("фотографии повреждения")
-        if any(term in text for term in ("изменен", "модификац", "modification", "установ")) and not facts.get("aircraft_type"):
-            missing.append("конфигурация ВС и применимость изменения")
-        return missing
 
     @staticmethod
     def _required_documents(facts: dict[str, object], impact: dict[str, list[str]]) -> list[str]:

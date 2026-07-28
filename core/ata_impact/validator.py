@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 from .evidence import is_controlled_evidence_document
@@ -31,6 +32,12 @@ _CRITICAL_WARNING_PREFIXES = (
     "procedure_without_factual_anchor:",
     "adjacent_without_access_or_protection:",
     "critic_action_missing_reason:",
+    "classification_reference_",
+)
+
+_DOCUMENT_REFERENCE_RE = re.compile(
+    r"\b(?:AMM|SRM|IPC|CMM|WDM|NTM|ALS)\s+(?:ATA\s+)?\d{2}-\d{2}(?:-\d{2})?\b",
+    re.IGNORECASE,
 )
 
 
@@ -65,6 +72,13 @@ def validate_facts(payload: object, identifiers: dict[str, object]) -> tuple[dic
         aircraft.setdefault("model", None)
         aircraft.setdefault("msn", identifiers.get("msn"))
         aircraft["confidence"] = _confidence(aircraft.get("confidence"), warnings, "aircraft")
+    event = facts["event"]
+    if isinstance(event, dict):
+        event.setdefault("type", None)
+        event.setdefault("maintenance_action", None)
+        if not isinstance(event.get("target_entity_ids"), list):
+            event["target_entity_ids"] = []
+    warnings.extend(_reconcile_duplicate_structural_damage(facts))
     entity_ids = _entity_ids(facts)
     for key in ("physical_objects", "locations", "structural_elements"):
         for item in facts.get(key, []) if isinstance(facts.get(key), list) else []:
@@ -119,6 +133,93 @@ def validate_facts(payload: object, identifiers: dict[str, object]) -> tuple[dic
         valid_relations.append(relation)
     facts["relations"] = valid_relations
     return facts, warnings
+
+
+def _reconcile_duplicate_structural_damage(
+    facts: dict[str, object],
+) -> list[str]:
+    """Reconcile exact cross-role duplicates without inferring parent damage."""
+
+    damage = (
+        facts.get("damage")
+        if isinstance(facts.get("damage"), list)
+        else []
+    )
+    damaged_ids = {
+        str(item.get("affected_entity_id") or "")
+        for item in damage
+        if isinstance(item, dict)
+    }
+    objects = [
+        item
+        for item in facts.get("physical_objects", [])
+        if isinstance(item, dict)
+    ]
+    structures = [
+        item
+        for item in facts.get("structural_elements", [])
+        if isinstance(item, dict)
+    ]
+    warnings: list[str] = []
+    for physical in objects:
+        physical_id = str(physical.get("id") or "")
+        physical_tokens = _entity_name_tokens(physical.get("name"))
+        is_damaged = (
+            physical_id in damaged_ids
+            or physical.get("damage_confirmed") is True
+            or str(physical.get("involvement") or "").lower() == "damaged"
+        )
+        if not is_damaged or len(physical_tokens) < 3:
+            continue
+        for structure in structures:
+            structure_id = str(structure.get("id") or "")
+            if (
+                not structure_id
+                or _entity_name_tokens(structure.get("name"))
+                != physical_tokens
+            ):
+                continue
+            structure["damage_confirmed"] = True
+            structure["involvement"] = "damaged"
+            if structure_id not in damaged_ids:
+                source_damage = next(
+                    (
+                        item
+                        for item in damage
+                        if isinstance(item, dict)
+                        and item.get("affected_entity_id") == physical_id
+                    ),
+                    None,
+                )
+                damage.append(
+                    {
+                        "type": (
+                            str(source_damage.get("type") or "damage")
+                            if isinstance(source_damage, dict)
+                            else "damage"
+                        ),
+                        "affected_entity_id": structure_id,
+                        "description": (
+                            str(source_damage.get("description") or "")
+                            if isinstance(source_damage, dict)
+                            else ""
+                        ),
+                    }
+                )
+                damaged_ids.add(structure_id)
+            warnings.append(
+                "facts_cross_role_duplicate_reconciled:"
+                f"{physical_id}:{structure_id}"
+            )
+    return warnings
+
+
+def _entity_name_tokens(value: object) -> frozenset[str]:
+    return frozenset(
+        token
+        for token in re.findall(r"[a-zа-яё0-9]+", str(value or "").lower())
+        if len(token) >= 3
+    )
 
 
 def validate_mapping(
@@ -188,9 +289,23 @@ def validate_mapping(
             if category == "object_ata" and (entity_id not in object_ids or entity_id not in damaged_ids):
                 warnings.append(f"object_ata_wrong_entity_role:{ata}")
                 continue
-            if category == "structural_ata" and (entity_id not in structure_ids or entity_id not in structural_involved_ids):
-                warnings.append(f"structural_ata_without_involvement:{ata}")
-                continue
+            if category == "structural_ata":
+                validated_structure = (
+                    entity_id in structure_ids
+                    and entity_id in structural_involved_ids
+                )
+                reclassified_damaged_object = (
+                    entity_id in object_ids
+                    and entity_id in damaged_ids
+                    and item.get("technical_role") == "actual_structure"
+                )
+                if not (
+                    validated_structure or reclassified_damaged_object
+                ):
+                    warnings.append(
+                        f"structural_ata_without_involvement:{ata}"
+                    )
+                    continue
             if category == "location_context_ata":
                 is_location = entity_id in location_ids
                 is_location_structure = entity_id in structure_ids and entity_id not in structural_involved_ids
@@ -211,10 +326,10 @@ def validate_mapping(
                 ):
                     warnings.append(f"adjacent_without_access_or_protection:{ata}:{relation_id}")
                     continue
-            if category == "procedure_ata_hypotheses" and not (
-                relation_id in relation_ids
-                or entity_id in entity_ids
-                or _fragment_in_request(str(item.get("source_fragment") or ""), request)
+            if category == "procedure_ata_hypotheses" and not _has_procedure_anchor(
+                item,
+                relation_ids=relation_ids,
+                request=request,
             ):
                 warnings.append(f"procedure_without_factual_anchor:{ata}")
                 continue
@@ -236,6 +351,24 @@ def validate_mapping(
             item["candidate_id"] = candidate_id
             item["initial_state"] = "candidate_unverified"
             mapping[category].append(item)
+    mapped_object_ids = {
+        str(item.get("entity_id") or "")
+        for item in mapping["object_ata"]
+    }
+    mapped_structure_ids = {
+        str(item.get("entity_id") or "")
+        for item in mapping["structural_ata"]
+    }
+    for entity_id in sorted((damaged_ids & object_ids) - mapped_object_ids):
+        warnings.append(
+            f"mapping_affected_entity_missing:object:{entity_id}"
+        )
+    for entity_id in sorted(
+        (structural_involved_ids & structure_ids) - mapped_structure_ids
+    ):
+        warnings.append(
+            f"mapping_affected_entity_missing:structure:{entity_id}"
+        )
     present_declared = {item["ata"] for item in mapping["user_declared_ata"]}
     for ata in declared:
         if ata not in present_declared:
@@ -264,10 +397,28 @@ def validate_mapping(
             )
     allowed_user_status = {"consistent", "conflicting", "unverified", "not_in_certificate"}
     for item in mapping["user_declared_ata"]:
-        if str(item.get("declared_assessment") or "") not in allowed_user_status:
+        declared_assessment = str(item.get("declared_assessment") or "")
+        if not declared_assessment:
+            item["declared_assessment"] = "unverified"
+        elif declared_assessment not in allowed_user_status:
             item["declared_assessment"] = "unverified"
             warnings.append(f"invalid_user_declared_status:{item['ata']}")
     return mapping, warnings
+
+
+def _has_procedure_anchor(
+    item: dict[str, object],
+    *,
+    relation_ids: set[str],
+    request: str,
+) -> bool:
+    relation_id = str(item.get("relation_id") or "")
+    if relation_id and relation_id in relation_ids:
+        return True
+    source_fragment = str(item.get("source_fragment") or "").strip()
+    if source_fragment and _DOCUMENT_REFERENCE_RE.search(source_fragment):
+        return True
+    return bool(request and _DOCUMENT_REFERENCE_RE.search(request))
 
 
 def validate_critic(

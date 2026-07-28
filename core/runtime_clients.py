@@ -33,7 +33,7 @@ class RuntimeSettings:
     llm_max_tokens: int = int(os.getenv("MRO_KB_LLM_MAX_TOKENS", "1200"))
     ata_structured_output_mode: str = os.getenv(
         "MRO_KB_ATA_STRUCTURED_OUTPUT_MODE",
-        "json_schema",
+        "qwen_completion",
     ).strip()
     # The intake agent must fail closed to the ontology result instead of leaving
     # an OpenWebUI stream in a perpetual "thinking" state.
@@ -47,8 +47,15 @@ class StructuredLLMResponse:
     finish_reason: str | None
     structured_output_mode: str
     schema_enforced: bool
+    requested_structured_output_mode: str | None = None
+    schema_enforcement_requested: bool = False
+    server_profile_accepted: bool = False
+    local_schema_valid: bool = False
     repair_attempted: bool = False
     error: str | None = None
+    primary_error: str | None = None
+    repair_error: str | None = None
+    validation_errors: list[str] | None = None
     latency_ms: float = 0.0
 
 
@@ -136,6 +143,7 @@ class OpenAICompatibleLLM:
     def __init__(self, settings: RuntimeSettings) -> None:
         self.settings = settings
         self._resolved_model: str | None = None
+        self._ata_structured_profile: str | None = None
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -216,61 +224,46 @@ class OpenAICompatibleLLM:
         input_payload: dict[str, object],
         response_schema: dict[str, object],
     ) -> StructuredLLMResponse:
-        mode = self.settings.ata_structured_output_mode
+        requested_mode = self.settings.ata_structured_output_mode or "auto"
+        mode = self._resolve_ata_structured_profile(requested_mode)
         if mode not in {
             "json_schema",
             "json_schema_no_strict",
             "json_object",
             "prompt_only",
+            "qwen_completion",
         }:
             return StructuredLLMResponse(
                 parsed=None,
                 content="",
                 finish_reason=None,
                 structured_output_mode=mode,
+                requested_structured_output_mode=requested_mode,
                 schema_enforced=False,
                 error=f"unsupported_structured_output_mode:{mode}",
+                primary_error=f"unsupported_structured_output_mode:{mode}",
             )
-        schema_enforced = mode == "json_schema"
         started = time.monotonic()
         try:
-            payload: dict[str, object] = {
-                "model": self.resolve_model(),
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": json.dumps(input_payload, ensure_ascii=False),
-                    },
-                ],
-                "temperature": self.settings.llm_temperature,
-                "stream": False,
-            }
-            schema_name = (
-                re.sub(r"[^a-zA-Z0-9_-]", "_", stage)[:64]
-                or "structured_response"
-            )
-            if mode in {"json_schema", "json_schema_no_strict"}:
-                json_schema: dict[str, object] = {
-                    "name": schema_name,
-                    "schema": (
-                        _strict_transport_schema(response_schema)
-                        if mode == "json_schema"
-                        else response_schema
-                    ),
-                }
-                if mode == "json_schema":
-                    json_schema["strict"] = True
-                payload["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": json_schema,
-                }
-            elif mode == "json_object":
-                payload["response_format"] = {"type": "json_object"}
-            if self.settings.llm_max_tokens > 0:
-                payload["max_tokens"] = self.settings.llm_max_tokens
+            if mode == "qwen_completion":
+                payload = self._qwen_completion_payload(
+                    stage=stage,
+                    system_prompt=system_prompt,
+                    input_payload=input_payload,
+                    response_schema=response_schema,
+                )
+                endpoint = "completions"
+            else:
+                payload = self._structured_payload(
+                    stage=stage,
+                    system_prompt=system_prompt,
+                    input_payload=input_payload,
+                    response_schema=response_schema,
+                    mode=mode,
+                )
+                endpoint = "chat/completions"
             request = urllib.request.Request(
-                f"{self.settings.llm_base_url}/chat/completions",
+                f"{self.settings.llm_base_url}/{endpoint}",
                 data=json.dumps(payload).encode("utf-8"),
                 headers=self._headers(),
                 method="POST",
@@ -284,25 +277,43 @@ class OpenAICompatibleLLM:
             if not choices:
                 raise RuntimeError("LLM response has no choices")
             choice = choices[0]
-            message = choice.get("message") or {}
-            content = str(message.get("content") or "").strip()
-            parsed = message.get("parsed")
-            if not isinstance(parsed, dict):
+            if mode == "qwen_completion":
+                content = str(choice.get("text") or "").strip()
                 parsed = None
-            error = None
-            if not content and parsed is None:
-                error = (
-                    "reasoning_content_without_content"
-                    if str(message.get("reasoning_content") or "").strip()
-                    else "empty_content"
+                reasoning_present = False
+            else:
+                message = choice.get("message") or {}
+                content = str(message.get("content") or "").strip()
+                parsed = message.get("parsed")
+                if not isinstance(parsed, dict):
+                    parsed = None
+                reasoning_present = bool(
+                    str(message.get("reasoning_content") or "").strip()
                 )
+            finish_reason = str(choice.get("finish_reason") or "") or None
+            parsed, error, validation_errors = self._parse_structured_message(
+                content=content,
+                parsed=parsed,
+                response_schema=response_schema,
+                finish_reason=finish_reason,
+                reasoning_present=reasoning_present,
+            )
+            if not content and parsed is None:
+                content = ""
             return StructuredLLMResponse(
                 parsed=parsed,
                 content=content,
-                finish_reason=str(choice.get("finish_reason") or "") or None,
+                finish_reason=finish_reason,
                 structured_output_mode=mode,
-                schema_enforced=schema_enforced,
+                requested_structured_output_mode=requested_mode,
+                schema_enforced=False,
+                schema_enforcement_requested=mode
+                in {"json_schema", "json_schema_no_strict", "qwen_completion"},
+                server_profile_accepted=True,
+                local_schema_valid=parsed is not None and not validation_errors and error is None,
                 error=error,
+                primary_error=error,
+                validation_errors=validation_errors,
                 latency_ms=(time.monotonic() - started) * 1000,
             )
         except Exception as exc:
@@ -311,10 +322,234 @@ class OpenAICompatibleLLM:
                 content="",
                 finish_reason=None,
                 structured_output_mode=mode,
-                schema_enforced=schema_enforced,
+                requested_structured_output_mode=requested_mode,
+                schema_enforced=False,
+                schema_enforcement_requested=mode
+                in {"json_schema", "json_schema_no_strict", "qwen_completion"},
+                server_profile_accepted=False,
                 error=f"transport_error:{type(exc).__name__}",
+                primary_error=f"transport_error:{type(exc).__name__}",
                 latency_ms=(time.monotonic() - started) * 1000,
             )
+
+    def _resolve_ata_structured_profile(self, requested_mode: str) -> str:
+        requested = (requested_mode or "auto").strip()
+        if requested != "auto":
+            return requested
+        if self._ata_structured_profile:
+            return self._ata_structured_profile
+        self._ata_structured_profile = self._probe_ata_structured_profile()
+        return self._ata_structured_profile
+
+    def _probe_ata_structured_profile(self) -> str:
+        schema: dict[str, object] = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["ok", "value"],
+            "properties": {
+                "ok": {"type": "boolean"},
+                "value": {"type": "string"},
+            },
+        }
+        input_payload: dict[str, object] = {
+            "task": "Return ok=true and value='probe'.",
+        }
+        for mode in (
+            "json_schema",
+            "json_schema_no_strict",
+            "json_object",
+            "qwen_completion",
+            "prompt_only",
+        ):
+            try:
+                if mode == "qwen_completion":
+                    payload = self._qwen_completion_payload(
+                        stage="ata_structured_capability_probe",
+                        system_prompt="Return one JSON object only. No markdown.",
+                        input_payload=input_payload,
+                        response_schema=schema,
+                    )
+                    endpoint = "completions"
+                else:
+                    payload = self._structured_payload(
+                        stage="ata_structured_capability_probe",
+                        system_prompt="Return one JSON object only. No markdown.",
+                        input_payload=input_payload,
+                        response_schema=schema,
+                        mode=mode,
+                    )
+                    endpoint = "chat/completions"
+                request = urllib.request.Request(
+                    f"{self.settings.llm_base_url}/{endpoint}",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=self._headers(),
+                    method="POST",
+                )
+                with urllib.request.urlopen(
+                    request,
+                    timeout=min(20, self.settings.llm_timeout_seconds),
+                ) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                choices = body.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if mode == "qwen_completion":
+                    content = str(choice.get("text") or "").strip()
+                    parsed = None
+                    reasoning_present = False
+                else:
+                    message = choice.get("message") or {}
+                    content = str(message.get("content") or "").strip()
+                    parsed = message.get("parsed")
+                    parsed = parsed if isinstance(parsed, dict) else None
+                    reasoning_present = bool(
+                        str(message.get("reasoning_content") or "").strip()
+                    )
+                parsed, error, validation_errors = self._parse_structured_message(
+                    content=content,
+                    parsed=parsed,
+                    response_schema=schema,
+                    finish_reason=str(choice.get("finish_reason") or "") or None,
+                    reasoning_present=reasoning_present,
+                )
+                if parsed is not None and error is None and not validation_errors:
+                    return mode
+            except Exception:
+                continue
+        return "unsupported:auto_probe_failed"
+
+    def _structured_payload(
+        self,
+        *,
+        stage: str,
+        system_prompt: str,
+        input_payload: dict[str, object],
+        response_schema: dict[str, object],
+        mode: str,
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "model": self.resolve_model(),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        (
+                            {
+                                "input": input_payload,
+                                "response_schema": response_schema,
+                                "instruction": "Return only one JSON object that validates against response_schema.",
+                            }
+                            if mode == "prompt_only"
+                            else input_payload
+                        ),
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "temperature": self.settings.llm_temperature,
+            "stream": False,
+        }
+        if self.settings.llm_max_tokens > 0:
+            payload["max_tokens"] = self.settings.llm_max_tokens
+        schema_name = (
+            re.sub(r"[^a-zA-Z0-9_-]", "_", stage)[:64]
+            or "structured_response"
+        )
+        if mode in {"json_schema", "json_schema_no_strict"}:
+            json_schema: dict[str, object] = {
+                "name": schema_name,
+                "schema": (
+                    _strict_transport_schema(response_schema)
+                    if mode == "json_schema"
+                    else response_schema
+                ),
+            }
+            if mode == "json_schema":
+                json_schema["strict"] = True
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": json_schema,
+            }
+        elif mode == "json_object":
+            payload["response_format"] = {"type": "json_object"}
+        elif mode == "prompt_only":
+            payload["response_format"] = {"type": "text"}
+        return payload
+
+    def _qwen_completion_payload(
+        self,
+        *,
+        stage: str,
+        system_prompt: str,
+        input_payload: dict[str, object],
+        response_schema: dict[str, object],
+    ) -> dict[str, object]:
+        user_contract = json.dumps(
+            {
+                "input": input_payload,
+                "instruction": (
+                    "Return only one JSON object matching the server-provided "
+                    "JSON schema."
+                ),
+            },
+            ensure_ascii=False,
+        ).replace("<|", "\\u003c|")
+        safe_system = system_prompt.replace("<|", "\\u003c|")
+        prompt = (
+            f"<|im_start|>system\n{safe_system}<|im_end|>\n"
+            f"<|im_start|>user\n{user_contract}<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+        payload: dict[str, object] = {
+            "model": self.resolve_model(),
+            "prompt": prompt,
+            "temperature": self.settings.llm_temperature,
+            "stream": False,
+            "stop": ["<|im_end|>"],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": (
+                        re.sub(r"[^a-zA-Z0-9_-]", "_", stage)[:64]
+                        or "structured_response"
+                    ),
+                    "strict": True,
+                    "schema": _strict_transport_schema(response_schema),
+                },
+            },
+        }
+        if self.settings.llm_max_tokens > 0:
+            payload["max_tokens"] = self.settings.llm_max_tokens
+        return payload
+
+    @staticmethod
+    def _parse_structured_message(
+        *,
+        content: str,
+        parsed: dict[str, object] | None,
+        response_schema: dict[str, object],
+        finish_reason: str | None,
+        reasoning_present: bool,
+    ) -> tuple[dict[str, object] | None, str | None, list[str]]:
+        if finish_reason == "length":
+            return None, "truncated_response", []
+        value = parsed
+        if value is None:
+            if not content.strip():
+                return (
+                    None,
+                    "reasoning_content_without_content" if reasoning_present else "empty_content",
+                    [],
+                )
+            try:
+                value = _parse_json_object_content(content)
+            except ValueError as exc:
+                return None, str(exc), []
+        value = _drop_optional_nulls(value, response_schema)
+        errors = _schema_errors(value, response_schema, "response")
+        return value, "schema_validation_failed" if errors else None, errors
 
     def health(self) -> dict[str, Any]:
         try:
@@ -322,3 +557,126 @@ class OpenAICompatibleLLM:
             return {"ok": True, "model": model, "provider": self.settings.llm_provider, "base_url": self.settings.llm_base_url}
         except Exception as exc:
             return {"ok": False, "error": repr(exc), "provider": self.settings.llm_provider, "base_url": self.settings.llm_base_url}
+
+
+def _parse_json_object_content(content: str) -> dict[str, object]:
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        fenced = re.fullmatch(
+            r"```(?:json)?\s*(.*?)\s*```",
+            stripped,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if fenced is None:
+            raise ValueError("invalid_fenced_json")
+        stripped = fenced.group(1).strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        raise ValueError("json_parse_error") from None
+    if not isinstance(value, dict):
+        raise ValueError("llm_response_not_object")
+    return value
+
+
+def _schema_errors(value: dict[str, object], schema: dict[str, object], label: str) -> list[str]:
+    errors: list[str] = []
+    _validate_schema_value(value, schema, label, errors)
+    return errors
+
+
+def _drop_optional_nulls(
+    value: object,
+    schema: dict[str, object],
+) -> object:
+    if isinstance(value, dict):
+        required = {
+            str(item)
+            for item in schema.get("required", [])
+            if isinstance(item, str)
+        }
+        properties = (
+            schema.get("properties")
+            if isinstance(schema.get("properties"), dict)
+            else {}
+        )
+        return {
+            key: _drop_optional_nulls(
+                item,
+                properties.get(key)
+                if isinstance(properties.get(key), dict)
+                else {},
+            )
+            for key, item in value.items()
+            if item is not None or key in required
+        }
+    if isinstance(value, list):
+        item_schema = (
+            schema.get("items")
+            if isinstance(schema.get("items"), dict)
+            else {}
+        )
+        return [
+            _drop_optional_nulls(item, item_schema)
+            for item in value
+        ]
+    return value
+
+
+def _validate_schema_value(
+    value: object,
+    schema: dict[str, object],
+    path: str,
+    errors: list[str],
+) -> None:
+    expected = schema.get("type")
+    if expected and not _matches_schema_type(value, expected):
+        errors.append(f"schema_type_error:{path}:{expected}")
+        return
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        errors.append(f"schema_enum_error:{path}")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            errors.append(f"schema_minimum_error:{path}")
+        if isinstance(maximum, (int, float)) and value > maximum:
+            errors.append(f"schema_maximum_error:{path}")
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            for key in required:
+                if key not in value:
+                    errors.append(f"schema_missing_required:{path}:{key}")
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            if schema.get("additionalProperties") is False:
+                for key in value:
+                    if key not in properties:
+                        errors.append(f"schema_additional_property:{path}:{key}")
+            for key, definition in properties.items():
+                if key in value and isinstance(definition, dict):
+                    _validate_schema_value(value[key], definition, f"{path}:{key}", errors)
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            errors.append(f"schema_min_items_error:{path}")
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                _validate_schema_value(item, item_schema, f"{path}:{index}", errors)
+
+
+def _matches_schema_type(value: object, expected: object) -> bool:
+    if isinstance(expected, list):
+        return any(_matches_schema_type(value, item) for item in expected)
+    return {
+        "object": lambda: isinstance(value, dict),
+        "array": lambda: isinstance(value, list),
+        "string": lambda: isinstance(value, str),
+        "number": lambda: isinstance(value, (int, float)) and not isinstance(value, bool),
+        "integer": lambda: isinstance(value, int) and not isinstance(value, bool),
+        "boolean": lambda: isinstance(value, bool),
+        "null": lambda: value is None,
+    }.get(str(expected), lambda: True)()

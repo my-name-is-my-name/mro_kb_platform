@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from core.ata_impact.certificate_validator import validate_certificate
+from core.ata_impact.certificate_validator import (
+    assess_certificate,
+    validate_certificate,
+)
 from core.ata_impact.evidence import (
     EvidenceSearchResult,
     LegacyEvidenceRetrieverAdapter,
@@ -17,13 +22,16 @@ from core.ata_impact.prompts import (
     ATA_CRITIC_PROMPT,
     ATA_JSON_REPAIR_PROMPT,
 )
+from core.ata_impact.reference_catalog import AtaClassificationReferenceCatalog
 from core.ata_impact.service import AtaImpactService
 from core.ata_impact.schemas import (
+    ATA_CRITIC_GENERATION_SCHEMA,
     ATA_CRITIC_SCHEMA,
+    ATA_MAPPING_GENERATION_SCHEMA,
     ATA_MAPPING_SCHEMA,
     ENGINEERING_FACTS_SCHEMA,
 )
-from core.ata_impact.validator import validate_mapping
+from core.ata_impact.validator import validate_facts, validate_mapping
 from core.go_no_go import AtaImpactAgent, CertificateCatalog, CertificateEntry
 from core.runtime_clients import (
     OpenAICompatibleLLM,
@@ -68,9 +76,306 @@ class _HttpResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+def _valid_probe_response() -> _HttpResponse:
+    return _HttpResponse(
+        {
+            "choices": [
+                {
+                    "message": {"content": '{"ok": true, "value": "probe"}'},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+    )
+
+
 class AtaImpactSafetyRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.certificate = CertificateCatalog()
+
+    def test_gost_civil_reference_catalog_is_complete_and_retrievable(self) -> None:
+        catalog = AtaClassificationReferenceCatalog()
+        self.assertTrue(catalog.available)
+        self.assertGreaterEqual(len(catalog.entries), 490)
+        context = catalog.context(
+            "Коррозия балки пола фюзеляжа между шпангоутами",
+            {
+                "structural_elements": [
+                    {"id": "structure_1", "name": "балка пола фюзеляжа"}
+                ]
+            },
+        )
+        chapters = {
+            item["ata"]: item["title"]
+            for item in context["chapter_index"]  # type: ignore[union-attr]
+        }
+        self.assertIn("ATA 53", chapters)
+        self.assertIn(
+            "ATA 53",
+            {
+                item["parent_ata"]
+                for item in context["relevant_definitions"]  # type: ignore[union-attr]
+            },
+        )
+        self.assertTrue(catalog.reference_ids_for_ata("ATA 34-10"))
+        self.assertTrue(catalog.reference_ids_for_ata("ATA 53"))
+
+    def test_gost_role_policy_blocks_procedure_as_affected_object(
+        self,
+    ) -> None:
+        catalog = AtaClassificationReferenceCatalog()
+        mapping = empty_mapping()
+        mapping["object_ata"] = [
+            {"ata": "ATA 51", "candidate_id": "candidate:object"}
+        ]
+        mapping["structural_ata"] = [
+            {"ata": "ATA 57", "candidate_id": "candidate:structure"}
+        ]
+        warnings = catalog.enforce_mapping_roles(mapping)
+        self.assertEqual(mapping["object_ata"], [])
+        self.assertEqual(
+            [item["ata"] for item in mapping["structural_ata"]],
+            ["ATA 57"],
+        )
+        self.assertTrue(
+            any(
+                warning.startswith("mapping_role_candidate_removed:")
+                for warning in warnings
+            )
+        )
+        wing = next(
+            entry
+            for entry in catalog.entries
+            if entry.ata == "ATA 57"
+            and entry.ata == entry.parent_ata
+        )
+        self.assertEqual(
+            wing.as_dict()["allowed_mapping_categories"],
+            [
+                "object_ata",
+                "structural_ata",
+                "location_context_ata",
+                "interface_ata_hypotheses",
+            ],
+        )
+
+    def test_exact_cross_role_duplicate_preserves_structural_damage(self) -> None:
+        payload = facts()
+        payload["physical_objects"][0]["name"] = "upper panel central fuel tank"  # type: ignore[index]
+        payload["structural_elements"][0]["name"] = "central fuel tank upper panel"  # type: ignore[index]
+        validated, warnings = validate_facts(
+            payload,
+            {
+                "aircraft_type_raw": None,
+                "msn": None,
+            },
+        )
+        structure = validated["structural_elements"][0]  # type: ignore[index]
+        self.assertTrue(structure["damage_confirmed"])
+        self.assertEqual(structure["involvement"], "damaged")
+        self.assertIn(
+            "structure_1",
+            {
+                item["affected_entity_id"]
+                for item in validated["damage"]  # type: ignore[union-attr]
+            },
+        )
+        self.assertTrue(
+            any(
+                warning.startswith(
+                    "facts_cross_role_duplicate_reconciled:"
+                )
+                for warning in warnings
+            )
+        )
+
+    def test_generic_central_tank_corrosion_does_not_create_ata_51_procedure(self) -> None:
+        engineering_facts = facts(structure_damage=True)
+        mapping = combined_mapping("ATA 25", structure_affected=True, interface_ata=None)["ata_mapping"]
+        mapping["structural_ata"] = [
+            {
+                "ata": "ATA 57",
+                "confidence": 0.93,
+                "reason": "damaged central wing tank panel is actual wing structure",
+                "entity_id": "structure_1",
+            }
+        ]
+        mapping["procedure_ata_hypotheses"] = [
+            {
+                "ata": "ATA 51",
+                "confidence": 0.7,
+                "reason": "generic corrosion procedure",
+                "entity_id": "structure_1",
+                "source_fragment": "corrosion on upper panel central fuel tank",
+            }
+        ]
+        validated, warnings = validate_mapping(
+            mapping,
+            engineering_facts,
+            [],
+            (
+                "На ВС в ходе инспекции была обнаружена коррозия на верхней панели "
+                "центрального топливного бака между балкой Y1292 и нервюрой Rib1"
+            ),
+        )
+        self.assertEqual(validated["structural_ata"][0]["ata"], "ATA 57")
+        self.assertEqual(validated["procedure_ata_hypotheses"], [])
+        self.assertTrue(
+            any(
+                "procedure_without_factual_anchor:ATA 51" in warning
+                for warning in warnings
+            )
+        )
+
+    def test_missing_structural_mapping_is_filled_from_gost_shortlist(self) -> None:
+        engineering_facts = facts(structure_damage=True)
+        engineering_facts["physical_objects"][0]["name"] = "upper panel central fuel tank"  # type: ignore[index]
+        engineering_facts["structural_elements"][0]["name"] = "upper panel central fuel tank"  # type: ignore[index]
+        engineering_facts["damage"] = [  # type: ignore[index]
+            {"type": "corrosion", "affected_entity_id": "structure_1"}
+        ]
+        mapping = combined_mapping("ATA 25", structure_affected=False, interface_ata=None)["ata_mapping"]
+        mapping["object_ata"] = []
+        mapping["location_context_ata"] = []
+
+        class StructuredSequence:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def structured_chat(self, **kwargs: object) -> StructuredLLMResponse:
+                payload = dict(kwargs)
+                self.calls.append(payload)
+                stage = str(payload["stage"])
+                if stage == "engineering_fact_extraction":
+                    return StructuredLLMResponse(
+                        parsed=engineering_facts,
+                        content="",
+                        finish_reason="stop",
+                        structured_output_mode="json_schema",
+                        schema_enforced=True,
+                    )
+                if stage == "ata_mapping":
+                    return StructuredLLMResponse(
+                        parsed=mapping,
+                        content="",
+                        finish_reason="stop",
+                        structured_output_mode="json_schema",
+                        schema_enforced=True,
+                    )
+                critic_mapping = payload["input_payload"]["ata_mapping"]  # type: ignore[index]
+                actions = []
+                for category, items in critic_mapping.items():  # type: ignore[union-attr]
+                    if category == "user_declared_ata":
+                        continue
+                    for item in items:
+                        actions.append(
+                            {
+                                "candidate_id": item["candidate_id"],
+                                "action": "confirm",
+                                "reason": "confirmed",
+                            }
+                        )
+                return StructuredLLMResponse(
+                    parsed={"actions": actions},
+                    content="",
+                    finish_reason="stop",
+                    structured_output_mode="json_schema",
+                    schema_enforced=True,
+                )
+
+        llm = StructuredSequence()
+        result = AtaImpactService(
+            self.certificate,
+            llm,  # type: ignore[arg-type]
+            FixedRetriever([]),
+        ).analyze(
+            (
+                "На ВС в ходе инспекции была обнаружена коррозия на верхней панели "
+                "центрального топливного бака между балкой Y1292 и нервюрой Rib1"
+            ),
+            runtime_mode="standard",
+        )
+        self.assertEqual(result["affected_ata"], ["ATA 57"])
+        self.assertIn(
+            "reference_shortlist_candidate_added:structural_ata:structure_1:ATA 57",
+            result["warnings"],
+        )
+
+    def test_damaged_object_requires_explicit_role_for_structural_mapping(
+        self,
+    ) -> None:
+        engineering_facts = facts()
+        candidate = {
+            "ata": "ATA 57",
+            "entity_id": "object_1",
+            "technical_role": "actual_structure",
+            "confidence": 0.9,
+            "reason": "Reference excludes this damaged construction from its functional ATA.",
+        }
+        raw = empty_mapping()
+        raw["structural_ata"] = [candidate]
+        accepted, warnings = validate_mapping(
+            raw,
+            engineering_facts,
+            [],
+        )
+        self.assertEqual(
+            accepted["structural_ata"][0]["entity_id"],
+            "object_1",
+        )
+        self.assertFalse(
+            any(
+                warning.startswith(
+                    "structural_ata_without_involvement:"
+                )
+                for warning in warnings
+            )
+        )
+
+        without_role = empty_mapping()
+        without_role["structural_ata"] = [
+            {key: value for key, value in candidate.items() if key != "technical_role"}
+        ]
+        rejected, warnings = validate_mapping(
+            without_role,
+            engineering_facts,
+            [],
+        )
+        self.assertEqual(rejected["structural_ata"], [])
+        self.assertTrue(
+            any(
+                warning.startswith(
+                    "structural_ata_without_involvement:"
+                )
+                for warning in warnings
+            )
+        )
+
+    def test_missing_classification_reference_prevents_affected_confirmation(
+        self,
+    ) -> None:
+        mapping = combined_mapping("ATA 25", interface_ata=None)["ata_mapping"]
+        missing_catalog = AtaClassificationReferenceCatalog(
+            Path("/tmp/mro-kb-missing-gost-reference.json")
+        )
+        result = AtaImpactService(
+            self.certificate,
+            SequenceLLM(facts(), mapping, confirm_actions(mapping)),
+            FixedRetriever([]),
+            reference_catalog=missing_catalog,
+        ).analyze("A320 damaged cargo equipment")
+        self.assertEqual(result["affected_ata"], [])
+        self.assertEqual(result["decision"], "engineering_review_required")
+        self.assertEqual(
+            result["classification_reference"]["status"],  # type: ignore[index]
+            "unavailable",
+        )
+        self.assertTrue(
+            any(
+                str(item).startswith("classification_reference_")
+                for item in result["warnings"]
+            )
+        )
 
     def run_pipeline(
         self,
@@ -122,12 +427,39 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             [call["response_schema"] for call in llm.calls],
-            [ENGINEERING_FACTS_SCHEMA, ATA_MAPPING_SCHEMA, ATA_CRITIC_SCHEMA],
+            [
+                ENGINEERING_FACTS_SCHEMA,
+                ATA_MAPPING_GENERATION_SCHEMA,
+                ATA_CRITIC_GENERATION_SCHEMA,
+            ],
         )
         self.assertNotIn("certificate_catalog", llm.calls[1]["input_payload"])
         self.assertNotIn("candidate_id", mapping["object_ata"][0])
         critic_mapping = llm.calls[2]["input_payload"]["ata_mapping"]  # type: ignore[index]
+        self.assertNotIn(
+            "certificate_catalog_reference",
+            llm.calls[2]["input_payload"],  # type: ignore[operator]
+        )
+        self.assertTrue(llm.calls[1]["input_payload"]["ata_reference"])  # type: ignore[index]
+        self.assertTrue(llm.calls[2]["input_payload"]["ata_reference"])  # type: ignore[index]
         self.assertIn("candidate_id", critic_mapping["object_ata"][0])  # type: ignore[index]
+        self.assertTrue(
+            critic_mapping["object_ata"][0]["classification_reference_ids"]  # type: ignore[index]
+        )
+        required_ids = llm.calls[2]["input_payload"]["required_candidate_ids"]  # type: ignore[index]
+        self.assertEqual(
+            len(required_ids),  # type: ignore[arg-type]
+            llm.calls[2]["input_payload"]["required_candidate_count"],  # type: ignore[index]
+        )
+        self.assertEqual(
+            set(required_ids),  # type: ignore[arg-type]
+            {
+                item["candidate_id"]
+                for category, items in critic_mapping.items()  # type: ignore[union-attr]
+                if category != "user_declared_ata"
+                for item in items
+            },
+        )
         for step in result["agent_trace"][1:]:
             if step["step"] in {
                 "engineering_fact_extraction",
@@ -177,8 +509,16 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
                 "independent_critic",
             ],
         )
-        self.assertEqual(llm.calls[2]["response_schema"], ATA_MAPPING_SCHEMA)
-        self.assertEqual(result["agent_trace"][2]["repair"], "completed")
+        self.assertEqual(
+            llm.calls[2]["response_schema"],
+            ATA_MAPPING_GENERATION_SCHEMA,
+        )
+        mapping_trace = next(
+            item
+            for item in result["agent_trace"]
+            if item["step"] == "ata_mapping"
+        )
+        self.assertEqual(mapping_trace["repair"], "completed")
 
     def test_openai_transport_profiles_and_generic_chat_isolation(self) -> None:
         captured: list[dict[str, object]] = []
@@ -189,7 +529,7 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
                 {
                     "choices": [
                         {
-                            "message": {"content": "{}"},
+                            "message": {"content": json.dumps(empty_mapping())},
                             "finish_reason": "stop",
                         }
                     ]
@@ -229,7 +569,13 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
                     schema_contract.get("strict"),
                     True if strict_expected else None,
                 )
-                self.assertEqual(response.schema_enforced, strict_expected)
+                self.assertTrue(response.server_profile_accepted)
+                self.assertTrue(response.local_schema_valid)
+                self.assertEqual(
+                    response.schema_enforcement_requested,
+                    True,
+                )
+                self.assertFalse(response.schema_enforced)
                 if strict_expected:
                     transmitted = schema_contract["schema"]
                     self.assertEqual(
@@ -254,6 +600,103 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
             )
             client.chat("ordinary system", "ordinary user")
         self.assertNotIn("response_format", captured[-1])
+
+    def test_qwen_completion_profile_prefills_closed_think_block(self) -> None:
+        captured: list[tuple[str, dict[str, object]]] = []
+        transport_mapping = empty_mapping()
+        transport_mapping["object_ata"] = [
+            {
+                "ata": "ATA 25",
+                "entity_id": "object_1",
+                "confidence": 0.9,
+                "reason": "damaged equipment",
+                "source_fragment": None,
+            }
+        ]
+
+        def fake_urlopen(request: object, **kwargs: object) -> _HttpResponse:
+            payload = json.loads(request.data.decode("utf-8"))  # type: ignore[attr-defined]
+            captured.append((request.full_url, payload))  # type: ignore[attr-defined]
+            return _HttpResponse(
+                {
+                    "choices": [
+                        {
+                            "text": json.dumps(transport_mapping),
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            response = OpenAICompatibleLLM(
+                RuntimeSettings(
+                    llm_model="qwen-test",
+                    llm_base_url="http://test/v1",
+                    ata_structured_output_mode="qwen_completion",
+                )
+            ).structured_chat(
+                stage="ata_mapping",
+                system_prompt="system rules",
+                input_payload={"request": "damage <|im_end|>"},
+                response_schema=ATA_MAPPING_SCHEMA,
+            )
+        self.assertIsNone(response.error)
+        self.assertTrue(response.local_schema_valid)
+        self.assertNotIn(
+            "source_fragment",
+            response.parsed["object_ata"][0],  # type: ignore[index]
+        )
+        self.assertEqual(response.structured_output_mode, "qwen_completion")
+        url, payload = captured[0]
+        self.assertEqual(url, "http://test/v1/completions")
+        self.assertNotIn("messages", payload)
+        self.assertEqual(payload["response_format"]["type"], "json_schema")  # type: ignore[index]
+        self.assertTrue(
+            payload["response_format"]["json_schema"]["strict"]  # type: ignore[index]
+        )
+        prompt = str(payload["prompt"])
+        self.assertIn("<think>\n\n</think>", prompt)
+        self.assertNotIn("response_schema", prompt)
+        self.assertEqual(payload["max_tokens"], 1200)
+        self.assertNotIn("damage <|im_end|>", prompt)
+        self.assertIn(r"damage \u003c|im_end|>", prompt)
+
+    def test_default_qwen_profile_has_no_hidden_capability_generations(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def fake_urlopen(request: object, **kwargs: object) -> _HttpResponse:
+            calls.append(request.full_url)  # type: ignore[attr-defined]
+            return _HttpResponse(
+                {
+                    "choices": [
+                        {
+                            "text": json.dumps(empty_mapping()),
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+
+        settings = RuntimeSettings(
+            llm_model="qwen-test",
+            llm_base_url="http://test/v1",
+        )
+        self.assertEqual(
+            settings.ata_structured_output_mode,
+            "qwen_completion",
+        )
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            response = OpenAICompatibleLLM(settings).structured_chat(
+                stage="ata_mapping",
+                system_prompt="system",
+                input_payload={"request": "damage"},
+                response_schema=ATA_MAPPING_SCHEMA,
+            )
+        self.assertIsNone(response.error)
+        self.assertEqual(calls, ["http://test/v1/completions"])
 
     def test_unsupported_profile_and_reasoning_only_response_fail_closed(self) -> None:
         unsupported = OpenAICompatibleLLM(
@@ -293,6 +736,7 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
                 RuntimeSettings(
                     llm_model="test-model",
                     llm_base_url="http://test/v1",
+                    ata_structured_output_mode="json_schema",
                 )
             ).structured_chat(
                 stage="ata_mapping",
@@ -303,6 +747,211 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
         self.assertEqual(response.error, "reasoning_content_without_content")
         self.assertEqual(response.content, "")
 
+    def test_auto_probe_selects_cached_qwen_completion_after_reasoning_only_schema(self) -> None:
+        captured: list[dict[str, object]] = []
+        business_mapping = json.dumps(empty_mapping())
+
+        def fake_urlopen(request: object, **kwargs: object) -> _HttpResponse:
+            payload = json.loads(request.data.decode("utf-8"))  # type: ignore[attr-defined]
+            captured.append(payload)
+            response_format = payload.get("response_format")
+            if "prompt" in payload:
+                return _HttpResponse(
+                    {
+                        "choices": [
+                            {
+                                "text": (
+                                    business_mapping
+                                    if "system rules" in str(payload["prompt"])
+                                    else '{"ok": true, "value": "probe"}'
+                                ),
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                )
+            if response_format and response_format.get("type") == "json_schema":
+                return _HttpResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "",
+                                    "reasoning_content": '{"ok": true, "value": "probe"}',
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                )
+            if response_format and response_format.get("type") == "json_object":
+                raise urllib.error.HTTPError(
+                    "http://test/v1/chat/completions",
+                    400,
+                    "unsupported",
+                    {},
+                    None,
+                )
+            if payload["messages"][0]["content"] == "system rules":
+                return _HttpResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {"content": business_mapping},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                )
+            return _valid_probe_response()
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            client = OpenAICompatibleLLM(
+                RuntimeSettings(
+                    llm_model="test-model",
+                    llm_base_url="http://test/v1",
+                    ata_structured_output_mode="auto",
+                )
+            )
+            first = client.structured_chat(
+                stage="ata_mapping",
+                system_prompt="system rules",
+                input_payload={"request": "damage"},
+                response_schema=ATA_MAPPING_SCHEMA,
+            )
+            second = client.structured_chat(
+                stage="ata_mapping",
+                system_prompt="system rules",
+                input_payload={"request": "damage"},
+                response_schema=ATA_MAPPING_SCHEMA,
+            )
+        self.assertIsNone(first.error)
+        self.assertIsNone(second.error)
+        self.assertEqual(first.structured_output_mode, "qwen_completion")
+        self.assertEqual(second.structured_output_mode, "qwen_completion")
+        self.assertEqual(first.requested_structured_output_mode, "auto")
+        self.assertTrue(first.schema_enforcement_requested)
+        self.assertTrue(first.server_profile_accepted)
+        self.assertTrue(first.local_schema_valid)
+        probe_calls = [
+            payload
+            for payload in captured
+            if (
+                "system rules" not in str(payload.get("prompt") or "")
+                and (
+                    "messages" not in payload
+                    or payload["messages"][0]["content"] != "system rules"  # type: ignore[index]
+                )
+            )
+        ]
+        self.assertEqual(len(probe_calls), 4)
+
+    def test_parsed_json_success_and_trace_error_fields_are_explicit(self) -> None:
+        parsed_response = _HttpResponse(
+            {
+                "choices": [
+                    {
+                        "message": {"parsed": empty_mapping(), "content": ""},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+        with patch("urllib.request.urlopen", return_value=parsed_response):
+            response = OpenAICompatibleLLM(
+                RuntimeSettings(
+                    llm_model="test-model",
+                    llm_base_url="http://test/v1",
+                    ata_structured_output_mode="json_schema",
+                )
+            ).structured_chat(
+                stage="ata_mapping",
+                system_prompt="system",
+                input_payload={},
+                response_schema=ATA_MAPPING_SCHEMA,
+            )
+        self.assertIsNone(response.error)
+        self.assertTrue(response.local_schema_valid)
+        self.assertEqual(response.parsed, empty_mapping())
+
+        class BrokenThenBrokenRepair:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def structured_chat(self, **kwargs: object) -> StructuredLLMResponse:
+                self.calls.append(str(kwargs["stage"]))
+                if kwargs["stage"] == "engineering_fact_extraction":
+                    return StructuredLLMResponse(
+                        parsed=None,
+                        content="",
+                        finish_reason="stop",
+                        structured_output_mode="prompt_only",
+                        schema_enforced=False,
+                        server_profile_accepted=True,
+                        error="reasoning_content_without_content",
+                        primary_error="reasoning_content_without_content",
+                    )
+                return StructuredLLMResponse(
+                    parsed=None,
+                    content="",
+                    finish_reason="stop",
+                    structured_output_mode="prompt_only",
+                    schema_enforced=False,
+                    repair_attempted=False,
+                    server_profile_accepted=True,
+                    error="empty_content",
+                    primary_error="empty_content",
+                )
+
+        result = AtaImpactService(
+            self.certificate,
+            BrokenThenBrokenRepair(),  # type: ignore[arg-type]
+        ).analyze("A320 unclear request")
+        step = result["agent_trace"][1]
+        self.assertEqual(step["primary_error"], "reasoning_content_without_content")
+        self.assertEqual(step["repair_error"], "empty_content")
+        self.assertEqual(step["repair"], "repair_failed")
+
+    def test_unknown_event_null_fields_are_schema_valid_without_repair(self) -> None:
+        mapping = combined_mapping("ATA 25", interface_ata=None)["ata_mapping"]
+        unknown_facts = facts()
+        unknown_facts["event"] = {
+            "type": None,
+            "maintenance_action": None,
+            "target_entity_ids": [],
+        }
+
+        class StructuredSequence:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.responses = [
+                    unknown_facts,
+                    mapping,
+                    confirm_actions(mapping),
+                ]
+
+            def structured_chat(self, **kwargs: object) -> StructuredLLMResponse:
+                self.calls.append(str(kwargs["stage"]))
+                return StructuredLLMResponse(
+                    parsed=self.responses.pop(0),
+                    content="",
+                    finish_reason="stop",
+                    structured_output_mode="prompt_only",
+                    schema_enforced=False,
+                    server_profile_accepted=True,
+                    local_schema_valid=True,
+                )
+
+        llm = StructuredSequence()
+        result = AtaImpactService(
+            self.certificate,
+            llm,  # type: ignore[arg-type]
+            FixedRetriever([]),
+        ).analyze("A320 item mentioned near cargo bay", runtime_mode="standard")
+        self.assertNotIn("json_repair", llm.calls)
+        self.assertIsNone(result["engineering_facts"]["event"]["type"])
+        self.assertIsNone(result["engineering_facts"]["event"]["maintenance_action"])
+
     def test_standard_and_auto_always_use_independent_critic(self) -> None:
         for mode in ("standard", "auto"):
             mapping = combined_mapping("ATA 25", interface_ata=None)["ata_mapping"]
@@ -310,14 +959,22 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
             self.assertGreaterEqual(len(llm.calls), 3)
             self.assertEqual(llm.calls[2][0], ATA_CRITIC_PROMPT)
             self.assertFalse(any("self-audit the mapping" in call[0] for call in llm.calls))
-            self.assertEqual(
-                [item["step"] for item in result["agent_trace"][1:5]],
-                [
-                    "engineering_fact_extraction",
-                    "ata_mapping",
-                    "certificate_scope_validation",
-                    "independent_critic",
-                ],
+            stages = [item["step"] for item in result["agent_trace"]]
+            self.assertLess(
+                stages.index("engineering_fact_extraction"),
+                stages.index("ata_classification_reference_retrieval"),
+            )
+            self.assertLess(
+                stages.index("ata_classification_reference_retrieval"),
+                stages.index("ata_mapping"),
+            )
+            self.assertLess(
+                stages.index("ata_mapping"),
+                stages.index("certificate_scope_validation"),
+            )
+            self.assertLess(
+                stages.index("certificate_scope_validation"),
+                stages.index("independent_critic"),
             )
 
     def test_missing_empty_duplicate_unknown_and_mismatched_actions_fail_closed(self) -> None:
@@ -756,7 +1413,7 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
             candidate["candidate_id"],
         )
 
-    def test_source_fragment_only_document_record_cannot_confirm_procedure(self) -> None:
+    def test_source_fragment_only_procedure_candidate_is_rejected(self) -> None:
         mapping = combined_mapping("ATA 25", interface_ata=None)["ata_mapping"]
         mapping["location_context_ata"] = []
         procedure = {
@@ -766,48 +1423,18 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
             "source_fragment": "equipment corrosion",
         }
         mapping["procedure_ata_hypotheses"] = [procedure]
-        procedure_id = expected_candidate_id(
-            mapping,
-            "procedure_ata_hypotheses",
-        )
         actions = confirm_actions(mapping)
-        actions["actions"][-1]["action"] = "require_document"  # type: ignore[index]
-        document = {
-            "document_id": "amm-51",
-            "document_type": "AMM",
-            "revision": "1",
-            "effectivity": "A320",
-            "section_reference": "51-00",
-            "trust_level": "controlled_oem",
-            "applicable": True,
-            "current_revision": True,
-            "verification_status": "confirmed",
-            "confirmed_candidates": [
-                {
-                    "candidate_id": procedure_id,
-                    "ata": "ATA 51",
-                    "category": "procedure_ata_hypotheses",
-                    "source_fragment": "equipment corrosion",
-                    "verification_status": "confirmed",
-                    "confirmed_claim": "procedure applies",
-                }
-            ],
-        }
         result, _ = self.run_pipeline(
             mapping,
             actions,
-            retriever=FixedRetriever([document]),
+            retriever=FixedRetriever([]),
         )
-        self.assertEqual(result["validated_ata"]["document_confirmed"], [])
-        self.assertEqual(result["controlled_evidence"], [])
-        self.assertEqual(
-            [
-                item["candidate_id"]
-                for item in result["validated_ata"][
-                    "document_verification_required"
-                ]
-            ],
-            [procedure_id],
+        self.assertEqual(result["validated_ata"]["possible_procedure"], [])
+        self.assertTrue(
+            any(
+                "procedure_without_factual_anchor:ATA 51" in warning
+                for warning in result["warnings"]
+            )
         )
 
     def test_installed_in_is_context_not_interface_basis(self) -> None:
@@ -933,14 +1560,22 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
         repair_payload = json.loads(llm.calls[2][1])
         self.assertEqual(repair_payload["stage"], "ata_mapping")
         self.assertIn("stage_contract", repair_payload)
-        self.assertEqual(repair_payload["response_schema"], ATA_MAPPING_SCHEMA)
+        self.assertEqual(
+            repair_payload["response_schema"],
+            ATA_MAPPING_GENERATION_SCHEMA,
+        )
         self.assertTrue(
             any(
                 error.startswith("mapping_item_missing_required:")
                 for error in repair_payload["validation_errors"]
             )
         )
-        self.assertEqual(result["agent_trace"][2]["repair"], "completed")
+        mapping_trace = next(
+            item
+            for item in result["agent_trace"]
+            if item["step"] == "ata_mapping"
+        )
+        self.assertEqual(mapping_trace["repair"], "completed")
 
     def test_additional_mapping_property_requires_repair_and_fail_safe(self) -> None:
         invalid_mapping = combined_mapping("ATA 25", interface_ata=None)["ata_mapping"]
@@ -1082,7 +1717,12 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
         )
         result = AtaImpactService(self.certificate, llm).analyze("A320 equipment damage")
         self.assertEqual(result["affected_ata"], ["ATA 25"])
-        self.assertEqual(result["agent_trace"][2]["repair"], "completed")
+        mapping_trace = next(
+            item
+            for item in result["agent_trace"]
+            if item["step"] == "ata_mapping"
+        )
+        self.assertEqual(mapping_trace["repair"], "completed")
 
     def test_malformed_fenced_json_is_not_accepted(self) -> None:
         llm = SequenceLLM(
@@ -1289,7 +1929,7 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
     def test_declared_outside_or_ambiguous_certificate_requires_review(self) -> None:
         for declared, expected_bucket in (
             ("ATA 99", "user_declared_not_in_certificate"),
-            ("ATA 25-99", "user_declared_unverified"),
+            ("ATA 25-99", "user_declared_conflicting"),
         ):
             with self.subTest(declared=declared):
                 engineering_facts = facts(structure_damage=True)
@@ -1479,6 +2119,7 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
 
         exact = validate_certificate(Catalog(), ["ATA 25-10"])[0]
         self.assertEqual(exact["certificate_scope_status"], "in_scope_candidate")
+        self.assertEqual(exact["match_type"], "exact")
         self.assertEqual(exact["certificate_entry"]["name"], "ten")
         missing = validate_certificate(Catalog(), ["ATA 25-30"])[0]
         self.assertEqual(missing["certificate_scope_status"], "ambiguous_subchapter")
@@ -1486,6 +2127,179 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
         chapter = validate_certificate(Catalog(), ["ATA 25"])[0]
         self.assertEqual(chapter["certificate_scope_status"], "in_scope_candidate")
         self.assertIsNone(chapter["certificate_entry"])
+
+    def test_certificate_parent_chapter_covers_subchapter_and_assessment(self) -> None:
+        class Catalog:
+            path = Path("sertifikat_glavy_new.docx")
+            entries = [CertificateEntry("53", "", "Фюзеляж", "")]
+            by_system = {"53": entries}
+
+        chapter_match = validate_certificate(Catalog(), ["ATA 53-10"])[0]
+        self.assertEqual(
+            chapter_match["certificate_scope_status"],
+            "in_scope_candidate",
+        )
+        self.assertEqual(chapter_match["match_type"], "chapter")
+        self.assertEqual(chapter_match["certificate_ata"], "ATA 53")
+
+        covered = assess_certificate(Catalog(), ["ATA 53-10"], [])
+        self.assertEqual(covered["status"], "covered")
+        self.assertEqual(covered["matches"][0]["match_type"], "chapter")
+
+        partial = assess_certificate(
+            Catalog(),
+            ["ATA 53-10"],
+            ["ATA 34"],
+        )
+        self.assertEqual(partial["status"], "partially_covered")
+        self.assertEqual(
+            [item["ata"] for item in partial["missing"]],
+            ["ATA 34"],
+        )
+
+        affected_missing = assess_certificate(
+            Catalog(),
+            ["ATA 34"],
+            ["ATA 53-10"],
+        )
+        self.assertEqual(affected_missing["status"], "not_covered")
+
+        undetermined = assess_certificate(Catalog(), [], ["ATA 53"])
+        self.assertEqual(undetermined["status"], "undetermined")
+
+    def test_new_certificate_assessment_preserves_legacy_scope_status(
+        self,
+    ) -> None:
+        mapping = combined_mapping("ATA 25", interface_ata=None)["ata_mapping"]
+        result, _ = self.run_pipeline(
+            mapping,
+            confirm_actions(mapping),
+            retriever=FixedRetriever([]),
+        )
+        self.assertEqual(
+            result["certificate_assessment"]["status"],  # type: ignore[index]
+            "covered",
+        )
+        self.assertEqual(
+            result["certificate_scope"]["status"],  # type: ignore[index]
+            "in_scope_candidate",
+        )
+        self.assertIn("matches", result["certificate_assessment"])  # type: ignore[operator]
+        self.assertIn("matched", result["certificate_scope"])  # type: ignore[operator]
+
+    def test_gost_reference_is_bound_to_supplied_source_pdf(self) -> None:
+        catalog = AtaClassificationReferenceCatalog()
+        self.assertTrue(catalog.available)
+        self.assertEqual(len(catalog.entries), 501)
+        self.assertEqual(
+            catalog.source_file_sha256,
+            "816d7e245823acf02afb6e463d8e6818c0d721c84a3c88526a1790165a087676",
+        )
+
+    def test_gost_vector_retrieval_returns_only_small_ranked_subset(self) -> None:
+        catalog = AtaClassificationReferenceCatalog(
+            vector_cache_path=Path("/tmp/mro-kb-missing-ata-vectors.json")
+        )
+        target = next(
+            entry
+            for entry in catalog.entries
+            if entry.ata == "ATA 50" and entry.ata == entry.parent_ata
+        )
+        other = next(
+            entry
+            for entry in catalog.entries
+            if entry.ata == "ATA 53" and entry.ata == entry.parent_ata
+        )
+        catalog._vectors = {
+            target.ata: [1.0, 0.0],
+            other.ata: [0.0, 1.0],
+        }
+        catalog.vector_search_enabled = True
+        with patch.object(catalog, "_embed_query", return_value=[1.0, 0.0]):
+            context = catalog.context(
+                "corroded cargo roller track",
+                {"physical_objects": [{"name": "cargo roller track"}]},
+            )
+        self.assertEqual(
+            context["retrieval_mode"],
+            "hybrid_vector_lexical",
+        )
+        self.assertEqual(
+            context["relevant_definitions"][0]["ata"],  # type: ignore[index]
+            "ATA 50",
+        )
+        self.assertLessEqual(len(context["relevant_definitions"]), 8)
+
+    def test_gost_vector_endpoint_is_not_called_when_feature_is_disabled(
+        self,
+    ) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "MRO_KB_ATA_REFERENCE_VECTORS_ENABLED": "false",
+                "MRO_KB_ATA_AGENT_LLM_ENABLED": "false",
+            },
+        ):
+            catalog = AtaClassificationReferenceCatalog()
+        catalog._vectors = {"ATA 50": [1.0, 0.0]}
+        with patch.object(catalog, "_embed_query") as embed_query:
+            context = catalog.context(
+                "corroded cargo roller track",
+                {"physical_objects": [{"name": "cargo roller track"}]},
+            )
+        embed_query.assert_not_called()
+        self.assertEqual(context["retrieval_mode"], "lexical_fallback")
+        self.assertLessEqual(len(context["relevant_definitions"]), 8)
+
+    def test_malformed_vector_cache_and_embedding_fail_to_lexical(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "vectors.json"
+            cache.write_text("[]", encoding="utf-8")
+            catalog = AtaClassificationReferenceCatalog(
+                vector_cache_path=cache
+            )
+            self.assertEqual(catalog._vectors, {})
+
+        catalog = AtaClassificationReferenceCatalog(
+            vector_cache_path=Path("/tmp/mro-kb-missing-vector-cache.json")
+        )
+        catalog._vectors = {"ATA 50": [1.0, 0.0]}
+        catalog.vector_search_enabled = True
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_HttpResponse(
+                {"embeddings": [["not-a-number"]]}
+            ),
+        ):
+            context = catalog.context(
+                "corroded cargo roller track",
+                {"physical_objects": [{"name": "cargo roller track"}]},
+            )
+        self.assertEqual(context["retrieval_mode"], "lexical_fallback")
+
+    def test_mapping_failure_does_not_repeat_reference_retrieval(self) -> None:
+        class CountingCatalog(AtaClassificationReferenceCatalog):
+            def __init__(self) -> None:
+                super().__init__()
+                self.context_calls = 0
+
+            def context(
+                self,
+                request: str,
+                engineering_facts: dict[str, object],
+                limit: int = 8,
+            ) -> dict[str, object]:
+                self.context_calls += 1
+                return super().context(request, engineering_facts, limit)
+
+        catalog = CountingCatalog()
+        result = AtaImpactService(
+            self.certificate,
+            SequenceLLM(facts(), "invalid mapping", "invalid repair"),
+            reference_catalog=catalog,
+        ).analyze("A320 cargo equipment damage")
+        self.assertEqual(result["runtime_mode"], "fallback")
+        self.assertEqual(catalog.context_calls, 1)
 
     def test_no_production_scenario_hardcodes_or_combined_prompt_usage(self) -> None:
         root = Path(__file__).resolve().parents[1]
