@@ -188,12 +188,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 "created": now,
                                 "owned_by": "local",
                             },
-                            {
-                                "id": "mro-ata-impact",
-                                "object": "model",
-                                "created": int(time.time()),
-                                "owned_by": "mro-kb-platform",
-                            },
                         ],
                     }
                 )
@@ -205,7 +199,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "components": SERVICES.retrieval.health(),
                         "commercial_offers": SERVICES.commercial_offers.health(),
                         "go_no_go": SERVICES.go_no_go.health(),
-                        "ata_impact": {"catalog_version": SERVICES.ata_impact.catalog.version, **SERVICES.ata_impact.health()},
                     }
                 )
             if parsed.path.startswith("/api/com-offers/registry/"):
@@ -259,7 +252,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {"message": "JSON body must be an object", "type": "invalid_request_error"}}, status=400)
             if parsed.path == "/v1/chat/completions":
                 model = str(payload.get("model") or "").strip()
-                if model not in {"mro-kb", "mro-similar-cases", "mro-go-no-go", "mro-ata-impact"}:
+                if model not in {"mro-kb", "mro-similar-cases", "mro-go-no-go"}:
                     return self._send_json({"error": {"message": f"Unknown model: {model}", "type": "invalid_request_error"}}, status=404)
                 messages = payload.get("messages") or []
                 question = ""
@@ -275,15 +268,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result = SERVICES.commercial_offers.similar_cases(question)
                 elif model == "mro-go-no-go":
                     result = SERVICES.go_no_go.triage(question)
-                elif model == "mro-ata-impact":
-                    mode = validate_ata_runtime_mode(
-                        payload["mode"] if "mode" in payload else "auto",
-                        allow_legacy=True,
-                    )
-                    stream = validate_stream_flag(payload)
-                    if stream:
-                        return self._send_ata_impact_stream(question, mode)
-                    result = SERVICES.ata_impact.analyze(question, mode=mode)
                 else:
                     result = SERVICES.retrieval.chat(question)
                 return self._send_openai_completion(
@@ -298,15 +282,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
                 return self._send_json({"ok": True, "triage": SERVICES.go_no_go.triage(request_text, fields)})
             if parsed.path == "/api/ata-impact":
-                request_text = extract_ata_request_text(payload)
-                if not request_text:
-                    return self._send_json({"ok": False, "error": "request is required"}, status=400)
-                fields = merge_ata_request_fields(payload)
-                mode = validate_ata_runtime_mode(
-                    payload["mode"] if "mode" in payload else "auto",
-                    allow_legacy=True,
+                return self._send_json(
+                    {
+                        "ok": False,
+                        "error": "mro-ata-impact is not served on port 8121; use http://10.100.112.51:8122",
+                    },
+                    status=410,
                 )
-                return self._send_json({"ok": True, "ata_impact": SERVICES.ata_impact.analyze(request_text, fields, mode=mode)})
             if parsed.path == "/api/chat":
                 question = str(payload.get("q") or payload.get("question") or "").strip()
                 if not question:

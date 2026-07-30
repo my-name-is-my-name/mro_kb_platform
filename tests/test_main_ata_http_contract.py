@@ -9,7 +9,6 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from types import MethodType
-from unittest.mock import patch
 
 import apps.api.ata_server as dedicated_server
 import apps.api.server as main_server
@@ -53,7 +52,7 @@ class MainAtaHttpContractTests(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read())
 
-    def test_native_contract_matches_dedicated_endpoint(self) -> None:
+    def test_native_ata_endpoint_is_disabled_on_main_api(self) -> None:
         status, payload = self.request(
             "/api/ata-impact",
             {
@@ -63,60 +62,27 @@ class MainAtaHttpContractTests(unittest.TestCase):
                 "mode": "standard",
             },
         )
-        self.assertEqual(status, 200)
-        self.assertTrue(payload["ok"])
-        self.assertEqual(StubAgent.calls[-1][1], {"aircraft_type": "A320"})
-        self.assertEqual(StubAgent.calls[-1][2], "standard")
+        self.assertEqual(status, 410)
+        self.assertFalse(payload["ok"])
+        self.assertIn("8122", payload["error"])
+        self.assertEqual(StubAgent.calls, [])
 
-    def test_conflict_and_invalid_mode_are_400(self) -> None:
-        status, payload = self.request(
-            "/api/ata-impact",
-            {
-                "request": "damage",
-                "aircraft_type": "A320",
-                "fields": {"aircraft_type": "B737"},
-            },
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["error"]["type"], "invalid_request_error")
-        status, payload = self.request(
-            "/api/ata-impact",
-            {"request": "damage", "mode": "standrd"},
-        )
-        self.assertEqual(status, 400)
-        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+    def test_main_models_do_not_publish_ata_impact(self) -> None:
+        with urllib.request.urlopen(self.base + "/v1/models", timeout=5) as response:
+            models = json.loads(response.read())
+        ids = {item["id"] for item in models["data"]}
+        self.assertNotIn("mro-ata-impact", ids)
 
-    def test_openai_nonstream_and_sse_contracts(self) -> None:
-        status, completion = self.request(
+    def test_openai_ata_model_is_unknown_on_main_api(self) -> None:
+        status, payload = self.request(
             "/v1/chat/completions",
             {
                 "model": "mro-ata-impact",
-                "mode": "extended",
                 "messages": [{"role": "user", "content": "damage"}],
             },
         )
-        self.assertEqual(status, 200)
-        self.assertEqual(completion["choices"][0]["message"]["content"], "ATA result")
-        self.assertEqual(StubAgent.calls[-1][2], "extended")
-        request = urllib.request.Request(
-            self.base + "/v1/chat/completions",
-            data=json.dumps(
-                {
-                    "model": "mro-ata-impact",
-                    "stream": True,
-                    "messages": [{"role": "user", "content": "damage"}],
-                }
-            ).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            self.assertEqual(
-                response.headers.get_content_type(),
-                "text/event-stream",
-            )
-            body = response.read().decode()
-        self.assertIn('"finish_reason": "stop"', body)
-        self.assertTrue(body.rstrip().endswith("data: [DONE]"))
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
 
 
 class SocketlessAtaHandlerTests(unittest.TestCase):
@@ -157,149 +123,89 @@ class SocketlessAtaHandlerTests(unittest.TestCase):
         handler.do_POST()
         return int(captured["status"]), captured["payload"]  # type: ignore[return-value]
 
-    def test_native_conflict_and_invalid_mode_parity_without_sockets(self) -> None:
+    def test_dedicated_native_conflict_and_invalid_mode_without_sockets(self) -> None:
         conflict = {
             "request": "damage",
             "aircraft_type": "A320",
             "fields": {"aircraft_type": "B737"},
         }
         invalid = {"request": "damage", "mode": "standrd"}
-        for handler, sender in (
-            (dedicated_server.AtaHandler, "_json"),
-            (main_server.RequestHandler, "_send_json"),
-        ):
-            with self.subTest(handler=handler.__name__, case="conflict"):
-                status, payload = self.invoke(handler, "/api/ata-impact", conflict, sender)
-                self.assertEqual(status, 400)
-                self.assertEqual(payload["error"]["type"], "invalid_request_error")
-            with self.subTest(handler=handler.__name__, case="mode"):
-                status, payload = self.invoke(handler, "/api/ata-impact", invalid, sender)
-                self.assertEqual(status, 400)
-                self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        status, payload = self.invoke(dedicated_server.AtaHandler, "/api/ata-impact", conflict, "_json")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        status, payload = self.invoke(dedicated_server.AtaHandler, "/api/ata-impact", invalid, "_json")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
 
-    def test_native_request_alias_conflicts_have_identical_contract(self) -> None:
+    def test_dedicated_request_alias_conflicts_have_identical_contract(self) -> None:
         conflict = {"request": "damage A", "question": "damage B"}
         identical = {"request": "same damage", "question": "same damage"}
-        for handler, sender in (
-            (dedicated_server.AtaHandler, "_json"),
-            (main_server.RequestHandler, "_send_json"),
-        ):
-            with self.subTest(handler=handler.__name__, case="conflict"):
-                status, payload = self.invoke(
-                    handler,
-                    "/api/ata-impact",
-                    conflict,
-                    sender,
-                )
-                self.assertEqual(status, 400)
-                self.assertEqual(payload["error"]["type"], "invalid_request_error")
-            with self.subTest(handler=handler.__name__, case="identical"):
-                status, _ = self.invoke(
-                    handler,
-                    "/api/ata-impact",
-                    identical,
-                    sender,
-                )
-                self.assertEqual(status, 200)
-                self.assertEqual(StubAgent.calls[-1][0], "same damage")
+        status, payload = self.invoke(dedicated_server.AtaHandler, "/api/ata-impact", conflict, "_json")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        status, _ = self.invoke(dedicated_server.AtaHandler, "/api/ata-impact", identical, "_json")
+        self.assertEqual(status, 200)
+        self.assertEqual(StubAgent.calls[-1][0], "same damage")
 
-    def test_openai_invalid_mode_and_enabled_legacy_without_sockets(self) -> None:
+    def test_dedicated_openai_invalid_mode_without_sockets(self) -> None:
         chat = {
             "model": "mro-ata-impact",
             "mode": "AUTO",
             "messages": [{"role": "user", "content": "damage"}],
         }
-        for handler, sender in (
-            (dedicated_server.AtaHandler, "_json"),
-            (main_server.RequestHandler, "_send_json"),
-        ):
-            status, payload = self.invoke(
-                handler,
-                "/v1/chat/completions",
-                chat,
-                sender,
-            )
-            self.assertEqual(status, 400)
-            self.assertEqual(payload["error"]["type"], "invalid_request_error")
-        with patch.dict(
-            "os.environ",
-            {"MRO_KB_ENABLE_LEGACY_ATA_MODES": "true"},
-        ):
-            for handler, sender in (
-                (dedicated_server.AtaHandler, "_json"),
-                (main_server.RequestHandler, "_send_json"),
-            ):
-                status, _ = self.invoke(
-                    handler,
-                    "/api/ata-impact",
-                    {"request": "damage", "mode": "rules_only"},
-                    sender,
-                )
-                self.assertEqual(status, 200)
-                self.assertEqual(StubAgent.calls[-1][2], "rules_only")
+        status, payload = self.invoke(dedicated_server.AtaHandler, "/v1/chat/completions", chat, "_json")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
 
         invalid_stream = {
             "model": "mro-ata-impact",
             "stream": "false",
             "messages": [{"role": "user", "content": "damage"}],
         }
-        for handler, sender in (
-            (dedicated_server.AtaHandler, "_json"),
-            (main_server.RequestHandler, "_send_json"),
-        ):
-            status, payload = self.invoke(
-                handler,
-                "/v1/chat/completions",
-                invalid_stream,
-                sender,
-            )
-            self.assertEqual(status, 400)
-            self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        status, payload = self.invoke(dedicated_server.AtaHandler, "/v1/chat/completions", invalid_stream, "_json")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
 
-    def test_agent_exceptions_are_json_500_on_both_endpoints(self) -> None:
+    def test_dedicated_agent_exceptions_are_json_500(self) -> None:
         class BrokenAgent(StubAgent):
             def analyze(self, *args: object, **kwargs: object) -> dict[str, object]:
                 raise RuntimeError("boom")
 
         main_server.SERVICES = SimpleNamespace(ata_impact=BrokenAgent())  # type: ignore[assignment]
         dedicated_server.ATA_AGENT = BrokenAgent()  # type: ignore[assignment]
-        for handler, sender in (
-            (dedicated_server.AtaHandler, "_json"),
-            (main_server.RequestHandler, "_send_json"),
-        ):
-            status, payload = self.invoke(
-                handler,
-                "/api/ata-impact",
-                {"request": "damage"},
-                sender,
-            )
-            self.assertEqual(status, 500)
-            self.assertEqual(payload["error"]["type"], "server_error")
+        status, payload = self.invoke(dedicated_server.AtaHandler, "/api/ata-impact", {"request": "damage"}, "_json")
+        self.assertEqual(status, 500)
+        self.assertEqual(payload["error"]["type"], "server_error")
+
+    def test_main_handler_rejects_ata_impact_without_agent_call(self) -> None:
+        status, payload = self.invoke(main_server.RequestHandler, "/api/ata-impact", {"request": "damage"}, "_send_json")
+        self.assertEqual(status, 410)
+        self.assertIn("8122", payload["error"])
+        self.assertEqual(StubAgent.calls, [])
+
+        status, payload = self.invoke(
+            main_server.RequestHandler,
+            "/v1/chat/completions",
+            {"model": "mro-ata-impact", "messages": [{"role": "user", "content": "damage"}]},
+            "_send_json",
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
 
     def test_sse_envelopes_and_mode_forwarding_without_sockets(self) -> None:
-        for handler_class, method_name in (
-            (dedicated_server.AtaHandler, "_stream"),
-            (main_server.RequestHandler, "_send_ata_impact_stream"),
-        ):
-            handler = object.__new__(handler_class)
-            handler.wfile = io.BytesIO()
-            headers: dict[str, str] = {}
-            handler.send_response = MethodType(lambda self, status: None, handler)
-            handler.send_header = MethodType(
-                lambda self, key, value: headers.__setitem__(key, value),
-                handler,
-            )
-            handler.end_headers = MethodType(lambda self: None, handler)
-            handler.close_connection = False
-            getattr(handler, method_name)("damage", "extended")
-            body = handler.wfile.getvalue().decode()
-            self.assertEqual(
-                headers["Content-Type"],
-                "text/event-stream; charset=utf-8",
-            )
-            self.assertIn('"finish_reason": "stop"', body)
-            self.assertTrue(body.rstrip().endswith("data: [DONE]"))
-            self.assertEqual(StubAgent.calls[-1][2], "extended")
+        handler = object.__new__(dedicated_server.AtaHandler)
+        handler.wfile = io.BytesIO()
+        headers: dict[str, str] = {}
+        handler.send_response = MethodType(lambda self, status: None, handler)
+        handler.send_header = MethodType(lambda self, key, value: headers.__setitem__(key, value), handler)
+        handler.end_headers = MethodType(lambda self: None, handler)
+        handler.close_connection = False
+        handler._stream("damage", "extended")
+        body = handler.wfile.getvalue().decode()
+        self.assertEqual(headers["Content-Type"], "text/event-stream; charset=utf-8")
+        self.assertIn('"finish_reason": "stop"', body)
+        self.assertTrue(body.rstrip().endswith("data: [DONE]"))
+        self.assertEqual(StubAgent.calls[-1][2], "extended")
 
 
 if __name__ == "__main__":
