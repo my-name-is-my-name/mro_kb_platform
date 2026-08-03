@@ -230,6 +230,30 @@ curl -X POST http://127.0.0.1:8121/api/ingest/run
 ```
 
 This rebuilds SQLite document/case tables and publishes Obsidian notes.
+It does not rebuild Qdrant automatically.
+
+Build or refresh the semantic chunk index:
+
+```bash
+python3 -m apps.api.server reindex-mro-kb-vectors
+python3 -m apps.api.server reindex-mro-kb-vectors-status
+```
+
+Runtime options:
+
+```bash
+export MRO_KB_QDRANT_ENABLED=1
+export MRO_KB_QDRANT_URL=http://127.0.0.1:6333
+export MRO_KB_QDRANT_COLLECTION=mro_kb_chunks
+export MRO_KB_QDRANT_TARGET_TOTAL=54727
+export MRO_KB_OLLAMA_URL=http://127.0.0.1:11434
+export MRO_KB_EMBEDDING_MODEL=bge-m3
+```
+
+If Qdrant or embeddings are unavailable, `mro-kb` falls back to SQLite lexical
+retrieval and reports the degraded vector status in `/api/health`.
+The implementation can use the Python Qdrant client when present, but also has
+an HTTP fallback for the existing Qdrant service used by `Intranet_RAG`.
 
 ## OpenWebUI Configuration
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -572,6 +573,170 @@ class SQLiteStore:
                 (document_id, section_title, limit),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def iter_vector_chunks(self, batch_size: int = 512, limit: int = 0) -> Iterator[dict[str, object]]:
+        emitted = 0
+        sql_limit = "LIMIT ?" if limit > 0 else ""
+        params: tuple[object, ...] = (limit,) if limit > 0 else ()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT h.chunk_id, h.case_id, h.document_id, h.chunk_kind, h.unit_kind, h.chunk_level,
+                       h.document_family, h.section_label, h.section_title, h.heading_path_json,
+                       h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
+                       h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
+                       d.source_document_id, d.title, d.document_type, d.issuer,
+                       d.aircraft_type AS document_aircraft_type, d.effectivity, d.ata AS document_ata,
+                       d.revision, d.issue_date, d.section_reference, d.source_url, d.trust_level, d.source_origin,
+                       c.subject, c.problem_summary, c.aircraft_type, c.msn, c.ata_list_json
+                FROM chunks h
+                JOIN documents d ON d.document_id = h.document_id
+                JOIN cases c ON c.case_id = h.case_id
+                ORDER BY h.rowid
+                {sql_limit}
+                """,
+                params,
+            )
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    return
+                for row in rows:
+                    payload = dict(row)
+                    payload["heading_path"] = self._json_list(payload.pop("heading_path_json", "[]"))
+                    payload["table_refs"] = self._json_list(payload.pop("table_refs_json", "[]"))
+                    payload["metadata"] = self._json_dict(payload.pop("metadata_json", "{}"))
+                    payload["ata_list"] = self._json_list(payload.pop("ata_list_json", "[]"))
+                    yield payload
+                    emitted += 1
+                    if limit > 0 and emitted >= limit:
+                        return
+
+    def corpus_hash(self) -> str:
+        import hashlib
+
+        digest = hashlib.sha256()
+        for chunk in self.iter_vector_chunks(batch_size=1024):
+            digest.update(str(chunk.get("chunk_id") or "").encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(chunk.get("search_text") or chunk.get("text") or "").encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def parent_section_count(self) -> int:
+        keys: set[tuple[str, str]] = set()
+        for chunk in self.iter_vector_chunks(batch_size=2048):
+            keys.add((str(chunk.get("document_id") or ""), str(chunk.get("section_title") or "__document__")))
+        return len(keys)
+
+    def iter_parent_sections(self, batch_size: int = 512, limit: int = 0, skip_parent_ids: set[str] | None = None) -> Iterator[dict[str, object]]:
+        parents: dict[tuple[str, str], dict[str, object]] = {}
+        skipped_keys: set[tuple[str, str]] = set()
+        skip_parent_ids = skip_parent_ids or set()
+        current_document_id = ""
+        emitted = 0
+
+        def flush_parents() -> Iterator[dict[str, object]]:
+            for parent in parents.values():
+                text_parts = parent.pop("_text_parts", [])
+                search_parts = parent.pop("_search_parts", [])
+                parent["text"] = "\n\n".join(str(part) for part in text_parts)[:12000]
+                parent["search_text"] = "\n\n".join(str(part) for part in (search_parts or text_parts))[:12000]
+                yield parent
+
+        for chunk in self.iter_vector_chunks(batch_size=batch_size):
+            document_id = str(chunk.get("document_id") or "")
+            if current_document_id and document_id != current_document_id:
+                for parent in flush_parents():
+                    yield parent
+                    emitted += 1
+                    if limit and emitted >= limit:
+                        return
+                parents = {}
+                skipped_keys = set()
+            current_document_id = document_id
+            key = (str(chunk.get("document_id") or ""), str(chunk.get("section_title") or "__document__"))
+            if key in skipped_keys:
+                continue
+            if key not in parents and self._parent_id_for_section(key[0], "" if key[1] == "__document__" else key[1]) in skip_parent_ids:
+                skipped_keys.add(key)
+                continue
+            parent = parents.get(key)
+            if parent is None:
+                parent = dict(chunk)
+                parent["chunk_id"] = str(chunk.get("chunk_id") or "")
+                parent["chunk_kind"] = "parent_section"
+                parent["unit_kind"] = "parent_section"
+                parent["chunk_level"] = "section"
+                parent["child_chunk_ids"] = []
+                parent["child_count"] = 0
+                parent["_text_parts"] = []
+                parent["_search_parts"] = []
+                parents[key] = parent
+            if parent.get("chunk_id") == "" or (parent.get("chunk_kind") == "table" and chunk.get("chunk_kind") != "table"):
+                parent["chunk_id"] = str(chunk.get("chunk_id") or parent.get("chunk_id") or "")
+            child_id = str(chunk.get("chunk_id") or "")
+            if child_id:
+                parent["child_chunk_ids"].append(child_id)  # type: ignore[index, union-attr]
+            parent["child_count"] = int(parent.get("child_count") or 0) + 1
+            text = str(chunk.get("text") or "").strip()
+            search_text = str(chunk.get("search_text") or "").strip()
+            if text and sum(len(part) for part in parent["_text_parts"]) < 12000:  # type: ignore[index]
+                parent["_text_parts"].append(text)  # type: ignore[index, union-attr]
+            if search_text and sum(len(part) for part in parent["_search_parts"]) < 12000:  # type: ignore[index]
+                parent["_search_parts"].append(search_text)  # type: ignore[index, union-attr]
+        for parent in flush_parents():
+            yield parent
+            emitted += 1
+            if limit and emitted >= limit:
+                return
+
+    @staticmethod
+    def _parent_id_for_section(document_id: str, section_title: str) -> str:
+        normalized_title = re.sub(r"\s+", " ", section_title or "").strip()
+        if normalized_title:
+            digest = hashlib.sha1(normalized_title.encode("utf-8")).hexdigest()[:16]
+            return f"{document_id}::section::{digest}"
+        return f"{document_id}::document"
+
+    @staticmethod
+    def _parent_section_payload(chunks: list[dict[str, object]]) -> dict[str, object]:
+        primary = next((chunk for chunk in chunks if chunk.get("chunk_kind") != "table"), chunks[0])
+        text_parts: list[str] = []
+        search_parts: list[str] = []
+        for chunk in chunks:
+            text = str(chunk.get("text") or "").strip()
+            search_text = str(chunk.get("search_text") or "").strip()
+            if text:
+                text_parts.append(text)
+            if search_text:
+                search_parts.append(search_text)
+        result = dict(primary)
+        result["chunk_id"] = str(primary.get("chunk_id") or "")
+        result["chunk_kind"] = "parent_section"
+        result["unit_kind"] = "parent_section"
+        result["chunk_level"] = "section"
+        result["child_chunk_ids"] = [str(chunk.get("chunk_id") or "") for chunk in chunks if chunk.get("chunk_id")]
+        result["child_count"] = len(chunks)
+        result["text"] = "\n\n".join(text_parts)[:12000]
+        result["search_text"] = "\n\n".join(search_parts or text_parts)[:12000]
+        return result
+
+    @staticmethod
+    def _json_list(value: object) -> list[object]:
+        try:
+            parsed = json.loads(str(value or "[]"))
+        except Exception:
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    @staticmethod
+    def _json_dict(value: object) -> dict[str, object]:
+        try:
+            parsed = json.loads(str(value or "{}"))
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     @staticmethod
     def _search_terms(query: str) -> list[str]:

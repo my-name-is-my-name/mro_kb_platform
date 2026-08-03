@@ -52,7 +52,14 @@ class RuntimeServices:
             "ok": True,
             "doc_snapshot_id": doc_snapshot_id,
             "stats": self.store.stats(),
+            "warnings": ["mro_kb_vector_index_stale_run_reindex_mro_kb_vectors"],
         }
+
+    def reindex_mro_kb_vectors(self, limit: int = 0) -> dict[str, object]:
+        return self.retrieval.reindex_vectors(limit=limit)
+
+    def mro_kb_vectors_status(self) -> dict[str, object]:
+        return self.retrieval.vector_status()
 
 
 SERVICES = RuntimeServices()
@@ -322,6 +329,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "serve",
             "reindex-com-offers",
             "reindex-com-offers-status",
+            "reindex-mro-kb-vectors",
+            "reindex-mro-kb-vectors-status",
             "rebuild-com-offers-manifest",
             "publish-com-offer-registry",
             "build-com-offer-profiles",
@@ -354,6 +363,14 @@ def main() -> None:
         return
     if args.command == "reindex-com-offers-status":
         result = SERVICES.commercial_offers.reindex_status()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "reindex-mro-kb-vectors":
+        result = SERVICES.reindex_mro_kb_vectors(limit=args.limit)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "reindex-mro-kb-vectors-status":
+        result = SERVICES.mro_kb_vectors_status()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if args.command == "build-com-offer-profiles":

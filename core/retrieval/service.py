@@ -4,6 +4,7 @@ import re
 
 from core.citations.formatting import obsidian_uri, source_label
 from core.runtime_clients import ExternalReranker, OpenAICompatibleLLM, RuntimeSettings
+from core.retrieval.vector import MroQdrantIndex, parent_id_for_chunk
 from storage.sqlite.store import SQLiteStore
 
 
@@ -44,6 +45,8 @@ class RetrievalService:
             self.settings.reranker_enabled and self.settings.reranker_url
         ) else None
         self._llm = OpenAICompatibleLLM(self.settings) if self.settings.llm_enabled and self.settings.llm_provider == "openai" else None
+        self._vector_index = MroQdrantIndex(store)
+        self._last_vector_warnings: list[str] = []
 
     def chat(self, question: str, limit: int = 6) -> dict[str, object]:
         explicit_case_id = self._extract_case_id(question)
@@ -70,13 +73,16 @@ class RetrievalService:
                         "document_id": hit["document_id"],
                         "source_document_id": source_document_id,
                         "chunk_id": hit["chunk_id"],
+                        "parent_id": str(hit.get("parent_id") or parent_id_for_chunk(hit)),
+                        "parent_kind": str(hit.get("parent_kind") or ("section" if str(hit.get("section_title") or "") else "document")),
+                        "child_count": int(hit.get("child_count") or 1),
                         "chunk_kind": str(hit.get("chunk_kind") or "chunk"),
                         "section_title": hit["section_title"],
                         "page_number": None,
                         "vault_uri": obsidian_uri(self.vault_name, note_path, block_id) if note_path else "",
                         "page_image_uri": str(hit.get("page_image_path") or ""),
                         "snapshot_id": None,
-                        "retrieval_mode": "sqlite_like",
+                        "retrieval_mode": str(hit.get("retrieval_mode") or ("qdrant_hybrid" if hit.get("vector_score") is not None else "sqlite_like")),
                         "link_confidence": 1.0,
                         "rerank_score": float(hit.get("rerank_score", 0.0)),
                         "final_score": float(hit.get("final_score", 0.0)),
@@ -95,19 +101,32 @@ class RetrievalService:
                     llm_status = "retrieval_fallback"
             except Exception:
                 llm_status = "retrieval_fallback"
+        warnings = list(self._last_vector_warnings)
+        if not sources:
+            warnings.append("no_relevant_sources_found")
         return {
             "answer": answer,
             "sources": sources,
             "evidence": sources[: min(3, len(sources))],
-            "warnings": [] if sources else ["no_relevant_sources_found"],
+            "warnings": warnings,
             "snapshot_id": None,
             "llm_status": llm_status,
         }
 
     def health(self) -> dict[str, object]:
         return {
+            "mro_kb_vectors": self._vector_index.health(),
             "reranker": self._reranker.health() if self._reranker is not None else {"ok": False, "disabled": True},
             "llm": self._llm.health() if self._llm is not None else {"ok": False, "disabled": True},
+        }
+
+    def reindex_vectors(self, limit: int = 0) -> dict[str, object]:
+        return self._vector_index.reindex(limit=limit)
+
+    def vector_status(self) -> dict[str, object]:
+        return {
+            "progress": self._vector_index.reindex_status(),
+            "health": self._vector_index.health(),
         }
 
     @staticmethod
@@ -206,6 +225,18 @@ class RetrievalService:
         return rescored[:limit]
 
     def _collect_candidates(self, question: str, limit: int, explicit_case_id: str | None = None) -> list[dict[str, object]]:
+        self._last_vector_warnings = []
+        lexical_hits = self._collect_sqlite_candidates(question, limit=limit, explicit_case_id=explicit_case_id)
+        if self._is_list_query(question):
+            return lexical_hits
+        vector_hits, warnings = self._vector_index.search(question, limit=limit, explicit_case_id=explicit_case_id)
+        self._last_vector_warnings = warnings
+        if not vector_hits:
+            return lexical_hits
+        merged = self._vector_index.hybrid_merge(question, vector_hits, lexical_hits, limit=max(limit, 24))
+        return merged or lexical_hits
+
+    def _collect_sqlite_candidates(self, question: str, limit: int, explicit_case_id: str | None = None) -> list[dict[str, object]]:
         per_query_limit = min(max(limit // 4, 8), 12)
         merged: dict[str, dict[str, object]] = {}
         case_ids: list[str] = []
@@ -259,6 +290,9 @@ class RetrievalService:
                         if chunk_id and chunk_id not in merged:
                             merged[chunk_id] = chunk
         hits = list(merged.values())
+        for hit in hits:
+            hit.setdefault("parent_id", parent_id_for_chunk(hit))
+            hit.setdefault("parent_kind", "section" if str(hit.get("section_title") or "") else "document")
         hits.sort(key=lambda item: float(item.get("lexical_score", 0.0)), reverse=True)
         selected: list[dict[str, object]] = []
         per_case_counts: dict[str, int] = {}
@@ -290,7 +324,7 @@ class RetrievalService:
         for hit in hits:
             if self._is_list_query(question) and not self._list_hit_matches_question(tokens, hit):
                 continue
-            score = float(hit.get("rerank_score", hit.get("lexical_score", 0.0)))
+            score = float(hit.get("rerank_score", hit.get("hybrid_score", hit.get("lexical_score", 0.0))))
             score += self._match_bonus(tokens, hit)
             score -= self._noise_penalty(hit)
             updated = dict(hit)

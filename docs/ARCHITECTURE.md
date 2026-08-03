@@ -20,13 +20,26 @@ Runtime storage:
 
 - `data_runtime/mro_kb.sqlite3`
 - `data_runtime/obsidian_vault`
+- Qdrant collection `mro_kb_chunks` for semantic chunk retrieval
 
 Implementation:
 
 - `core/retrieval/service.py`
+- `core/retrieval/vector.py`
 - `storage/sqlite/store.py`
 - `ingest/mro_docs/import_documents.py`
 - `ingest/publish_obsidian/publish.py`
+
+Retrieval:
+
+1. exact case-id routing is preserved for direct `MRO/MP/WO/МР-NNN` questions.
+2. semantic search embeds the user query with Ollama `bge-m3` and searches Qdrant.
+3. lexical SQLite candidates are collected with the existing token scoring.
+4. vector and lexical candidates are merged by RRF, then structurally boosted by MRO metadata.
+5. each child chunk carries a deterministic parent section id based on `document_id + section_title`.
+6. selection prefers one child per parent section first; answer context expands through SQLite to the full parent section.
+7. the existing optional external reranker can reorder the hybrid pool.
+8. SQLite remains the source for source expansion, citations and fallback.
 
 ### `mro-similar-cases`
 

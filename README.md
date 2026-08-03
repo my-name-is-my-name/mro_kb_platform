@@ -101,6 +101,15 @@ python3 -m apps.api.server rebuild-com-offers-manifest
 python3 -m apps.api.server reindex-com-offers
 ```
 
+`reindex-mro-kb-vectors` builds the Qdrant vector index for the `mro-kb`
+documentation chunks already loaded into SQLite. Run it after `/api/ingest/run`
+or whenever the embedding model changes:
+
+```bash
+python3 -m apps.api.server reindex-mro-kb-vectors
+python3 -m apps.api.server reindex-mro-kb-vectors-status
+```
+
 `publish-com-offer-registry` writes one Markdown dashboard page per commercial request. Similar-case answers link case IDs to browser-friendly HTML pages through `/api/com-offers/registry/{case_id}`; raw Markdown is available with `?format=md`:
 
 ```bash
@@ -153,6 +162,17 @@ Optional reranker:
 ```bash
 export MRO_KB_RERANKER_URL=http://10.251.10.5:9101
 export MRO_KB_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+```
+
+Qdrant hybrid retrieval for `mro-kb`:
+
+```bash
+export MRO_KB_QDRANT_ENABLED=1
+export MRO_KB_QDRANT_URL=http://127.0.0.1:6333
+export MRO_KB_QDRANT_COLLECTION=mro_kb_chunks
+export MRO_KB_QDRANT_TARGET_TOTAL=54727
+export MRO_KB_OLLAMA_URL=http://127.0.0.1:11434
+export MRO_KB_EMBEDDING_MODEL=bge-m3
 ```
 
 Optional LLM for final answer generation:
