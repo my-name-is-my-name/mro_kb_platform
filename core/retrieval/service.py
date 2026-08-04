@@ -551,6 +551,7 @@ class RetrievalService:
 
         selected: list[dict[str, object]] = []
         seen_chunk_ids: set[str] = set()
+        seen_source_sections: set[tuple[str, str]] = set()
         seen_case_ids: set[str] = set()
         prefer_case_diversity = self._is_list_query(question)
         for hit in rescored:
@@ -559,10 +560,14 @@ class RetrievalService:
                 continue
             if self._is_low_value_hit(hit):
                 continue
+            source_key = (str(hit.get("source_document_id") or hit.get("document_id") or ""), str(hit.get("section_title") or ""))
+            if source_key in seen_source_sections and len(selected) < limit:
+                continue
             case_id = str(hit.get("case_id") or "")
             if prefer_case_diversity and case_id in seen_case_ids and len(selected) < max(limit, 4):
                 continue
             seen_chunk_ids.add(chunk_id)
+            seen_source_sections.add(source_key)
             seen_case_ids.add(case_id)
             selected.append(hit)
             if len(selected) >= limit:
@@ -779,6 +784,7 @@ class RetrievalService:
         penalty = 0.0
         text = normalize_spaces(str(hit.get("text") or ""))
         section_title = str(hit.get("section_title") or "")
+        section_normalized = section_title.lower().replace("ё", "е")
         chunk_kind = str(hit.get("chunk_kind") or "")
         if "<!-- image -->" in text and len(text) < 600:
             penalty += 0.8
@@ -786,6 +792,12 @@ class RetrievalService:
             penalty += 0.2
         if chunk_kind == "table" and len(text) < 180:
             penalty += 0.1
+        if "форма оценки качества" in section_normalized:
+            penalty += 2.0
+        if "оглавление" in section_normalized:
+            penalty += 1.4
+        if section_normalized == "document_intro" and ("---" in text[:600] or len(text) < 260):
+            penalty += 0.6
         return penalty
 
     @staticmethod
