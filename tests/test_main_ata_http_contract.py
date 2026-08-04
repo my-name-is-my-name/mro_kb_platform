@@ -192,6 +192,33 @@ class SocketlessAtaHandlerTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
 
+    def test_main_similar_cases_search_endpoint_is_machine_contract(self) -> None:
+        class FakeCommercialOffers:
+            def search_similar_cases(self, payload: dict[str, object]) -> dict[str, object]:
+                return {
+                    "status": "ok",
+                    "similarity_status": "qualified_matches_found",
+                    "threshold_version": "similarity-gate-v1",
+                    "accepted": [{"case_id": "A1"}],
+                    "not_accepted": [{"case_id": "R1"}],
+                    "coverage": {"accepted_available": 1, "not_accepted_available": 1, "unknown_status_excluded": 0},
+                    "warnings": [],
+                    "echo_context": payload.get("context"),
+                }
+
+        main_server.SERVICES = SimpleNamespace(commercial_offers=FakeCommercialOffers())  # type: ignore[assignment]
+        status, payload = self.invoke(
+            main_server.RequestHandler,
+            "/api/similar-cases/search",
+            {"query": "frame crack", "context": {"ata": ["ATA 53"]}},
+            "_send_json",
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["accepted"][0]["case_id"], "A1")
+        self.assertEqual(payload["not_accepted"][0]["case_id"], "R1")
+        self.assertEqual(payload["echo_context"], {"ata": ["ATA 53"]})
+
     def test_sse_envelopes_and_mode_forwarding_without_sockets(self) -> None:
         handler = object.__new__(dedicated_server.AtaHandler)
         handler.wfile = io.BytesIO()

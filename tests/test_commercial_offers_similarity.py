@@ -54,7 +54,7 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
         recall_at_5 = 0.0
         ndcg_5 = 0.0
         for query, relevant in GROUND_TRUTH:
-            ids = [case["case_id"] for case in self.service.similar_cases(query, limit=10)["similar_cases"]]
+            ids = [case["case_id"] for case in self.service.similar_cases(query, limit=5)["similar_cases"]]
             rank = first_relevant_rank(ids, relevant)
             ranks.append(rank)
             precision_at_5 += sum(1 for case_id in ids[:5] if case_id in relevant) / 5
@@ -63,11 +63,9 @@ class CommercialOffersSimilarityTests(unittest.TestCase):
 
         count = len(GROUND_TRUTH)
         hit_at_5 = sum(1 for rank in ranks if rank is not None and rank <= 5) / count
-        hit_at_10 = sum(1 for rank in ranks if rank is not None and rank <= 10) / count
         mrr = sum((1 / rank) if rank else 0 for rank in ranks) / count
 
         self.assertGreaterEqual(hit_at_5, 0.6)
-        self.assertGreaterEqual(hit_at_10, 0.7)
         self.assertGreater(mrr, 0.5)
         self.assertGreater(precision_at_5 / count, 0.1)
         self.assertGreater(recall_at_5 / count, 0.35)

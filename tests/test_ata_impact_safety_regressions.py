@@ -120,6 +120,149 @@ class AtaImpactSafetyRegressionTests(unittest.TestCase):
         self.assertTrue(catalog.reference_ids_for_ata("ATA 34-10"))
         self.assertTrue(catalog.reference_ids_for_ata("ATA 53"))
 
+    def test_reference_ranker_owns_simple_cabin_and_wing_structure_mapping(self) -> None:
+        catalog = AtaClassificationReferenceCatalog()
+        cabin = catalog.propose_mapping_candidates(
+            "замена чехлов в салоне",
+            {
+                "physical_objects": [
+                    {
+                        "id": "object_1",
+                        "name": "seat cover",
+                        "involvement": "replaced",
+                        "damage_confirmed": True,
+                    }
+                ],
+                "functional_purposes": [
+                    {
+                        "object_id": "object_1",
+                        "description": "passenger cabin interior",
+                    }
+                ],
+                "structural_elements": [],
+                "locations": [],
+                "damage": [],
+                "relations": [],
+            },
+        )
+        wing = catalog.propose_mapping_candidates(
+            "коррозия нервюры rib5",
+            {
+                "physical_objects": [],
+                "functional_purposes": [],
+                "structural_elements": [
+                    {
+                        "id": "structure_1",
+                        "name": "rib 5",
+                        "involvement": "damaged",
+                        "damage_confirmed": True,
+                    }
+                ],
+                "locations": [],
+                "damage": [{"type": "corrosion", "affected_entity_id": "structure_1"}],
+                "relations": [],
+            },
+        )
+
+        self.assertEqual(cabin["object_ata"][0]["ata"], "ATA 25")
+        self.assertEqual(wing["structural_ata"][0]["ata"], "ATA 57")
+
+    def test_reference_ranker_overrides_bad_llm_mapping_for_simple_cases(self) -> None:
+        cabin_facts = {
+            "aircraft": {"family": None, "model": None, "msn": None, "confidence": 0.0},
+            "event": {"type": "replacement", "maintenance_action": "replace"},
+            "physical_objects": [
+                {
+                    "id": "object_1",
+                    "name": "seat cover",
+                    "original_text": "чехлы",
+                    "involvement": "replaced",
+                    "damage_confirmed": True,
+                    "confidence": 0.9,
+                }
+            ],
+            "functional_purposes": [{"object_id": "object_1", "description": "passenger cabin interior", "confidence": 0.9}],
+            "structural_elements": [],
+            "locations": [],
+            "damage": [],
+            "relations": [],
+            "uncertainties": [],
+        }
+        cabin_mapping = combined_mapping("ATA 44", context_ata="ATA 44", interface_ata=None)["ata_mapping"]
+        cabin_result = AtaImpactService(
+            self.certificate,
+            SequenceLLM(
+                cabin_facts,
+                cabin_mapping,
+                {
+                    "actions": [
+                        {
+                            "candidate_id": "candidate:object_ata:object_1:ATA_44:1",
+                            "action": "confirm",
+                            "reason": "LLM attempted ATA 44",
+                            "ata": "ATA 25",
+                            "category": "object_ata",
+                            "entity_id": "object_1",
+                        }
+                    ]
+                },
+            ),
+            FixedRetriever([]),
+        ).analyze("замена чехлов в салоне", runtime_mode="standard")
+
+        rib_facts = {
+            "aircraft": {"family": None, "model": None, "msn": None, "confidence": 0.0},
+            "event": {"type": "corrosion", "maintenance_action": "inspection_finding"},
+            "physical_objects": [],
+            "functional_purposes": [],
+            "structural_elements": [
+                {
+                    "id": "structure_1",
+                    "name": "rib 5",
+                    "involvement": "damaged",
+                    "damage_confirmed": True,
+                    "confidence": 0.9,
+                }
+            ],
+            "locations": [],
+            "damage": [{"type": "corrosion", "affected_entity_id": "structure_1"}],
+            "relations": [],
+            "uncertainties": [],
+        }
+        rib_mapping = {
+            "object_ata": [],
+            "structural_ata": [{"ata": "ATA 55-10", "entity_id": "structure_1", "confidence": 0.9, "reason": "LLM attempted empennage"}],
+            "location_context_ata": [],
+            "interface_ata_hypotheses": [],
+            "procedure_ata_hypotheses": [],
+            "user_declared_ata": [],
+        }
+        rib_result = AtaImpactService(
+            self.certificate,
+            SequenceLLM(
+                rib_facts,
+                rib_mapping,
+                {
+                    "actions": [
+                        {
+                            "candidate_id": "candidate:structural_ata:structure_1:ATA_55_10:1",
+                            "action": "confirm",
+                            "reason": "LLM attempted ATA 55-10",
+                            "ata": "ATA 57",
+                            "category": "structural_ata",
+                            "entity_id": "structure_1",
+                        }
+                    ]
+                },
+            ),
+            FixedRetriever([]),
+        ).analyze("коррозия нервюры rib5", runtime_mode="standard")
+
+        self.assertEqual(cabin_result["affected_ata"], ["ATA 25"])
+        self.assertNotIn("ATA 44", cabin_result["affected_ata"])
+        self.assertEqual(rib_result["affected_ata"], ["ATA 57"])
+        self.assertNotIn("ATA 55-10", rib_result["affected_ata"])
+
     def test_gost_role_policy_blocks_procedure_as_affected_object(
         self,
     ) -> None:

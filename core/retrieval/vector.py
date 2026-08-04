@@ -164,7 +164,7 @@ class MroVectorSettings:
     rrf_k: int = int(os.getenv("MRO_KB_RRF_K", "60"))
     batch_size: int = int(os.getenv("MRO_KB_QDRANT_UPSERT_BATCH_SIZE", "16"))
     embedding_batch_size: int = int(os.getenv("MRO_KB_EMBEDDING_BATCH_SIZE", "1"))
-    target_total: int = int(os.getenv("MRO_KB_QDRANT_TARGET_TOTAL", "54727"))
+    target_total: int = int(os.getenv("MRO_KB_QDRANT_TARGET_TOTAL", "35566"))
     progress_path: Path = DATA_RUNTIME_ROOT / "mro_kb_qdrant_reindex_progress.json"
 
 

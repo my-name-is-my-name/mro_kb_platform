@@ -119,6 +119,35 @@ def normalize_lookup(text: str) -> str:
     return normalize_spaces((text or "").lower().replace("ё", "е"))
 
 
+SIMILARITY_GATE_VERSION = "similarity-gate-v1"
+SIMILARITY_ACCEPTED_STATUSES = {"accepted", "in_work"}
+SIMILARITY_NOT_ACCEPTED_STATUSES = {"rejected", "cancelled", "no_quote"}
+SIMILARITY_INTERMEDIATE_STATUSES = {"on_hold", "quote_preparation", "in_triage"}
+DEFAULT_SIMILAR_CASE_SEMANTIC_THRESHOLD = 0.72
+
+
+def similar_case_status_group(status_normalized: str) -> str | None:
+    status = normalize_lookup(status_normalized).replace("-", "_").replace(" ", "_")
+    if status in SIMILARITY_ACCEPTED_STATUSES:
+        return "accepted"
+    if status in SIMILARITY_NOT_ACCEPTED_STATUSES:
+        return "not_accepted"
+    if status in SIMILARITY_INTERMEDIATE_STATUSES:
+        return "intermediate"
+    return None
+
+
+def unique_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = normalize_spaces(str(value))
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
 def tokenize(text: str) -> list[str]:
     tokens = []
     for token in TOKEN_RE.findall(normalize_lookup(text)):
@@ -1568,14 +1597,281 @@ class CommercialOffersService:
             reason_class = "weak_analog"
         return {"score": score, "reason_class": reason_class, "reasons": reasons[:6]}
 
+    def search_similar_cases(self, payload: dict[str, object]) -> dict[str, object]:
+        query = normalize_spaces(str(payload.get("query") or payload.get("q") or payload.get("request") or ""))
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else {}
+        accepted_limit = self._bounded_machine_limit(limits.get("accepted"), default=5)
+        not_accepted_limit = self._bounded_machine_limit(limits.get("not_accepted"), default=5)
+        intermediate_limit = self._bounded_machine_limit(limits.get("intermediate"), default=5)
+        if str(payload.get("retrieval_mode") or "") == "legacy_ranked_query":
+            return self._search_similar_cases_from_legacy_ranking(query, accepted_limit, not_accepted_limit, intermediate_limit)
+        threshold = self._similarity_semantic_threshold()
+        expanded_query = self._machine_similarity_query(query, context)
+        query_profile = self._query_profile(expanded_query)
+        warnings: list[str] = []
+        if self._insufficient_similarity_query(query, context, query_profile):
+            return {
+                "status": "ok",
+                "similarity_status": "insufficient_query",
+                "threshold_version": SIMILARITY_GATE_VERSION,
+                "accepted": [],
+                "not_accepted": [],
+                "coverage": {"accepted_available": 0, "not_accepted_available": 0, "unknown_status_excluded": 0},
+                "warnings": ["insufficient_technical_signals"],
+            }
+
+        query_rewrite, rewrite_warnings = self._rewrite_query(expanded_query)
+        search_queries = self._search_queries(expanded_query, query_rewrite)
+        candidates = self._candidate_cases(search_queries, limit=max((accepted_limit + not_accepted_limit) * 20, 80))
+        candidates = self._rerank_cases(expanded_query, candidates, limit=max((accepted_limit + not_accepted_limit) * 8, 40))
+        warnings.extend(rewrite_warnings)
+
+        accepted: list[dict[str, object]] = []
+        not_accepted: list[dict[str, object]] = []
+        intermediate: list[dict[str, object]] = []
+        unknown_status_excluded = 0
+        for item in candidates:
+            gate = self._similarity_gate(item, threshold)
+            if not gate["qualified"]:
+                continue
+            case = item.get("case") if isinstance(item.get("case"), dict) else {}
+            group = similar_case_status_group(str(case.get("status_normalized") or ""))
+            if group is None:
+                unknown_status_excluded += 1
+                continue
+            case_payload = self._machine_case_payload(item, gate)
+            if group == "accepted":
+                accepted.append(case_payload)
+            elif group == "not_accepted":
+                not_accepted.append(case_payload)
+            elif group == "intermediate":
+                intermediate.append(case_payload)
+
+        accepted_available = len(accepted)
+        not_accepted_available = len(not_accepted)
+        intermediate_available = len(intermediate)
+        accepted = accepted[:accepted_limit]
+        not_accepted = not_accepted[:not_accepted_limit]
+        intermediate = intermediate[:intermediate_limit]
+        if not accepted:
+            warnings.append("no_qualified_accepted_cases")
+        if not not_accepted:
+            warnings.append("no_qualified_not_accepted_cases")
+        similarity_status = "qualified_matches_found" if accepted or not_accepted or intermediate else "no_qualified_matches"
+        return {
+            "status": "ok",
+            "similarity_status": similarity_status,
+            "threshold_version": SIMILARITY_GATE_VERSION,
+            "accepted": accepted,
+            "not_accepted": not_accepted,
+            "intermediate": intermediate,
+            "coverage": {
+                "accepted_available": accepted_available,
+                "not_accepted_available": not_accepted_available,
+                "intermediate_available": intermediate_available,
+                "unknown_status_excluded": unknown_status_excluded,
+            },
+            "warnings": warnings,
+        }
+
+    def _search_similar_cases_from_legacy_ranking(self, query: str, accepted_limit: int, not_accepted_limit: int, intermediate_limit: int) -> dict[str, object]:
+        legacy = self.similar_cases(query, limit=5)
+        accepted: list[dict[str, object]] = []
+        not_accepted: list[dict[str, object]] = []
+        intermediate: list[dict[str, object]] = []
+        unknown_status_excluded = 0
+        for item in legacy.get("similar_cases", []) if isinstance(legacy.get("similar_cases"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            group = similar_case_status_group(str(item.get("status_normalized") or ""))
+            if group is None:
+                unknown_status_excluded += 1
+                continue
+            payload = self._legacy_machine_case_payload(item)
+            if group == "accepted" and len(accepted) < accepted_limit:
+                accepted.append(payload)
+            elif group == "not_accepted" and len(not_accepted) < not_accepted_limit:
+                not_accepted.append(payload)
+            elif group == "intermediate" and len(intermediate) < intermediate_limit:
+                intermediate.append(payload)
+        warnings = [str(warning) for warning in legacy.get("warnings", []) if str(warning).strip()] if isinstance(legacy.get("warnings"), list) else []
+        if not accepted:
+            warnings.append("no_qualified_accepted_cases")
+        if not not_accepted:
+            warnings.append("no_qualified_not_accepted_cases")
+        return {
+            "status": "ok",
+            "similarity_status": "qualified_matches_found" if accepted or not_accepted or intermediate else "no_qualified_matches",
+            "threshold_version": "legacy-ranked-query-v1",
+            "accepted": accepted,
+            "not_accepted": not_accepted,
+            "intermediate": intermediate,
+            "coverage": {
+                "accepted_available": len(accepted),
+                "not_accepted_available": len(not_accepted),
+                "intermediate_available": len(intermediate),
+                "unknown_status_excluded": unknown_status_excluded,
+            },
+            "warnings": unique_strings(warnings),
+        }
+
+    @staticmethod
+    def _bounded_machine_limit(value: object, default: int) -> int:
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            limit = default
+        return max(0, min(limit, 20))
+
+    @staticmethod
+    def _similarity_semantic_threshold() -> float:
+        try:
+            return float(os.environ.get("MRO_SIMILAR_CASE_SEMANTIC_THRESHOLD", DEFAULT_SIMILAR_CASE_SEMANTIC_THRESHOLD))
+        except ValueError:
+            return DEFAULT_SIMILAR_CASE_SEMANTIC_THRESHOLD
+
+    @staticmethod
+    def _machine_similarity_query(query: str, context: dict[str, object]) -> str:
+        parts = [query]
+        for key in ("aircraft_type", "defect_type", "work_type"):
+            value = normalize_spaces(str(context.get(key) or ""))
+            if value:
+                parts.append(value)
+        for key in ("ata", "components", "zones", "identifiers"):
+            value = context.get(key)
+            if isinstance(value, list):
+                parts.extend(normalize_spaces(str(item)) for item in value if normalize_spaces(str(item)))
+            elif value:
+                parts.append(normalize_spaces(str(value)))
+        return normalize_spaces(" ".join(parts))
+
+    def _insufficient_similarity_query(self, query: str, context: dict[str, object], profile: dict[str, object]) -> bool:
+        identifiers = self._profile_set(profile, "identifiers")
+        components = self._profile_set(profile, "components")
+        zones = self._profile_set(profile, "zones")
+        defect = normalize_lookup(str(profile.get("defect_type") or "unknown"))
+        direct_context_signal = any(
+            context.get(key)
+            for key in ("components", "zones", "identifiers", "defect_type")
+        )
+        if identifiers or (components and defect != "unknown") or (components and zones) or direct_context_signal:
+            return False
+        technical_tokens = [token for token in tokenize(query) if token not in STOP_TOKENS]
+        return len(technical_tokens) < 4
+
+    def _similarity_gate(self, item: dict[str, object], semantic_threshold: float) -> dict[str, object]:
+        reason_class = str(item.get("similarity_reason_class") or "weak_analog")
+        reasons = [str(reason) for reason in item.get("reasons", []) if str(reason).strip()] if isinstance(item.get("reasons"), list) else []
+        reason_text = normalize_lookup(" ".join(reasons))
+        exact_score = float(item.get("exact_score") or 0.0)
+        semantic_score = max(float(item.get("semantic_score") or 0.0), float(item.get("profile_semantic_score") or 0.0))
+        structured_score = float(item.get("structured_score") or 0.0)
+        has_identifier = self._has_significant_similarity_identifier(reason_text, reason_class, exact_score)
+        has_component = "совпал компонент" in reason_text or reason_class in {"same_component_defect", "same_component_defect_zone"}
+        has_defect = "совпал тип дефекта" in reason_text or reason_class in {"same_component_defect", "same_component_defect_zone"}
+        has_zone = "совпала зона" in reason_text or reason_class == "same_component_defect_zone"
+        has_authority = "сертификационный" in reason_text or "регуляторный" in reason_text
+        if reason_class == "weak_analog":
+            return self._gate_result(False, "low", "weak_analog", reasons)
+        if has_identifier:
+            return self._gate_result(True, "high", "same_identifier", reasons)
+        if has_component and has_defect and has_zone:
+            return self._gate_result(True, "high", "same_component_defect_zone", reasons)
+        if has_component and has_defect and semantic_score >= semantic_threshold:
+            return self._gate_result(True, "medium", "same_component_defect_semantic", reasons)
+        independent_signals = sum(bool(value) for value in (has_component, has_defect, has_zone, has_authority, has_identifier))
+        if independent_signals >= 3 and structured_score >= 3.0:
+            return self._gate_result(True, "medium", "multiple_engineering_signals", reasons)
+        return self._gate_result(False, "low", "weak_analog", reasons)
+
+    @staticmethod
+    def _has_significant_similarity_identifier(reason_text: str, reason_class: str, exact_score: float) -> bool:
+        has_identifier_signal = reason_class == "same_identifier" or exact_score >= 8.0 or "совпал инженерный идентификатор" in reason_text
+        if not has_identifier_signal:
+            return False
+        if any(regex.search(reason_text) for regex in (RIB_RE, FRAME_RE, STGR_RE, PART_RE, MSN_RE, REG_RE, AD_RE, SB_RE, CASE_RE)):
+            return True
+        without_ata = re.sub(r"\bata\s*[-:]?\s*\d{2}(?:\s*[-:]?\s*\d{2})?\b", " ", reason_text, flags=re.IGNORECASE)
+        if "совпал инженерный идентификатор" in normalize_lookup(without_ata) and not re.search(r"\b[a-zа-я]{2,}\d+[a-zа-я0-9-]*\b", without_ata, re.IGNORECASE):
+            return False
+        return exact_score >= 8.0 and bool(re.search(r"\b[a-zа-я]{2,}\d+[a-zа-я0-9-]*\b", without_ata, re.IGNORECASE))
+
+    @staticmethod
+    def _gate_result(qualified: bool, confidence: str, reason_class: str, reasons: list[str]) -> dict[str, object]:
+        return {
+            "qualified": qualified,
+            "similarity_confidence": confidence,
+            "similarity_reason_class": reason_class,
+            "threshold_version": SIMILARITY_GATE_VERSION,
+            "reasons": reasons[:6],
+        }
+
+    def _machine_case_payload(self, item: dict[str, object], gate: dict[str, object]) -> dict[str, object]:
+        case = item.get("case") if isinstance(item.get("case"), dict) else {}
+        case_id = str(case.get("case_id") or "")
+        return {
+            "case_id": case_id,
+            "status_normalized": case.get("status_normalized", ""),
+            "score": float(item.get("score") or 0.0),
+            "qualified": bool(gate.get("qualified")),
+            "similarity_confidence": gate.get("similarity_confidence", "low"),
+            "similarity_reason_class": gate.get("similarity_reason_class", "weak_analog"),
+            "threshold_version": gate.get("threshold_version", SIMILARITY_GATE_VERSION),
+            "reasons": gate.get("reasons", []),
+            "request_description": case.get("request_description", ""),
+            "aircraft_type": case.get("aircraft_type", ""),
+            "documents": [],
+            "case_url": self._registry_case_url(case_id) if case_id else "",
+        }
+
+    def _legacy_machine_case_payload(self, item: dict[str, object]) -> dict[str, object]:
+        case_id = str(item.get("case_id") or "")
+        reason_class = str(item.get("similarity_reason_class") or "strong_lexical_analog")
+        return {
+            "case_id": case_id,
+            "status_normalized": item.get("status_normalized", ""),
+            "score": float(item.get("score") or 0.0),
+            "qualified": True,
+            "similarity_confidence": self._legacy_similarity_confidence(item),
+            "similarity_reason_class": reason_class,
+            "threshold_version": "legacy-ranked-query-v1",
+            "reasons": item.get("reasons", []),
+            "request_description": item.get("request_description", ""),
+            "aircraft_type": item.get("aircraft_type", ""),
+            "documents": item.get("documents", []),
+            "case_url": self._registry_case_url(case_id) if case_id else "",
+        }
+
+    @staticmethod
+    def _legacy_similarity_confidence(item: dict[str, object]) -> str:
+        score = float(item.get("score") or 0.0)
+        rerank = float(item.get("rerank_score") or 0.0)
+        if score >= 1.0 or rerank >= 0.8:
+            return "high"
+        if score >= 0.8 or rerank >= 0.65:
+            return "medium"
+        return "low"
+
     def similar_cases(self, query: str, limit: int = 5) -> dict[str, object]:
+        try:
+            limit = int(limit or 5)
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(0, min(limit, 5))
         query_rewrite, rewrite_warnings = self._rewrite_query(query)
         search_queries = self._search_queries(query, query_rewrite)
         candidates = self._candidate_cases(search_queries, limit=max(limit * 20, 200))
-        candidates = self._rerank_cases(query, candidates, limit=max(limit * 4, 32))
+        candidates = self._rerank_cases(query, candidates, limit=max(limit * 8, 40))
         cases = []
         sources = []
-        for item in candidates[:limit]:
+        skipped_weak = 0
+        for item in candidates:
+            if len(cases) >= limit:
+                break
+            if not self._chat_similarity_candidate_is_useful(item):
+                skipped_weak += 1
+                continue
             case = dict(item["case"])
             evidence = self._case_evidence(case.get("case_id", ""), query, max_docs=3)
             quality_warnings = [str(doc.get("quality_warning")) for doc in evidence if doc.get("quality_warning")]
@@ -1604,7 +1900,7 @@ class CommercialOffersService:
                 "exact_score": float(item.get("exact_score", 0.0)),
                 "structured_score": float(item.get("structured_score", 0.0)),
                 "rerank_score": float(item.get("rerank_score", 0.0)),
-                "similarity_reason_class": item.get("similarity_reason_class", "weak_analog"),
+                "similarity_reason_class": self._chat_similarity_reason_class(item),
                 "matched_queries": item.get("matched_queries", []),
                 "reasons": item.get("reasons", []),
                 "check": self._check_points(query, case, evidence),
@@ -1646,6 +1942,8 @@ class CommercialOffersService:
                 llm_status = "retrieval_fallback"
         warnings = list(self._index_status.get("warnings") or [])
         warnings.extend(rewrite_warnings)
+        if skipped_weak:
+            warnings.append("weak_similar_cases_filtered")
         if not cases:
             warnings.append("no_similar_commercial_cases_found")
         return {
@@ -1656,6 +1954,34 @@ class CommercialOffersService:
             "warnings": warnings,
             "llm_status": llm_status,
         }
+
+    @staticmethod
+    def _chat_similarity_candidate_is_useful(item: dict[str, object]) -> bool:
+        reason_class = str(item.get("similarity_reason_class") or "weak_analog")
+        if reason_class != "weak_analog":
+            return True
+        score = float(item.get("score") or 0.0)
+        rerank_score = float(item.get("rerank_score") or 0.0)
+        exact_score = float(item.get("exact_score") or 0.0)
+        structured_score = float(item.get("structured_score") or 0.0)
+        semantic_score = max(float(item.get("semantic_score") or 0.0), float(item.get("profile_semantic_score") or 0.0))
+        if exact_score >= 3.0 or structured_score >= 2.0:
+            return True
+        if score >= 0.8:
+            return True
+        if semantic_score >= 0.78 and score >= 0.8:
+            return True
+        return False
+
+    @staticmethod
+    def _chat_similarity_reason_class(item: dict[str, object]) -> str:
+        reason_class = str(item.get("similarity_reason_class") or "weak_analog")
+        if reason_class != "weak_analog":
+            return reason_class
+        score = float(item.get("score") or 0.0)
+        if score >= 0.8:
+            return "strong_lexical_analog"
+        return reason_class
 
     def profile_semantic_cases(self, query: str, limit: int = 10) -> list[dict[str, object]]:
         candidates = self._profile_semantic_candidate_cases(query, limit=limit)

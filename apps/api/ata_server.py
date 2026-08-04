@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import queue
+import sqlite3
 import threading
 import time
 import uuid
@@ -21,14 +22,26 @@ from core.ata_impact.http_contract import (
     validate_stream_flag,
 )
 from core.ata_impact.modes import validate_ata_runtime_mode
+from core.ata_impact.similar_cases_client import attach_similar_cases
 from core.go_no_go import AtaDiscoveryCatalog, AtaImpactAgent, CertificateCatalog, InternalEvidenceRetriever
 from storage.sqlite.store import SQLiteStore
 
 
 CERTIFICATE = CertificateCatalog()
-ATA_STORE = SQLiteStore(SQLITE_PATH)
-ATA_STORE.initialize()
-ATA_AGENT = AtaImpactAgent(CERTIFICATE, AtaDiscoveryCatalog(CERTIFICATE), retriever=InternalEvidenceRetriever(ATA_STORE))
+ATA_STARTUP_WARNINGS: list[str] = []
+
+
+def _build_agent() -> AtaImpactAgent:
+    try:
+        store = SQLiteStore(SQLITE_PATH)
+        store.initialize()
+    except sqlite3.OperationalError as exc:
+        ATA_STARTUP_WARNINGS.append(f"sqlite_store_unavailable:{exc}")
+        return AtaImpactAgent(CERTIFICATE, AtaDiscoveryCatalog(CERTIFICATE), retriever=None)
+    return AtaImpactAgent(CERTIFICATE, AtaDiscoveryCatalog(CERTIFICATE), retriever=InternalEvidenceRetriever(store))
+
+
+ATA_AGENT = _build_agent()
 
 
 class AtaHandler(BaseHTTPRequestHandler):
@@ -45,7 +58,7 @@ class AtaHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         if path == "/health":
-            return self._json({"status": "ok", "service": "mro-ata-impact", **ATA_AGENT.health()})
+            return self._json({"status": "ok", "service": "mro-ata-impact", **ATA_AGENT.health(), "startup_warnings": ATA_STARTUP_WARNINGS})
         if path == "/v1/models":
             return self._json({"object": "list", "data": [{"id": "mro-ata-impact", "object": "model", "created": int(time.time()), "owned_by": "mro-kb-platform"}]})
         self._json({"error": "not found"}, 404)
@@ -70,6 +83,7 @@ class AtaHandler(BaseHTTPRequestHandler):
                     allow_legacy=True,
                 )
                 result = ATA_AGENT.analyze(question, fields, mode=mode)
+                combined = attach_similar_cases(result, question, fields)
             except ValueError as exc:
                 return self._json(
                     {"error": {"message": str(exc), "type": "invalid_request_error"}},
@@ -80,7 +94,7 @@ class AtaHandler(BaseHTTPRequestHandler):
                     {"error": {"message": "ATA analysis failed", "type": "server_error"}},
                     500,
                 )
-            return self._json({"ok": True, "ata_impact": result})
+            return self._json({"ok": True, "ata_impact": combined["ata_impact"], "similar_cases": combined["similar_cases"]})
         if path != "/v1/chat/completions":
             return self._json({"error": "not found"}, 404)
         if str(payload.get("model") or "") != "mro-ata-impact":
@@ -103,19 +117,22 @@ class AtaHandler(BaseHTTPRequestHandler):
         if not stream:
             try:
                 result = ATA_AGENT.analyze(question, mode=mode)
+                combined = attach_similar_cases(result, question, {})
             except Exception:
                 return self._json(
                     {"error": {"message": "ATA analysis failed", "type": "server_error"}},
                     500,
                 )
-            return self._json({"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion", "created": int(time.time()), "model": "mro-ata-impact", "choices": [{"index": 0, "message": {"role": "assistant", "content": result["answer"]}, "finish_reason": "stop"}], "ata_impact": result})
+            return self._json({"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion", "created": int(time.time()), "model": "mro-ata-impact", "choices": [{"index": 0, "message": {"role": "assistant", "content": combined["answer"]}, "finish_reason": "stop"}], "ata_impact": combined["ata_impact"], "similar_cases": combined["similar_cases"]})
         self._stream(question, mode)
 
     def _stream(self, question: str, mode: str = "auto") -> None:
         completion_id, events, result_box = f"chatcmpl-{uuid.uuid4().hex}", queue.Queue(), {}
         def work() -> None:
             try:
-                result_box["result"] = ATA_AGENT.analyze(question, progress=events.put, mode=mode)
+                result = ATA_AGENT.analyze(question, progress=events.put, mode=mode)
+                events.put({"stage": "similar_cases_search", "message": "Идет поиск похожих заявок."})
+                result_box["result"] = attach_similar_cases(result, question, {})
             except Exception:
                 result_box["error"] = True
             finally:

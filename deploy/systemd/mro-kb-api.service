@@ -12,7 +12,7 @@ Environment=MRO_KB_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 Environment=MRO_KB_QDRANT_ENABLED=1
 Environment=MRO_KB_QDRANT_URL=http://127.0.0.1:6333
 Environment=MRO_KB_QDRANT_COLLECTION=mro_kb_chunks
-Environment=MRO_KB_QDRANT_TARGET_TOTAL=54727
+Environment=MRO_KB_QDRANT_TARGET_TOTAL=35566
 Environment=MRO_KB_OLLAMA_URL=http://127.0.0.1:11434
 Environment=MRO_KB_EMBEDDING_MODEL=bge-m3
 ExecStart=/home/akhi93m6/.local/bin/python3 -m apps.api.server --host 0.0.0.0 --port 8121

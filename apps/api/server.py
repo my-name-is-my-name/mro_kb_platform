@@ -288,6 +288,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send_json({"ok": False, "error": "request is required"}, status=400)
                 fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
                 return self._send_json({"ok": True, "triage": SERVICES.go_no_go.triage(request_text, fields)})
+            if parsed.path == "/api/similar-cases/search":
+                query = str(payload.get("query") or payload.get("q") or payload.get("request") or "").strip()
+                if not query:
+                    return self._send_json(
+                        {"error": {"message": "query is required", "type": "invalid_request_error"}},
+                        status=400,
+                    )
+                return self._send_json(SERVICES.commercial_offers.search_similar_cases(payload))
             if parsed.path == "/api/ata-impact":
                 return self._send_json(
                     {

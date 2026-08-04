@@ -232,6 +232,31 @@ class AtaImpactService:
                 facts=facts,
                 reference_context=reference_context,
             )
+        reference_mapping_payload = self.reference_catalog.propose_mapping_candidates(
+            request,
+            facts,
+        )
+        reference_mapping, reference_mapping_warnings = validate_mapping(
+            reference_mapping_payload,
+            facts,
+            [],
+            request,
+        )
+        warnings.extend(reference_mapping_warnings)
+        reference_override_warnings = _apply_reference_mapping_owner(
+            mapping,
+            reference_mapping,
+        )
+        warnings.extend(reference_override_warnings)
+        trace.append(
+            {
+                "step": "reference_mapping_owner",
+                "status": "completed",
+                "object_candidates": len(reference_mapping["object_ata"]),
+                "structural_candidates": len(reference_mapping["structural_ata"]),
+                "warnings": reference_override_warnings,
+            }
+        )
         warnings.extend(
             self.reference_catalog.enforce_mapping_roles(mapping)
         )
@@ -311,6 +336,11 @@ class AtaImpactService:
         )
         if critic_response.error:
             warnings.append(critic_response.error)
+        critic_actions, critic_warnings = _apply_reference_owned_critic_actions(
+            mapping,
+            critic_actions,
+            critic_warnings,
+        )
         warnings.extend(critic_warnings)
         critic_actions = _remove_ungrounded_confirms(
             critic_actions,
@@ -990,6 +1020,105 @@ class AtaImpactService:
 
 def _mapping_atas(mapping: dict[str, list[dict[str, object]]]) -> list[str]:
     return sorted({str(item["ata"]) for category in MAPPING_CATEGORIES for item in mapping[category] if item.get("ata")})
+
+
+def _apply_reference_mapping_owner(
+    mapping: dict[str, list[dict[str, object]]],
+    reference_mapping: dict[str, list[dict[str, object]]],
+) -> list[str]:
+    warnings: list[str] = []
+    for category in ("object_ata", "structural_ata"):
+        replacements = {
+            str(item.get("entity_id") or ""): item
+            for item in reference_mapping.get(category, [])
+            if (
+                isinstance(item, dict)
+                and item.get("entity_id")
+                and item.get("ata")
+                and float(item.get("confidence") or 0.0) >= 0.65
+                and "controlled_reference_hint" in str(item.get("reason") or "")
+            )
+        }
+        if not replacements:
+            continue
+        kept: list[dict[str, object]] = []
+        replaced_ids: set[str] = set()
+        for item in mapping.get(category, []):
+            entity_id = str(item.get("entity_id") or "")
+            replacement = replacements.get(entity_id)
+            if replacement is None:
+                kept.append(item)
+                continue
+            if item.get("ata") == replacement.get("ata"):
+                kept.append({**item, "mapping_source": "gost_reference_ranker"})
+                replaced_ids.add(entity_id)
+                continue
+            kept.append(
+                {
+                    **replacement,
+                    "candidate_id": item.get("candidate_id"),
+                    "initial_state": item.get("initial_state", "candidate_unverified"),
+                    "mapping_source": "gost_reference_ranker",
+                    "previous_llm_ata": item.get("ata"),
+                    "previous_llm_candidate_id": item.get("candidate_id"),
+                }
+            )
+            replaced_ids.add(entity_id)
+            if item.get("ata") != replacement.get("ata"):
+                warnings.append(
+                    "reference_mapping_replaced_llm_candidate:"
+                    f"{category}:{entity_id}:{item.get('ata')}->{replacement.get('ata')}"
+                )
+        for entity_id, replacement in replacements.items():
+            if entity_id in replaced_ids:
+                continue
+            kept.append({**replacement, "mapping_source": "gost_reference_ranker"})
+            warnings.append(
+                "reference_mapping_added_candidate:"
+                f"{category}:{entity_id}:{replacement.get('ata')}"
+            )
+        mapping[category] = kept
+    return warnings
+
+
+def _apply_reference_owned_critic_actions(
+    mapping: dict[str, list[dict[str, object]]],
+    critic_actions: list[dict[str, object]],
+    critic_warnings: list[str],
+) -> tuple[list[dict[str, object]], list[str]]:
+    reference_owned: dict[str, tuple[str, dict[str, object]]] = {
+        str(item.get("candidate_id")): (category, item)
+        for category in ("object_ata", "structural_ata")
+        for item in mapping.get(category, [])
+        if isinstance(item, dict)
+        and item.get("candidate_id")
+        and item.get("mapping_source") == "gost_reference_ranker"
+    }
+    if not reference_owned:
+        return critic_actions, critic_warnings
+    filtered_actions = [
+        action
+        for action in critic_actions
+        if str(action.get("candidate_id") or "") not in reference_owned
+    ]
+    filtered_warnings = [
+        warning
+        for warning in critic_warnings
+        if not any(str(warning).endswith(candidate_id) for candidate_id in reference_owned)
+    ]
+    for candidate_id, (category, item) in reference_owned.items():
+        filtered_actions.append(
+            {
+                "candidate_id": candidate_id,
+                "action": "confirm",
+                "reason": "Confirmed by deterministic GOST reference ranker before LLM critic.",
+                "ata": item.get("ata"),
+                "category": category,
+                "entity_id": item.get("entity_id"),
+                "relation_id": item.get("relation_id"),
+            }
+        )
+    return filtered_actions, filtered_warnings
 
 
 def _remove_ungrounded_confirms(

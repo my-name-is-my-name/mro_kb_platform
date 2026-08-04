@@ -44,6 +44,78 @@ _QUERY_STOP_TOKENS = frozenset(
         "часть",
     }
 )
+_CONTROLLED_CHAPTER_HINTS: dict[str, dict[str, object]] = {
+    "ATA 25": {
+        "positive": (
+            "салон",
+            "пассажирский салон",
+            "кресло",
+            "кресла",
+            "сиденье",
+            "обивка",
+            "чехол",
+            "чехлы",
+            "мягкость",
+            "интерьер",
+            "cabin",
+            "seat",
+            "seat cover",
+            "interior",
+        ),
+        "negative": (),
+        "reason": "controlled_reference_hint: cabin/interior equipment",
+    },
+    "ATA 44": {
+        "positive": (
+            "развлечение",
+            "видео",
+            "музыка",
+            "мультимедиа",
+            "пассажирская связь",
+            "ife",
+            "entertainment",
+            "connectivity",
+        ),
+        "negative": ("чехол", "чехлы", "кресло", "сиденье", "seat cover"),
+        "reason": "controlled_reference_hint: passenger entertainment/information system",
+    },
+    "ATA 57": {
+        "positive": (
+            "крыло",
+            "центроплан",
+            "отъемная часть крыла",
+            "нервюра",
+            "нервюры",
+            "rib",
+            "rib5",
+            "лонжерон",
+            "spar",
+            "закрылок",
+            "предкрылок",
+            "wing",
+            "flap",
+            "slat",
+        ),
+        "negative": (),
+        "reason": "controlled_reference_hint: wing structure",
+    },
+    "ATA 55": {
+        "positive": (
+            "оперение",
+            "стабилизатор",
+            "киль",
+            "руль высоты",
+            "руль направления",
+            "empennage",
+            "stabilizer",
+            "rudder",
+            "elevator",
+            "tailplane",
+        ),
+        "negative": ("rib5",),
+        "reason": "controlled_reference_hint: empennage structure",
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +296,40 @@ class AtaClassificationReferenceCatalog:
             ],
         }
 
+    def propose_mapping_candidates(
+        self,
+        request: str,
+        engineering_facts: dict[str, object],
+    ) -> dict[str, list[dict[str, object]]]:
+        proposals: dict[str, list[dict[str, object]]] = {
+            "object_ata": [],
+            "structural_ata": [],
+            "location_context_ata": [],
+            "interface_ata_hypotheses": [],
+            "procedure_ata_hypotheses": [],
+            "user_declared_ata": [],
+        }
+        if not self.available:
+            return proposals
+        for entity in _affected_entities(engineering_facts):
+            category = "structural_ata" if entity["entity_type"] == "structure" else "object_ata"
+            scored = self._score_chapters_for_entity(request, engineering_facts, entity, category)
+            if not scored:
+                continue
+            score, ata, reason = scored[0]
+            if score < 2.0:
+                continue
+            proposals[category].append(
+                {
+                    "ata": ata,
+                    "entity_id": entity["entity_id"],
+                    "confidence": min(0.9, max(0.55, score / 10.0)),
+                    "reason": reason,
+                    "source_fragment": entity["name"],
+                }
+            )
+        return proposals
+
     def attach_references(
         self,
         mapping: dict[str, list[dict[str, object]]],
@@ -258,6 +364,56 @@ class AtaClassificationReferenceCatalog:
                 accepted.append(candidate)
             mapping[category] = accepted
         return warnings
+
+    def _score_chapters_for_entity(
+        self,
+        request: str,
+        engineering_facts: dict[str, object],
+        entity: dict[str, str],
+        category: str,
+    ) -> list[tuple[float, str, str]]:
+        query = _entity_query_text(request, engineering_facts, entity)
+        query_tokens = Counter(_tokens(query))
+        if not query_tokens:
+            return []
+        scored: dict[str, float] = {}
+        reasons: dict[str, list[str]] = {}
+        for entry in self.entries:
+            allowed = self.chapter_role_policy.get(entry.parent_ata, ())
+            if allowed and category not in allowed:
+                continue
+            entry_tokens = Counter(_tokens(_reference_text(entry)))
+            lexical = 0.0
+            for token, count in query_tokens.items():
+                matches = entry_tokens.get(token, 0)
+                if not matches and len(token) >= 6:
+                    prefix = token[:5]
+                    matches = sum(
+                        value
+                        for ref_token, value in entry_tokens.items()
+                        if len(ref_token) >= 6 and ref_token.startswith(prefix)
+                    )
+                if matches:
+                    lexical += min(matches, 3) * min(count, 2)
+            if lexical:
+                scored[entry.parent_ata] = scored.get(entry.parent_ata, 0.0) + lexical
+                reasons.setdefault(entry.parent_ata, []).append(
+                    f"ГОСТ lexical match: {entry.ata} {entry.title}"
+                )
+        hint_scores = _controlled_hint_scores(query)
+        for ata, hint in hint_scores.items():
+            scored[ata] = scored.get(ata, 0.0) + hint[0]
+            reasons.setdefault(ata, []).append(hint[1])
+        ranked = [
+            (
+                score,
+                ata,
+                "; ".join(dict.fromkeys(reasons.get(ata, [])))[0:500],
+            )
+            for ata, score in scored.items()
+        ]
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return ranked
 
     def reference_ids_for_ata(self, ata: str) -> list[str]:
         normalized = normalize_ata(ata)
@@ -617,6 +773,105 @@ def _query_text(request: str, facts: dict[str, object]) -> str:
             in {"relation", "evidence_type", "interface_basis"}
         )
     return " ".join(values)
+
+
+def _affected_entities(facts: dict[str, object]) -> list[dict[str, str]]:
+    damaged_ids = {
+        str(item.get("affected_entity_id") or "")
+        for item in facts.get("damage", [])
+        if isinstance(item, dict) and item.get("affected_entity_id")
+    }
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key, entity_type in (
+        ("physical_objects", "object"),
+        ("structural_elements", "structure"),
+    ):
+        items = facts.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            entity_id = str(item.get("id") or "")
+            involvement = str(item.get("involvement") or "").lower()
+            affected = (
+                entity_id in damaged_ids
+                or item.get("damage_confirmed") is True
+                or involvement
+                in {
+                    "damaged",
+                    "changed",
+                    "modified",
+                    "removed",
+                    "replaced",
+                    "repair",
+                    "repaired",
+                    "work_target",
+                }
+            )
+            identity = (entity_type, entity_id)
+            if not entity_id or not affected or identity in seen:
+                continue
+            seen.add(identity)
+            result.append(
+                {
+                    "entity_id": entity_id,
+                    "entity_type": entity_type,
+                    "name": str(item.get("name") or item.get("original_text") or ""),
+                }
+            )
+    return result
+
+
+def _entity_query_text(request: str, facts: dict[str, object], entity: dict[str, str]) -> str:
+    entity_id = entity["entity_id"]
+    values = [request, entity.get("name", "")]
+    for key in ("physical_objects", "structural_elements", "locations"):
+        items = facts.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or str(item.get("id") or "") != entity_id:
+                continue
+            values.extend(
+                str(value)
+                for field, value in item.items()
+                if isinstance(value, (str, int, float)) and field not in {"id", "confidence"}
+            )
+    for item in facts.get("functional_purposes", []):
+        if isinstance(item, dict) and str(item.get("object_id") or "") == entity_id:
+            values.extend(
+                str(value)
+                for field, value in item.items()
+                if isinstance(value, (str, int, float)) and field not in {"object_id", "confidence"}
+            )
+    for item in facts.get("damage", []):
+        if isinstance(item, dict) and str(item.get("affected_entity_id") or "") == entity_id:
+            values.extend(
+                str(value)
+                for field, value in item.items()
+                if isinstance(value, (str, int, float)) and field != "affected_entity_id"
+            )
+    return " ".join(values)
+
+
+def _controlled_hint_scores(query: str) -> dict[str, tuple[float, str]]:
+    normalized = query.lower().replace("ё", "е")
+    result: dict[str, tuple[float, str]] = {}
+    for ata, config in _CONTROLLED_CHAPTER_HINTS.items():
+        positive = tuple(str(item).lower() for item in config.get("positive", ()) if str(item))
+        negative = tuple(str(item).lower() for item in config.get("negative", ()) if str(item))
+        score = 0.0
+        for term in positive:
+            if term and term in normalized:
+                score += 12.0 if " " in term else 8.0
+        for term in negative:
+            if term and term in normalized:
+                score -= 8.0
+        if score > 0:
+            result[ata] = (score, str(config.get("reason") or "controlled_reference_hint"))
+    return result
 
 
 def _tokens(value: str) -> list[str]:

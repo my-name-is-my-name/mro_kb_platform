@@ -14,6 +14,10 @@ Environment=MRO_KB_LLM_MAX_TOKENS=300
 Environment=MRO_KB_LLM_TIMEOUT_SECONDS=30
 Environment=MRO_KB_RERANKER_ENABLED=0
 Environment=MRO_KB_TSEARCH_ENABLED=0
+Environment=MRO_ATA_SIMILAR_CASES_ENABLED=1
+Environment=MRO_ATA_SIMILAR_CASES_URL=http://127.0.0.1:8121/api/similar-cases/search
+Environment=MRO_ATA_SIMILAR_CASES_TIMEOUT_SECONDS=30
+Environment=MRO_ATA_SIMILAR_CASES_RETRIES=0
 ExecStart=/home/akhi93m6/.local/bin/python3 -m apps.api.ata_server --host 10.100.112.51 --port 8122
 Restart=always
 RestartSec=5
