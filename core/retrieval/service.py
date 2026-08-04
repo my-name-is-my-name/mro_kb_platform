@@ -97,16 +97,18 @@ class RetrievalService:
             )
         answer = self._build_answer(question, case_payload, sources, requested_references)
         llm_status = "retrieval_only"
-        if self._llm is not None and sources and not self._is_list_query(question):
+        if self._llm is not None and sources:
             try:
                 llm_answer = self._generate_llm_answer(question, case_payload, sources, requested_references)
                 if llm_answer.strip():
                     answer = llm_answer
                     llm_status = "openai_compatible"
                 else:
-                    llm_status = "retrieval_fallback"
-            except Exception:
-                llm_status = "retrieval_fallback"
+                    answer = self._llm_failure_answer("LLM returned empty content", sources)
+                    llm_status = "llm_empty"
+            except Exception as exc:
+                answer = self._llm_failure_answer(repr(exc), sources)
+                llm_status = "llm_error"
         warnings = list(self._last_vector_warnings)
         if not sources:
             warnings.append("no_relevant_sources_found")
@@ -845,12 +847,43 @@ class RetrievalService:
                 f"snippet={str(source['snippet'])[:1200]}\n"
             )
         user_prompt = "\n".join(lines)
-        answer = self._llm.chat(system_prompt, user_prompt).strip()
+        answer = self._llm.chat(system_prompt, user_prompt, allow_reasoning_fallback=False).strip()
+        if not answer:
+            compact_lines = lines[:]
+            compact_lines = [line if not line.startswith("snippet=") else f"{line[:700]}" for line in compact_lines]
+            compact_lines.append(
+                "Сформируй финальный инженерный ответ. Не возвращай пустой ответ. "
+                "Если данных недостаточно, прямо напиши, каких данных не хватает."
+            )
+            answer = self._llm.chat(
+                system_prompt + " Верни только финальный ответ обычным текстом. Не выводи thinking, reasoning, план анализа или служебные рассуждения.",
+                "\n".join(compact_lines),
+                allow_reasoning_fallback=False,
+            ).strip()
+        if not answer:
+            raise RuntimeError("LLM returned empty content")
         if not answer:
             return answer
         suffix = self._source_summary(sources)
         appendix = f"{suffix}\n\n{self._sources_table(sources)}" if suffix else self._sources_table(sources)
         return f"{answer}\n\n{appendix}"
+
+    def _llm_failure_answer(self, error_text: str, sources: list[dict[str, object]]) -> str:
+        lines = [
+            "LLM не сформировал финальный ответ.",
+            f"Техническая причина: {error_text}",
+            "",
+            "Ниже оставлены найденные источники для диагностики retrieval:",
+        ]
+        for source in sources[:3]:
+            lines.append(f"- {source.get('title', '')}")
+        lines.append("")
+        source_summary = self._source_summary(sources)
+        if source_summary:
+            lines.append(source_summary)
+            lines.append("")
+        lines.append(self._sources_table(sources))
+        return "\n".join(lines)
 
     def _sources_table(self, sources: list[dict[str, object]]) -> str:
         rows = [

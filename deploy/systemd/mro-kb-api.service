@@ -6,7 +6,9 @@ After=default.target
 Type=simple
 WorkingDirectory=/mnt/ii_models/Users/hizhenkov/mro_kb_platform
 Environment=MRO_KB_PUBLIC_BASE_URL=http://10.100.112.51:8121
-Environment=MRO_KB_LLM_ENABLED=0
+Environment=MRO_KB_LLM_ENABLED=1
+Environment=MRO_KB_LLM_TIMEOUT_SECONDS=120
+Environment=MRO_KB_LLM_MAX_TOKENS=4000
 Environment=MRO_KB_RERANKER_URL=http://10.251.10.5:9101
 Environment=MRO_KB_RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 Environment=MRO_KB_QDRANT_ENABLED=1
