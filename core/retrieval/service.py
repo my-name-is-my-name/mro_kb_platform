@@ -52,7 +52,7 @@ class RetrievalService:
         explicit_case_id = self._extract_case_id(question)
         case_payload = self.store.fetch_case(explicit_case_id) if explicit_case_id else None
         hits = self._collect_candidates(question, limit=max(limit * 6, 36), explicit_case_id=explicit_case_id)
-        if not self._is_list_query(question):
+        if not self._is_list_query(question) and not self._is_case_overview_query(question):
             hits = self._rerank_hits(question, hits, limit=max(limit * 6, 36))
         hits = self._select_hits(question, hits, limit=limit)
         sources: list[dict[str, object]] = []
@@ -163,6 +163,17 @@ class RetrievalService:
             )
             if case_payload.get("subject"):
                 lines.append(f"Тема: {case_payload['subject']}")
+            if self._is_case_overview_query(question):
+                lines.append("")
+                lines.append("Кратко по заявке:")
+                if case_payload.get("problem_summary"):
+                    lines.append(f"- Суть: {case_payload['problem_summary']}")
+                elif case_payload.get("subject"):
+                    lines.append(f"- Суть: {case_payload['subject']}")
+                if case_payload.get("ata_list"):
+                    lines.append(f"- ATA: {', '.join(str(item) for item in case_payload['ata_list'])}")
+                if case_payload.get("applicable_ap_refs"):
+                    lines.append(f"- Применимые AP: {', '.join(str(item) for item in case_payload['applicable_ap_refs'][:6])}")
             lines.append("")
         if sources:
             case_ids = self._case_ids_from_sources(sources)
@@ -186,6 +197,14 @@ class RetrievalService:
         else:
             lines.append("В найденных документах надежного ответа нет.")
         return "\n".join(lines)
+
+    @staticmethod
+    def _is_case_overview_query(question: str) -> bool:
+        normalized = (question or "").lower().replace("ё", "е")
+        return bool(
+            re.search(r"\b(о\s+чем|про\s+что|что\s+за|кратк[оая]+|суть|описани[ея])\b", normalized)
+            and re.search(r"\b(заявк|mro|mp|wo|мр|номер|№|\d{2,5})", normalized)
+        )
 
     def _rerank_hits(self, question: str, hits: list[dict[str, object]], limit: int) -> list[dict[str, object]]:
         if not hits:
