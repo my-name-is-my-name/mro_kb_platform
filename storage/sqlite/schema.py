@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     text TEXT NOT NULL DEFAULT '',
     search_text TEXT NOT NULL DEFAULT '',
     table_refs_json TEXT NOT NULL DEFAULT '[]',
+    citation_refs_json TEXT NOT NULL DEFAULT '[]',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     page_number INTEGER,
     source_file TEXT NOT NULL DEFAULT '',
@@ -60,6 +61,35 @@ CREATE TABLE IF NOT EXISTS chunks (
     page_image_path TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(case_id) REFERENCES cases(case_id),
     FOREIGN KEY(document_id) REFERENCES documents(document_id)
+);
+
+CREATE TABLE IF NOT EXISTS document_references (
+    document_id TEXT NOT NULL,
+    ref_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    marker TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    document_number TEXT NOT NULL DEFAULT '',
+    document_type TEXT NOT NULL DEFAULT '',
+    raw_text TEXT NOT NULL DEFAULT '',
+    source_document_id TEXT NOT NULL DEFAULT '',
+    source_table_id TEXT NOT NULL DEFAULT '',
+    source_file TEXT NOT NULL DEFAULT '',
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(document_id, ref_id),
+    FOREIGN KEY(document_id) REFERENCES documents(document_id),
+    FOREIGN KEY(case_id) REFERENCES cases(case_id)
+);
+
+CREATE TABLE IF NOT EXISTS chunk_references (
+    chunk_id TEXT NOT NULL,
+    ref_id TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    PRIMARY KEY(chunk_id, ref_id),
+    FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id),
+    FOREIGN KEY(document_id) REFERENCES documents(document_id),
+    FOREIGN KEY(case_id) REFERENCES cases(case_id)
 );
 
 CREATE TABLE IF NOT EXISTS case_document_links (
@@ -91,4 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_case_id ON documents(case_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_case_id ON chunks(case_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_unit_kind ON chunks(unit_kind);
+CREATE INDEX IF NOT EXISTS idx_document_references_case_ref ON document_references(case_id, ref_id);
+CREATE INDEX IF NOT EXISTS idx_document_references_number ON document_references(document_number);
+CREATE INDEX IF NOT EXISTS idx_chunk_references_document_ref ON chunk_references(document_id, ref_id);
 """

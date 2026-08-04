@@ -10,7 +10,7 @@ import re
 import threading
 from typing import Iterator
 
-from core.models.entities import CaseSummary, DocumentChunk
+from core.models.entities import CaseSummary, DocumentChunk, DocumentReference
 from storage.sqlite.schema import SCHEMA_SQL
 
 
@@ -82,6 +82,7 @@ class SQLiteStore:
             "heading_path_json": "ALTER TABLE chunks ADD COLUMN heading_path_json TEXT NOT NULL DEFAULT '[]'",
             "search_text": "ALTER TABLE chunks ADD COLUMN search_text TEXT NOT NULL DEFAULT ''",
             "table_refs_json": "ALTER TABLE chunks ADD COLUMN table_refs_json TEXT NOT NULL DEFAULT '[]'",
+            "citation_refs_json": "ALTER TABLE chunks ADD COLUMN citation_refs_json TEXT NOT NULL DEFAULT '[]'",
             "metadata_json": "ALTER TABLE chunks ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
         }
         for column, statement in migrations.items():
@@ -141,10 +142,13 @@ class SQLiteStore:
         documents: list[dict[str, str]],
         chunks: list[DocumentChunk],
         links: list[tuple[str, str, str]],
+        references: list[DocumentReference] | None = None,
     ) -> None:
         with self._write_lock:
             with self.connect() as conn:
                 conn.execute("DELETE FROM case_document_links")
+                conn.execute("DELETE FROM chunk_references")
+                conn.execute("DELETE FROM document_references")
                 conn.execute("DELETE FROM chunks")
                 conn.execute("DELETE FROM documents")
                 conn.executemany(
@@ -185,9 +189,9 @@ class SQLiteStore:
                     INSERT INTO chunks (
                         chunk_id, case_id, document_id, chunk_kind, unit_kind, chunk_level, document_family,
                         section_label, section_title, heading_path_json, text, search_text,
-                        table_refs_json, metadata_json, page_number,
+                        table_refs_json, citation_refs_json, metadata_json, page_number,
                         source_file, source_system, block_id, vault_note_path, page_image_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -204,6 +208,7 @@ class SQLiteStore:
                             chunk.text,
                             chunk.search_text,
                             json.dumps(chunk.table_refs, ensure_ascii=False),
+                            json.dumps(chunk.citation_refs, ensure_ascii=False),
                             json.dumps(chunk.metadata, ensure_ascii=False),
                             chunk.page_number,
                             chunk.source_file,
@@ -213,6 +218,43 @@ class SQLiteStore:
                             chunk.page_image_path,
                         )
                         for chunk in chunks
+                    ],
+                )
+                if references:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO document_references (
+                            document_id, ref_id, case_id, marker, title, document_number, document_type,
+                            raw_text, source_document_id, source_table_id, source_file, raw_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                reference.document_id,
+                                reference.ref_id,
+                                reference.case_id,
+                                reference.marker,
+                                reference.title,
+                                reference.document_number,
+                                reference.document_type,
+                                reference.raw_text,
+                                reference.source_document_id,
+                                reference.source_table_id,
+                                reference.source_file,
+                                json.dumps(reference.raw_json, ensure_ascii=False),
+                            )
+                            for reference in references
+                        ],
+                    )
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO chunk_references (chunk_id, ref_id, document_id, case_id)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (chunk.chunk_id, ref_id, chunk.document_id, chunk.case_id)
+                        for chunk in chunks
+                        for ref_id in chunk.citation_refs
                     ],
                 )
                 conn.executemany(
@@ -286,7 +328,7 @@ class SQLiteStore:
                 for item in conn.execute(
                     """
                     SELECT chunk_id, chunk_kind, unit_kind, chunk_level, document_family, section_label,
-                           section_title, heading_path_json, text, search_text, table_refs_json,
+                           section_title, heading_path_json, text, search_text, table_refs_json, citation_refs_json,
                            page_number, block_id, vault_note_path, page_image_path
                     FROM chunks
                     WHERE document_id = ?
@@ -295,6 +337,7 @@ class SQLiteStore:
                     (document_id,),
                 ).fetchall()
             ]
+            payload["chunks"] = [self._decode_chunk_row(item) for item in payload["chunks"]]
             return payload
 
     def fetch_chunk(self, chunk_id: str) -> dict[str, object] | None:
@@ -303,7 +346,7 @@ class SQLiteStore:
                 """
                 SELECT h.chunk_id, h.case_id, h.document_id, h.chunk_kind, h.unit_kind, h.chunk_level,
                        h.section_label, h.section_title, h.heading_path_json,
-                       h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
+                       h.text, h.search_text, h.table_refs_json, h.citation_refs_json, h.metadata_json, h.page_number,
                        h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
                        d.source_document_id, d.title AS document_title, d.document_type, d.issuer,
                        d.aircraft_type AS document_aircraft_type, d.effectivity, d.ata AS document_ata,
@@ -314,7 +357,7 @@ class SQLiteStore:
                 """,
                 (chunk_id,),
             ).fetchone()
-            return dict(row) if row is not None else None
+            return self._decode_chunk_row(dict(row)) if row is not None else None
 
     def search_text(self, query: str, limit: int = 8, case_ids: list[str] | None = None) -> list[dict[str, object]]:
         tokens = self._search_terms(query)
@@ -383,7 +426,7 @@ class SQLiteStore:
                        d.document_id, d.source_document_id, d.title, d.document_family,
                        h.chunk_id, h.chunk_kind, h.unit_kind, h.chunk_level,
                        h.section_label, h.section_title, h.heading_path_json, h.text, h.search_text,
-                       h.table_refs_json, h.metadata_json, h.source_file,
+                       h.table_refs_json, h.citation_refs_json, h.metadata_json, h.source_file,
                        h.vault_note_path, h.block_id, h.page_image_path,
                        ({' + '.join(score_terms)}) AS lexical_score,
                        ({' + '.join(coverage_terms)}) AS token_coverage
@@ -396,7 +439,7 @@ class SQLiteStore:
                 """,
                 (*params, *(case_ids or []), limit),
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [self._decode_chunk_row(dict(row)) for row in rows]
 
     def search_documents(self, query: str, limit: int = 8) -> list[dict[str, object]]:
         return self.search_documents_for_cases(query, [], limit=limit)
@@ -534,7 +577,7 @@ class SQLiteStore:
                 """
                 SELECT h.chunk_id, h.case_id, h.document_id, h.chunk_kind, h.unit_kind, h.chunk_level,
                        h.section_label, h.section_title, h.heading_path_json,
-                       h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
+                       h.text, h.search_text, h.table_refs_json, h.citation_refs_json, h.metadata_json, h.page_number,
                        h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
                        d.source_document_id, d.title, d.document_family, d.document_type, d.issuer,
                        d.aircraft_type AS document_aircraft_type, d.effectivity, d.ata AS document_ata,
@@ -551,7 +594,7 @@ class SQLiteStore:
                 """,
                 (document_id, limit),
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [self._decode_chunk_row(dict(row)) for row in rows]
 
     def fetch_section_chunks(self, document_id: str, section_title: str, limit: int = 80) -> list[dict[str, object]]:
         with self.connect() as conn:
@@ -559,7 +602,7 @@ class SQLiteStore:
                 """
                 SELECT h.chunk_id, h.case_id, h.document_id, h.chunk_kind, h.unit_kind, h.chunk_level,
                        h.section_label, h.section_title, h.heading_path_json,
-                       h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
+                       h.text, h.search_text, h.table_refs_json, h.citation_refs_json, h.metadata_json, h.page_number,
                        h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
                        d.source_document_id, d.title, d.document_family, d.document_type, d.issuer,
                       c.subject, c.problem_summary, c.aircraft_type, c.msn
@@ -572,7 +615,7 @@ class SQLiteStore:
                 """,
                 (document_id, section_title, limit),
             ).fetchall()
-            return [dict(row) for row in rows]
+            return [self._decode_chunk_row(dict(row)) for row in rows]
 
     def iter_vector_chunks(self, batch_size: int = 512, limit: int = 0) -> Iterator[dict[str, object]]:
         emitted = 0
@@ -583,7 +626,7 @@ class SQLiteStore:
                 f"""
                 SELECT h.chunk_id, h.case_id, h.document_id, h.chunk_kind, h.unit_kind, h.chunk_level,
                        h.document_family, h.section_label, h.section_title, h.heading_path_json,
-                       h.text, h.search_text, h.table_refs_json, h.metadata_json, h.page_number,
+                       h.text, h.search_text, h.table_refs_json, h.citation_refs_json, h.metadata_json, h.page_number,
                        h.source_file, h.block_id, h.vault_note_path, h.page_image_path,
                        d.source_document_id, d.title, d.document_type, d.issuer,
                        d.aircraft_type AS document_aircraft_type, d.effectivity, d.ata AS document_ata,
@@ -605,6 +648,7 @@ class SQLiteStore:
                     payload = dict(row)
                     payload["heading_path"] = self._json_list(payload.pop("heading_path_json", "[]"))
                     payload["table_refs"] = self._json_list(payload.pop("table_refs_json", "[]"))
+                    payload["citation_refs"] = self._json_list(payload.pop("citation_refs_json", "[]"))
                     payload["metadata"] = self._json_dict(payload.pop("metadata_json", "{}"))
                     payload["ata_list"] = self._json_list(payload.pop("ata_list_json", "[]"))
                     yield payload
@@ -622,6 +666,64 @@ class SQLiteStore:
             digest.update(str(chunk.get("search_text") or chunk.get("text") or "").encode("utf-8"))
             digest.update(b"\0")
         return digest.hexdigest()
+
+    def fetch_document_references(self, document_id: str) -> list[dict[str, object]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM document_references
+                WHERE document_id = ?
+                ORDER BY CAST(ref_id AS INTEGER), ref_id
+                """,
+                (document_id,),
+            ).fetchall()
+            return [self._decode_reference_row(dict(row)) for row in rows]
+
+    def resolve_document_reference(self, document_id: str, ref_id: str) -> dict[str, object] | None:
+        normalized_ref_id = str(int(ref_id)) if str(ref_id).isdigit() else str(ref_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM document_references
+                WHERE document_id = ? AND ref_id = ?
+                """,
+                (document_id, normalized_ref_id),
+            ).fetchone()
+            return self._decode_reference_row(dict(row)) if row is not None else None
+
+    def resolve_case_references(self, case_id: str, ref_ids: list[str]) -> list[dict[str, object]]:
+        normalized_ref_ids = [str(int(ref_id)) if str(ref_id).isdigit() else str(ref_id) for ref_id in ref_ids]
+        normalized_ref_ids = [ref_id for ref_id in dict.fromkeys(normalized_ref_ids) if ref_id]
+        if not normalized_ref_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ref_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM document_references
+                WHERE case_id = ? AND ref_id IN ({placeholders})
+                ORDER BY source_document_id, CAST(ref_id AS INTEGER), ref_id
+                """,
+                (case_id, *normalized_ref_ids),
+            ).fetchall()
+            return [self._decode_reference_row(dict(row)) for row in rows]
+
+    def resolve_chunk_references(self, chunk_id: str) -> list[dict[str, object]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT r.*
+                FROM chunk_references cr
+                JOIN document_references r ON r.document_id = cr.document_id AND r.ref_id = cr.ref_id
+                WHERE cr.chunk_id = ?
+                ORDER BY CAST(r.ref_id AS INTEGER), r.ref_id
+                """,
+                (chunk_id,),
+            ).fetchall()
+            return [self._decode_reference_row(dict(row)) for row in rows]
 
     def parent_section_count(self) -> int:
         keys: set[tuple[str, str]] = set()
@@ -729,6 +831,24 @@ class SQLiteStore:
         except Exception:
             return []
         return parsed if isinstance(parsed, list) else []
+
+    @staticmethod
+    def _decode_chunk_row(payload: dict[str, object]) -> dict[str, object]:
+        if "heading_path_json" in payload:
+            payload["heading_path"] = SQLiteStore._json_list(payload.pop("heading_path_json", "[]"))
+        if "table_refs_json" in payload:
+            payload["table_refs"] = SQLiteStore._json_list(payload.pop("table_refs_json", "[]"))
+        if "citation_refs_json" in payload:
+            payload["citation_refs"] = SQLiteStore._json_list(payload.pop("citation_refs_json", "[]"))
+        if "metadata_json" in payload:
+            payload["metadata"] = SQLiteStore._json_dict(payload.pop("metadata_json", "{}"))
+        return payload
+
+    @staticmethod
+    def _decode_reference_row(payload: dict[str, object]) -> dict[str, object]:
+        if "raw_json" in payload:
+            payload["raw"] = SQLiteStore._json_dict(payload.pop("raw_json", "{}"))
+        return payload
 
     @staticmethod
     def _json_dict(value: object) -> dict[str, object]:

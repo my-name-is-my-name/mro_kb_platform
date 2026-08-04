@@ -31,6 +31,7 @@ class DocumentChunk:
     chunk_level: str = ""
     document_family: str = ""
     table_refs: list[str] = field(default_factory=list)
+    citation_refs: list[str] = field(default_factory=list)
     metadata: dict[str, str] = field(default_factory=dict)
     page_number: int | None = None
     source_system: str = "mro_rag"
@@ -62,3 +63,19 @@ class DocumentRecord:
     source_path: str = ""
     trust_level: str = "internal_reference"
     source_origin: str = "internal"
+
+
+@dataclass(slots=True)
+class DocumentReference:
+    case_id: str
+    document_id: str
+    ref_id: str
+    marker: str = ""
+    title: str = ""
+    document_number: str = ""
+    document_type: str = ""
+    raw_text: str = ""
+    source_document_id: str = ""
+    source_table_id: str = ""
+    source_file: str = ""
+    raw_json: dict[str, object] = field(default_factory=dict)

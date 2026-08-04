@@ -581,6 +581,7 @@ class MroQdrantIndex:
             "section_title": str(chunk.get("section_title") or ""),
             "section_label": str(chunk.get("section_label") or ""),
             "heading_path": chunk.get("heading_path") if isinstance(chunk.get("heading_path"), list) else [],
+            "citation_refs": chunk.get("citation_refs") if isinstance(chunk.get("citation_refs"), list) else [],
             "subject": str(chunk.get("subject") or ""),
             "problem_summary": str(chunk.get("problem_summary") or ""),
             "aircraft_type": str(chunk.get("aircraft_type") or ""),

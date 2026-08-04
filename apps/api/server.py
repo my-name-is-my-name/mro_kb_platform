@@ -42,11 +42,11 @@ class RuntimeServices:
 
     def run_ingest(self) -> dict[str, object]:
         demo_root = self.paths.mro_rag_root / "apps" / "webapp" / "demo_data"
-        cases, documents, chunks, doc_hash = import_mro_documents(demo_root)
+        cases, documents, chunks, references, doc_hash = import_mro_documents(demo_root)
         links = [(row["case_id"], row["document_id"], "matched") for row in documents]
         publish_obsidian_vault(self.paths.obsidian_vault_root, cases, chunks)
         self.store.replace_cases(cases)
-        self.store.replace_documents_and_chunks(documents, chunks, links)
+        self.store.replace_documents_and_chunks(documents, chunks, links, references)
         doc_snapshot_id = self.store.write_snapshot(str(demo_root), doc_hash, "mro_rag")
         return {
             "ok": True,
