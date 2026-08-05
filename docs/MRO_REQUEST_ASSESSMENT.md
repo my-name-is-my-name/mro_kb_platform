@@ -12,6 +12,7 @@ Optional configuration:
 
 - `MRO_ASSESSMENT_HTTP_TIMEOUT_SECONDS`, default `10`
 - `MRO_ASSESSMENT_SIMILAR_CASES_FALLBACK_ENABLED`, default `false`
+- `MRO_ASSESSMENT_MAX_RAG_CASES`, default `3`
 - `MRO_ASSESSMENT_CAPABILITY_REGISTRY`, default `config/request_assessment_capabilities.json`
 - `MRO_ASSESSMENT_DB_PATH`, default `data_runtime/request_assessment.sqlite3`
 
@@ -56,6 +57,40 @@ Decision logic is deterministic:
 5. passed mandatory controlled checks -> `ACCEPT_FOR_QUOTATION`
 
 Similar cases embedded in the `mro-ata-impact` response are reused. The fallback `/api/similar-cases/search` client runs only when the embedded block is missing, disabled or unavailable and fallback is explicitly enabled.
+
+Historical RAG workflow:
+
+1. `mro-ata-impact` structures the new request and may embed Similar Cases.
+2. `mro-request-assessment` selects the top `MRO_ASSESSMENT_MAX_RAG_CASES` technically useful candidates across all Similar Cases groups. Historical accepted/not accepted status does not directly drive the decision.
+3. For every selected `case_id`, `mro-request-assessment` sends an addressed HTTP query to `mro-kb` asking for document-backed facts about prior work. If no qualified analogs are found, it performs one wide MRO KB search for partial historical materials.
+4. The service extracts a universal `HistoricalFact` list using best effort parsing: explicit structured fields first, then a valid JSON block in `answer`, then explicit metadata from `sources`/`evidence`. Invalid JSON is a warning, not a workflow failure.
+5. The service builds `historical_inference` with `historical_support`, `proposed_scope`, `differences`, `assumptions` and `missing_inputs`.
+
+Supported historical fact categories are intentionally small:
+
+- `activity`
+- `calculation`
+- `document`
+- `customer_input`
+- `discipline`
+- `reference`
+- `constraint`
+- `outcome`
+
+Historical support values:
+
+- `DIRECT`: a strong Similar Case and document-backed facts about prior work are available.
+- `PARTIAL`: partial historical materials are available but do not confirm a full analog work package.
+- `NONE`: no useful document-backed historical facts were extracted.
+- `UNAVAILABLE`: MRO KB was unavailable; absence of historical documents is not inferred.
+
+`quotation_readiness` is separate from the formal decision:
+
+- `NEEDS_INFORMATION`: blocking customer data is missing.
+- `READY_FOR_ESTIMATION`: direct historical support exists and proposed scope is not empty.
+- `NEEDS_EXPERT_REVIEW`: support is partial/none/unavailable or expert confirmation is otherwise needed.
+
+Historical RAG never becomes automatic capability proof. The deterministic decision engine remains conservative: controlled hard fail -> `DECLINE`; blocking missing data -> `REQUEST_INFORMATION`; capability/approval/documentary uncertainty -> `EXPERT_REVIEW`; controlled checks pass -> `ACCEPT_FOR_QUOTATION`.
 
 MRO KB HTTP success is not treated as documentary confirmation. Returned `sources` and `evidence` are normalized and assessed for matching `case_id`, document/chunk identifiers, snippet presence, relevance and applicability. Empty or inconclusive RAG results never imply `DECLINE`; if documentary verification is required, they route the request to `EXPERT_REVIEW`.
 

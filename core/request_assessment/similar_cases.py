@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from .models import SelectedSimilarCase
@@ -36,43 +37,44 @@ def is_similar_cases_unavailable(payload: dict[str, Any] | None) -> bool:
 def select_similar_cases(payload: dict[str, Any] | None) -> list[SelectedSimilarCase]:
     if not isinstance(payload, dict):
         return []
-    selected: list[SelectedSimilarCase] = []
-    selected.extend(_select_group(payload.get("accepted"), "accepted", 3))
-    selected.extend(_select_group(payload.get("not_accepted"), "not_accepted", 2))
-    selected.extend(_select_group(payload.get("intermediate"), "intermediate", 1))
+    limit = _max_rag_cases()
+    candidates: list[tuple[tuple[int, float, float, float, int], SelectedSimilarCase]] = []
+    for group in ("accepted", "not_accepted", "intermediate"):
+        cases = [item for item in payload.get(group) if isinstance(item, dict)] if isinstance(payload.get(group), list) else []
+        for item in cases:
+            case_id = str(item.get("case_id") or item.get("id") or "").strip()
+            if not case_id:
+                continue
+            selected = SelectedSimilarCase(
+                case_id=case_id,
+                group=group,
+                similarity_class=str(item.get("similarity_reason_class") or item.get("similarity_class") or ""),
+                confidence=item.get("similarity_confidence"),
+                scores={key: item.get(key) for key in ("structured_score", "semantic_score", "rerank_score") if key in item},
+                reasons=[str(reason) for reason in item.get("reasons", [])] if isinstance(item.get("reasons"), list) else [],
+                source=item,
+            )
+            candidates.append((_rank(item), selected))
+    candidates.sort(key=lambda value: value[0], reverse=True)
+    selected = [item for _, item in candidates]
     stronger = [item for item in selected if item.similarity_class != "weak_analog"]
-    return stronger or selected
+    return (stronger or selected)[:limit]
 
 
 def qualified_cases(payload: dict[str, Any] | None) -> bool:
     return bool(select_similar_cases(payload))
 
 
-def _select_group(value: Any, group: str, limit: int) -> list[SelectedSimilarCase]:
-    cases = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
-    cases.sort(key=_rank, reverse=True)
-    return [
-        SelectedSimilarCase(
-            case_id=str(item.get("case_id") or item.get("id") or ""),
-            group=group,
-            similarity_class=str(item.get("similarity_reason_class") or item.get("similarity_class") or ""),
-            confidence=item.get("similarity_confidence"),
-            scores={key: item.get(key) for key in ("structured_score", "semantic_score", "rerank_score") if key in item},
-            reasons=[str(reason) for reason in item.get("reasons", [])] if isinstance(item.get("reasons"), list) else [],
-            source=item,
-        )
-        for item in cases[:limit]
-        if str(item.get("case_id") or item.get("id") or "").strip()
-    ]
-
-
-def _rank(item: dict[str, Any]) -> tuple[int, float, float, float]:
+def _rank(item: dict[str, Any]) -> tuple[int, float, float, float, int]:
     klass = str(item.get("similarity_reason_class") or item.get("similarity_class") or "")
+    warnings = item.get("warnings")
+    warning_penalty = len(warnings) if isinstance(warnings, list) else 0
     return (
         PRIORITY.get(klass, 0),
         _confidence(item.get("similarity_confidence")),
         _number(item.get("structured_score")),
         max(_number(item.get("rerank_score")), _number(item.get("semantic_score"))),
+        -warning_penalty,
     )
 
 
@@ -87,3 +89,10 @@ def _number(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _max_rag_cases() -> int:
+    try:
+        return max(1, int(os.environ.get("MRO_ASSESSMENT_MAX_RAG_CASES", "3")))
+    except ValueError:
+        return 3

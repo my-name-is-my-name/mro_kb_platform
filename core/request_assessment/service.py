@@ -17,6 +17,7 @@ from .clients.similar_cases import SimilarCasesClient
 from .completeness import assess_completeness, has_blocking_customer_missing
 from .decision import make_decision
 from .evidence import assess_documentary_evidence, normalize_mro_kb_evidence
+from .historical import build_historical_inference, extract_historical_facts, quotation_readiness
 from .models import (
     AssessmentDecision,
     AssessmentState,
@@ -137,6 +138,8 @@ class RequestAssessmentService:
         state.documentary_assessment = None
         state.mro_kb_evidence = []
         state.selected_similar_cases = []
+        state.historical_inference = None
+        state.quotation_readiness = "NEEDS_EXPERT_REVIEW"
         self.store.save(state)
 
         if state.workflow_iteration > 3:
@@ -162,25 +165,36 @@ class RequestAssessmentService:
         if has_blocking_customer_missing(state.missing_information):
             state.status = AssessmentStatus.WAITING_FOR_INFORMATION
             state.documentary_assessment = assess_documentary_evidence(False, [], [])
+            state.historical_inference = build_historical_inference(state, [], ["deep_historical_rag_skipped_blocking_customer_data"])
+            state.quotation_readiness = quotation_readiness(state)
             state.decision = make_decision(state.missing_information, None, None, state.documentary_assessment, _registry_mode(self.capability_provider))
             self._emit(progress, state, "completeness", "ATA Impact обнаружил блокирующие пробелы. Документальная проверка не выполняется.", "completed", details={"missing_count": len(state.missing_information)})
             return self.store.save(state)
 
         context = build_capability_context(state)
+        state.selected_similar_cases = select_similar_cases(state.similar_cases)
+        self._emit(
+            progress,
+            state,
+            "historical_case_selection",
+            f"Выбрано исторических заявок для проверки: {len(state.selected_similar_cases)}.",
+            "completed",
+            service="mro-similar-cases",
+            details={"selected_case_ids": [case.case_id for case in state.selected_similar_cases], "selection_reasons": {case.case_id: case.reasons for case in state.selected_similar_cases}},
+        )
+        documentary = self._maybe_call_mro_kb(state, progress)
+        state.documentary_assessment = documentary
+
         self._emit(progress, state, "capability", "Проверяю базовое соответствие capability.", "started", details={"aircraft_family": context.aircraft_family, "affected_ata": context.affected_ata})
         capability = self.capability_provider.assess(context)
         state.capability_assessment = capability
         self._emit(progress, state, "capability", "Capability Registry проверен.", "completed", details={"mode": capability.registry_mode.value, "version": capability.registry_version, "status": capability.status.value, "dimensions": {key: value.value for key, value in capability.dimension_results.items()}})
         if capability.status.value == "FAIL" and capability.registry_mode == CapabilityRegistryMode.CONTROLLED:
-            state.documentary_assessment = assess_documentary_evidence(False, [], [])
             state.decision = make_decision([], capability, None, state.documentary_assessment, capability.registry_mode)
             state.status = AssessmentStatus.DECISION_READY
-            self._emit(progress, state, "capability", "Capability pre-check выявил подтвержденный hard fail. MRO RAG не вызывается.", "completed")
+            self._emit(progress, state, "capability", "Capability pre-check выявил подтвержденный hard fail.", "completed")
             return self.store.save(state)
 
-        state.selected_similar_cases = select_similar_cases(state.similar_cases)
-        documentary = self._maybe_call_mro_kb(state, progress)
-        state.documentary_assessment = documentary
         approval = assess_approval(context, capability)
         state.approval_assessment = approval
         self._emit(progress, state, "approval", "Проверяю маршрут одобрения.", "completed", details={"status": approval.status.value})
@@ -230,24 +244,32 @@ class RequestAssessmentService:
     def _maybe_call_mro_kb(self, state: AssessmentState, progress: ProgressSink | None):
         if not _mro_kb_needed(state):
             self._emit(progress, state, "mro_kb_search", "Документальная проверка MRO RAG пропущена: результат не влияет на текущую рекомендацию.", "skipped", service="mro-kb")
+            state.historical_inference = build_historical_inference(state, [], ["historical_rag_not_required"])
+            state.quotation_readiness = quotation_readiness(state)
             return assess_documentary_evidence(False, [], [])
         unavailable = False
+        extracted_facts = []
+        extraction_warnings: list[str] = []
         ctx = normalize_ata_context(state.ata_impact, _ata_fields(state), state.business_context.requested_deliverables, state.source.request_text)
         if state.selected_similar_cases:
             for case in state.selected_similar_cases:
                 query = build_case_query(case, state)
-                self._emit(progress, state, "mro_kb_search", f"Обращаюсь к MRO RAG для документальной проверки {case.case_id}.", "started", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"case_id": case.case_id, "query": query})
+                self._emit(progress, state, "mro_kb_search", f"Проверяю {case.case_id} через MRO KB.", "started", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"case_id": case.case_id, "query": query})
                 try:
                     payload, trace = self.mro_kb_client.chat(query)
                     state.external_call_trace.append(trace)  # type: ignore[arg-type]
                     records = normalize_mro_kb_evidence(case.case_id, payload, ctx)
                     state.mro_kb_evidence.extend(records)
-                    self._emit(progress, state, "mro_kb_search", "MRO RAG завершил проверку.", "completed", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"case_id": case.case_id, "http_status": trace.http_status, "elapsed_ms": trace.elapsed_ms, "sources": len(payload.get("sources") or []), "raw_evidence": len(payload.get("evidence") or []), "usable_evidence": len(records)})
+                    facts, warnings = extract_historical_facts(case.case_id, payload, records)
+                    extracted_facts.extend(facts)
+                    extraction_warnings.extend(warnings)
+                    self._emit(progress, state, "mro_kb_search", "MRO KB вернул исторические материалы.", "completed", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"case_id": case.case_id, "http_status": trace.http_status, "elapsed_ms": trace.elapsed_ms, "sources": len(payload.get("sources") or []), "evidence": len(payload.get("evidence") or []), "extracted_facts": len(facts), "warnings": warnings})
                 except ExternalServiceError as exc:
                     state.external_call_trace.append(exc.trace)
                     state.warnings.append("DOCUMENTAL_VERIFICATION_UNAVAILABLE")
                     unavailable = True
-                    self._emit(progress, state, "mro_kb_search", "MRO RAG недоступен. Это не трактуется как отсутствие документов.", "failed", service="mro-kb", safe_url=self.mro_kb_client.safe_url)
+                    extraction_warnings.append(str(exc.trace.warning or "mro_kb_unavailable"))
+                    self._emit(progress, state, "mro_kb_search", "MRO KB недоступен. Это не трактуется как отсутствие документов.", "failed", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"case_id": case.case_id, "http_status": exc.trace.http_status, "warning": exc.trace.warning})
         elif not qualified_cases(state.similar_cases):
             query = build_wide_query(state)
             self._emit(progress, state, "mro_kb_wide_search", "Qualified similar cases не найдены. Выполняю широкий документальный поиск.", "started", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"query": query})
@@ -256,12 +278,19 @@ class RequestAssessmentService:
                 state.external_call_trace.append(trace)  # type: ignore[arg-type]
                 records = normalize_mro_kb_evidence(None, payload, ctx)
                 state.mro_kb_evidence.extend(records)
-                self._emit(progress, state, "mro_kb_wide_search", "MRO RAG wide search завершён.", "completed", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"http_status": trace.http_status, "elapsed_ms": trace.elapsed_ms, "sources": len(payload.get("sources") or []), "raw_evidence": len(payload.get("evidence") or []), "usable_evidence": len(records)})
+                facts, warnings = extract_historical_facts(None, payload, records)
+                extracted_facts.extend(facts)
+                extraction_warnings.extend(warnings)
+                self._emit(progress, state, "mro_kb_wide_search", "MRO KB wide search завершён.", "completed", service="mro-kb", safe_url=self.mro_kb_client.safe_url, details={"http_status": trace.http_status, "elapsed_ms": trace.elapsed_ms, "sources": len(payload.get("sources") or []), "evidence": len(payload.get("evidence") or []), "extracted_facts": len(facts), "warnings": warnings})
             except ExternalServiceError as exc:
                 state.external_call_trace.append(exc.trace)
                 state.warnings.append("DOCUMENTAL_VERIFICATION_UNAVAILABLE")
                 unavailable = True
+                extraction_warnings.append(str(exc.trace.warning or "mro_kb_unavailable"))
         documentary = assess_documentary_evidence(True, state.selected_similar_cases, state.mro_kb_evidence, state.warnings, unavailable)
+        state.historical_inference = build_historical_inference(state, extracted_facts, extraction_warnings, unavailable)
+        state.quotation_readiness = quotation_readiness(state, unavailable)
+        self._emit(progress, state, "historical_inference", "Формирую preliminary proposed scope.", "completed", service="mro-kb", details={"selected_case_ids": state.historical_inference.selected_case_ids, "facts": len(state.historical_inference.facts), "proposed_scope": len(state.historical_inference.proposed_scope), "historical_support": state.historical_inference.historical_support, "quotation_readiness": state.quotation_readiness, "warnings": state.historical_inference.warnings})
         self._emit(progress, state, "documentary_assessment", "Документальная проверка оценена.", "completed", service="mro-kb", details={"status": documentary.status.value, "requested_case_ids": documentary.requested_case_ids, "usable_evidence": len(documentary.usable_evidence_ids), "warnings": documentary.warnings})
         return documentary
 
@@ -386,7 +415,7 @@ def _mro_kb_needed(state: AssessmentState) -> bool:
     if state.selected_similar_cases:
         return any(case.similarity_class != "weak_analog" for case in state.selected_similar_cases)
     sim = state.similar_cases or {}
-    return str(sim.get("similarity_status") or "") == "no_qualified_matches" and bool((state.ata_impact or {}).get("affected_ata"))
+    return str(sim.get("similarity_status") or "") in {"no_qualified_matches", "none"} and bool((state.ata_impact or {}).get("affected_ata"))
 
 
 def _env_bool(name: str, default: bool) -> bool:

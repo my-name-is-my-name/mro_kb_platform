@@ -10,20 +10,22 @@ def build_case_query(case: SelectedSimilarCase, state: AssessmentState) -> str:
     ata = ", ".join(ctx.affected_ata) or "не указаны"
     potential = ", ".join(ctx.potentially_affected_ata) or "не указаны"
     deliverables = ", ".join(state.business_context.requested_deliverables) or "не указаны"
-    return f"""По заявке {case.case_id} найди документы и подтверждающие разделы,
-которые описывают:
+    return f"""По исторической заявке {case.case_id} найди подтверждённые документами сведения:
 
-- исходную техническую проблему;
-- объект работ;
-- тип повреждения;
-- расположение;
-- фактически выполненную инженерную работу;
-- выпущенные repair drawing, repair instruction, damage assessment,
-  stress substantiation или approved repair data;
-- использованные ссылки на SRM, AMM и другие контролируемые документы;
-- aircraft type, model, MSN и effectivity, если они явно указаны.
+- что было исходной инженерной задачей;
+- какой объект рассматривался;
+- какое повреждение или событие анализировалось;
+- какие инженерные работы выполнялись;
+- какие анализы или расчёты проводились;
+- какие документы выпускались;
+- какие исходные данные запрашивались;
+- какие дисциплины участвовали;
+- какие технические references использовались;
+- какие ограничения, риски или причины отказа были зафиксированы.
 
-Контекст новой заявки:
+Для каждого факта укажи document_id, chunk_id и подтверждающий фрагмент.
+
+Технический профиль новой заявки для объяснения релевантности и отличий:
 - aircraft: {aircraft};
 - работа: {ctx.work_type or "не указан"};
 - объект: {_objects(ctx)};
@@ -33,29 +35,19 @@ def build_case_query(case: SelectedSimilarCase, state: AssessmentState) -> str:
 - potentially affected ATA: {potential};
 - требуемые результаты: {deliverables}.
 
-Отдели прямое техническое совпадение от:
-- простого упоминания ATA;
-- совпадения только по местоположению;
-- другого объекта;
-- другого вида повреждения;
-- другой инженерной задачи.
+Используй универсальные категории фактов:
+- activities;
+- analyses_or_calculations;
+- documents;
+- customer_inputs;
+- disciplines;
+- references;
+- constraints;
+- outcome.
 
 Не принимай решение о capability новой заявки.
-Не делай выводов, которых нет в документах.
-
-Верни:
-- case_id;
-- document_id;
-- chunk_id;
-- section_title;
-- название и тип документа;
-- подтверждающий фрагмент;
-- aircraft, MSN и effectivity;
-- объект и повреждение;
-- фактически выпущенные документы;
-- причины релевантности;
-- ограничения применимости;
-- противоречия и недостающие данные.
+Не переноси автоматически исторический outcome на новую заявку.
+Не придумывай отсутствующие сведения.
 """
 
 
@@ -74,11 +66,9 @@ Zone: {", ".join(ctx.locations) or state.confirmed_inputs.zone or "не указ
 Direct ATA: {ata}.
 Potential ATA: {potential}.
 Requested deliverables: {", ".join(state.business_context.requested_deliverables) or "не указаны"}.
-Required document types: repair drawing, repair instruction, damage assessment, stress substantiation, approved repair data.
-Relevance criteria: direct object, damage, work type and applicability evidence.
-Exclusion criteria: simple ATA mention, different object, different damage type, unrelated engineering task.
-
-Верни structured evidence с document_id, chunk_id, section_title, snippet, relevance reasons, applicability limits and missing data.
+Найди частичные исторические материалы по универсальным категориям: activities, analyses_or_calculations, documents, customer_inputs, disciplines, references, constraints, outcome.
+Для каждого факта укажи document_id, chunk_id и подтверждающий фрагмент.
+Не принимай решение о capability новой заявки и не придумывай отсутствующие сведения.
 """
 
 
@@ -96,4 +86,3 @@ def _objects(ctx: object) -> str:
 def _damage(ctx: object) -> str:
     values = list(getattr(ctx, "damage_types", [])) + list(getattr(ctx, "damage_descriptions", []))
     return ", ".join(values) if values else "не указано"
-

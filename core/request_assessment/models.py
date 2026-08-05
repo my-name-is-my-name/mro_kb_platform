@@ -153,6 +153,27 @@ class EvidenceRecord(BaseModel):
     source_descriptor: dict[str, Any] = Field(default_factory=dict)
 
 
+class HistoricalFact(BaseModel):
+    category: str
+    value: str
+    raw_value: str | None = None
+    source_case_id: str | None = None
+    source_case_ids: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    basis: str = "OBSERVED"
+
+
+class HistoricalInference(BaseModel):
+    selected_case_ids: list[str] = Field(default_factory=list)
+    facts: list[HistoricalFact] = Field(default_factory=list)
+    proposed_scope: list[HistoricalFact] = Field(default_factory=list)
+    differences: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    missing_inputs: list[str] = Field(default_factory=list)
+    historical_support: str = "NONE"
+    warnings: list[str] = Field(default_factory=list)
+
+
 class CapabilityContext(BaseModel):
     aircraft_family: str | None = None
     aircraft_model: str | None = None
@@ -257,6 +278,8 @@ class AssessmentState(BaseModel):
     answers: list[ClarificationAnswer] = Field(default_factory=list)
     selected_similar_cases: list[SelectedSimilarCase] = Field(default_factory=list)
     mro_kb_evidence: list[EvidenceRecord] = Field(default_factory=list)
+    historical_inference: HistoricalInference | None = None
+    quotation_readiness: str = "NEEDS_EXPERT_REVIEW"
     documentary_assessment: DocumentaryAssessment | None = None
     capability_assessment: CapabilityAssessment | None = None
     approval_assessment: ApprovalAssessment | None = None

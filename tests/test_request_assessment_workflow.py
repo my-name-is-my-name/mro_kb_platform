@@ -20,6 +20,7 @@ from core.request_assessment.models import (
     DocumentaryAssessmentStatus,
     ExternalCallTrace,
 )
+from core.request_assessment.response_builder import build_final_content
 from core.request_assessment.service import RequestAssessmentService
 from core.request_assessment.progress import ProgressEvent, event_to_reasoning
 from storage.assessment_store import AssessmentStore
@@ -76,6 +77,7 @@ class StaticCapability:
         self.status = status
         self.mode = mode
         self.version = "test"
+        self.routes = routes
 
     def precheck(self, context):  # type: ignore[no-untyped-def]
         return self.assess(context)
@@ -88,7 +90,7 @@ class StaticCapability:
             matched_capability_ids=["CAP-1"],
             hard_fail_reasons=["outside scope"] if self.status == AssessmentResultStatus.FAIL else [],
             review_items=["review"] if self.status in {AssessmentResultStatus.UNKNOWN, AssessmentResultStatus.REVIEW} else [],
-            matched_approval_routes=[ApprovalRouteAssessment(route="EXTERNAL_DOA", status=AssessmentResultStatus.PASS, jurisdictions=["EASA"], deliverables=["damage_assessment", "repair_drawing", "repair_instruction", "stress_substantiation"], source_document="Agreement", source_revision="Rev. 1")] if routes else [],
+            matched_approval_routes=[ApprovalRouteAssessment(route="EXTERNAL_DOA", status=AssessmentResultStatus.PASS, jurisdictions=["EASA"], deliverables=["damage_assessment", "repair_drawing", "repair_instruction", "stress_substantiation"], source_document="Agreement", source_revision="Rev. 1")] if self.routes else [],
         )
 
     def health(self) -> dict[str, object]:
@@ -134,6 +136,7 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         state = service.create_assessment(payload)
         self.assertEqual(state.decision.status.value, "REQUEST_INFORMATION")  # type: ignore[union-attr]
         self.assertEqual(len(kb.queries), 0)
+        self.assertEqual(state.quotation_readiness, "NEEDS_INFORMATION")
         self.assertEqual(state.questions[0].field, "aircraft.msn")
 
     def test_answers_update_fields_rerun_ata_and_replace_similar_cases(self) -> None:
@@ -160,9 +163,9 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         sim = {"status": "ok", "similarity_status": "qualified_matches_found", "accepted": [_case("A1"), _case("A2"), _case("A3"), _case("A4")], "not_accepted": [_case("R1"), _case("R2"), _case("R3")], "intermediate": [_case("I1"), _case("I2")]}
         service = self.make_service(ata=FakeAta([_ata_response(similar_cases=sim)]), kb=kb)
         state = service.create_assessment(_request_payload())
-        self.assertEqual([case.case_id for case in state.selected_similar_cases], ["A1", "A2", "A3", "R1", "R2", "I1"])
-        self.assertEqual(len(kb.queries), 6)
-        self.assertIn("По заявке A1", kb.queries[0])
+        self.assertEqual([case.case_id for case in state.selected_similar_cases], ["A1", "A2", "A3"])
+        self.assertEqual(len(kb.queries), 3)
+        self.assertIn("По исторической заявке A1", kb.queries[0])
 
     def test_mro_kb_timeout_yields_expert_review_not_no_documents(self) -> None:
         service = self.make_service(kb=FakeMroKb(fail=True))
@@ -170,6 +173,8 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         self.assertEqual(state.decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
         self.assertIn("DOCUMENTAL_VERIFICATION_UNAVAILABLE", state.warnings)
         self.assertEqual(state.documentary_assessment.status, DocumentaryAssessmentStatus.UNAVAILABLE)
+        self.assertEqual(state.historical_inference.historical_support, "UNAVAILABLE")  # type: ignore[union-attr]
+        self.assertEqual(state.quotation_readiness, "NEEDS_EXPERT_REVIEW")
 
     def test_mro_kb_empty_result_is_inconclusive_not_decline(self) -> None:
         service = self.make_service(kb=FakeMroKb(payload={"ok": True, "answer": "", "sources": [], "evidence": []}))
@@ -183,12 +188,13 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         service = self.make_service(capability=StaticCapability(AssessmentResultStatus.UNKNOWN))
         self.assertEqual(service.create_assessment(_request_payload()).decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
 
-    def test_pass_registry_can_accept_for_quotation_without_unneeded_rag(self) -> None:
+    def test_absence_of_analogs_runs_wide_search_and_does_not_decline(self) -> None:
         kb = FakeMroKb()
         service = self.make_service(ata=FakeAta([_ata_response(similar_cases={"status": "ok", "similarity_status": "none", "accepted": [], "not_accepted": [], "intermediate": []})]), kb=kb)
         state = service.create_assessment(_request_payload())
-        self.assertEqual(state.decision.status.value, "ACCEPT_FOR_QUOTATION")  # type: ignore[union-attr]
-        self.assertEqual(kb.queries, [])
+        self.assertNotEqual(state.decision.status.value, "DECLINE")  # type: ignore[union-attr]
+        self.assertEqual(len(kb.queries), 1)
+        self.assertIn("широкий документальный поиск", kb.queries[0])
 
     def test_advisory_registry_never_accepts(self) -> None:
         service = self.make_service(
@@ -207,6 +213,67 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         self.assertEqual(provider.mode, CapabilityRegistryMode.UNAVAILABLE)
         self.assertEqual(state.capability_assessment.status, AssessmentResultStatus.UNKNOWN)
         self.assertEqual(state.decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
+
+    def test_structured_mro_kb_result_extracts_historical_facts_and_scope(self) -> None:
+        payload = {
+            "ok": True,
+            "answer": "structured",
+            "facts": [
+                {"category": "activity", "value": "damage assessment", "document_id": "DOC-1", "chunk_id": "C-1"},
+                {"category": "calculation", "value": "stress substantiation", "document_id": "DOC-1", "chunk_id": "C-2"},
+                {"category": "document", "value": "repair drawing", "document_id": "DOC-2", "chunk_id": "C-3"},
+            ],
+            "sources": [{"case_id": "MP-0123", "document_id": "DOC-1", "chunk_id": "C-1", "snippet": "fuselage skin crack ATA 53 repair", "applicability_status": "APPLICABLE"}],
+            "evidence": [],
+        }
+        service = self.make_service(kb=FakeMroKb(payload=payload))
+        state = service.create_assessment(_request_payload())
+        inference = state.historical_inference
+        self.assertEqual(inference.historical_support, "DIRECT")  # type: ignore[union-attr]
+        self.assertEqual(state.quotation_readiness, "READY_FOR_ESTIMATION")
+        self.assertTrue(all(fact.source_case_id == "MP-0123" for fact in inference.facts))  # type: ignore[union-attr]
+        self.assertTrue(all(fact.evidence_ids for fact in inference.facts))  # type: ignore[union-attr]
+        self.assertTrue(any(item.source_case_ids == ["MP-0123"] for item in inference.proposed_scope))  # type: ignore[union-attr]
+
+    def test_invalid_json_and_free_text_do_not_break_workflow(self) -> None:
+        payload = {"ok": True, "answer": "```json\n{\"facts\": [bad]\n```", "sources": [], "evidence": []}
+        state = self.make_service(kb=FakeMroKb(payload=payload)).create_assessment(_request_payload())
+        self.assertEqual(state.historical_inference.historical_support, "NONE")  # type: ignore[union-attr]
+        self.assertIn("mro_kb_answer_json_block_invalid", state.historical_inference.warnings)  # type: ignore[union-attr]
+
+    def test_sources_evidence_are_preserved_and_partial_materials_are_partial(self) -> None:
+        payload = {
+            "ok": True,
+            "answer": "```json\n{\"activities\": [\"document review\"]}\n```",
+            "sources": [{"case_id": "MP-0123", "document_id": "DOC-1", "chunk_id": "C-1", "snippet": "partial context", "applicability_status": "UNKNOWN"}],
+            "evidence": [{"case_id": "MP-0123", "document_id": "DOC-2", "chunk_id": "C-2", "snippet": "partial evidence"}],
+        }
+        state = self.make_service(ata=FakeAta([_ata_response(similar_cases={"status": "ok", "similarity_status": "qualified_matches_found", "accepted": [_case("MP-0123", klass="same_work_type")], "not_accepted": [], "intermediate": []})]), kb=FakeMroKb(payload=payload)).create_assessment(_request_payload())
+        self.assertEqual(len(state.mro_kb_evidence), 2)
+        self.assertEqual(state.historical_inference.historical_support, "PARTIAL")  # type: ignore[union-attr]
+
+    def test_historical_facts_do_not_create_false_capability_pass(self) -> None:
+        payload = {"ok": True, "facts": [{"category": "activity", "value": "repair design", "document_id": "DOC-1", "chunk_id": "C-1"}], "sources": [], "evidence": []}
+        state = self.make_service(kb=FakeMroKb(payload=payload), capability=StaticCapability(AssessmentResultStatus.UNKNOWN)).create_assessment(_request_payload())
+        self.assertEqual(state.capability_assessment.status, AssessmentResultStatus.UNKNOWN)
+        self.assertEqual(state.decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
+
+    def test_differences_are_derived_from_case_fields(self) -> None:
+        historical = _case("MP-0123") | {"aircraft_model": "A321-200", "zone": "FR40-FR41", "component": "frame"}
+        sim = {"status": "ok", "similarity_status": "qualified_matches_found", "accepted": [historical], "not_accepted": [], "intermediate": []}
+        payload = {"ok": True, "facts": [{"category": "activity", "value": "damage assessment", "document_id": "DOC-1", "chunk_id": "C-1"}], "sources": [], "evidence": []}
+        state = self.make_service(ata=FakeAta([_ata_response(similar_cases=sim)]), kb=FakeMroKb(payload=payload)).create_assessment(_request_payload())
+        self.assertTrue(any("другая модель ВС" in item for item in state.historical_inference.differences))  # type: ignore[union-attr]
+        self.assertTrue(any("другая зона" in item for item in state.historical_inference.differences))  # type: ignore[union-attr]
+
+    def test_final_answer_contains_historical_sections_not_json_dump(self) -> None:
+        payload = {"ok": True, "facts": [{"category": "activity", "value": "damage assessment", "document_id": "DOC-1", "chunk_id": "C-1"}], "sources": [{"case_id": "MP-0123", "document_id": "DOC-1", "chunk_id": "C-1", "snippet": "fuselage skin crack ATA 53 repair", "applicability_status": "APPLICABLE"}], "evidence": []}
+        state = self.make_service(kb=FakeMroKb(payload=payload)).create_assessment(_request_payload())
+        content = build_final_content(state)
+        self.assertIn("Историческая основа", content)
+        self.assertIn("Предлагаемый предварительный scope", content)
+        self.assertIn("Отличия новой заявки", content)
+        self.assertNotIn('"request_id"', content)
 
     def test_answers_store_additional_data_and_pass_to_ata(self) -> None:
         ata = FakeAta([
@@ -352,8 +419,8 @@ def _similar(case_id: str) -> dict[str, object]:
     return {"status": "ok", "similarity_status": "qualified_matches_found", "threshold_version": "similarity-gate-v1", "accepted": [_case(case_id)], "not_accepted": [], "intermediate": []}
 
 
-def _case(case_id: str) -> dict[str, object]:
-    return {"case_id": case_id, "similarity_reason_class": "same_identifier", "similarity_confidence": "high", "structured_score": 0.9, "semantic_score": 0.8, "reasons": ["same component"]}
+def _case(case_id: str, klass: str = "same_identifier") -> dict[str, object]:
+    return {"case_id": case_id, "similarity_reason_class": klass, "similarity_confidence": "high", "structured_score": 0.9, "semantic_score": 0.8, "reasons": ["same component"]}
 
 
 def service_context() -> CapabilityContext:
