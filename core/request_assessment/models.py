@@ -37,6 +37,21 @@ class AssessmentResultStatus(str, Enum):
     NOT_APPLICABLE = "NOT_APPLICABLE"
 
 
+class CapabilityRegistryMode(str, Enum):
+    UNAVAILABLE = "UNAVAILABLE"
+    ADVISORY = "ADVISORY"
+    CONTROLLED = "CONTROLLED"
+
+
+class DocumentaryAssessmentStatus(str, Enum):
+    NOT_REQUIRED = "NOT_REQUIRED"
+    CONFIRMED = "CONFIRMED"
+    PARTIALLY_CONFIRMED = "PARTIALLY_CONFIRMED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    NOT_CONFIRMED = "NOT_CONFIRMED"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 class EvidenceRelevance(str, Enum):
     DIRECT_MATCH = "DIRECT_MATCH"
     PARTIAL_MATCH = "PARTIAL_MATCH"
@@ -113,11 +128,19 @@ class SelectedSimilarCase(BaseModel):
 
 class EvidenceRecord(BaseModel):
     case_id: str | None = None
+    internal_case_id: str | None = None
     document_id: str | None = None
+    source_document_id: str | None = None
     chunk_id: str | None = None
+    parent_id: str | None = None
     section_title: str | None = None
+    citation_refs: list[str] = Field(default_factory=list)
+    retrieval_mode: str | None = None
+    rerank_score: float | None = None
+    final_score: float | None = None
     document_type: str | None = None
     revision: str | None = None
+    effectivity: str | None = None
     aircraft_type: str | None = None
     aircraft_model: str | None = None
     msn: str | None = None
@@ -133,12 +156,27 @@ class EvidenceRecord(BaseModel):
 class CapabilityContext(BaseModel):
     aircraft_family: str | None = None
     aircraft_model: str | None = None
+    product_scope: str | None = None
     work_type: str | None = None
-    ata: list[str] = Field(default_factory=list)
+    affected_ata: list[str] = Field(default_factory=list)
+    potentially_affected_ata: list[str] = Field(default_factory=list)
     disciplines: list[str] = Field(default_factory=list)
     deliverables: list[str] = Field(default_factory=list)
     approval_expectation: str | None = None
     jurisdiction: str | None = None
+    physical_objects: list[str] = Field(default_factory=list)
+    damage_types: list[str] = Field(default_factory=list)
+    locations: list[str] = Field(default_factory=list)
+
+
+class ApprovalRouteAssessment(BaseModel):
+    route: str
+    status: AssessmentResultStatus
+    jurisdictions: list[str] = Field(default_factory=list)
+    deliverables: list[str] = Field(default_factory=list)
+    source_document: str | None = None
+    source_revision: str | None = None
+    limitations: list[str] = Field(default_factory=list)
 
 
 class CapabilityAssessment(BaseModel):
@@ -149,6 +187,10 @@ class CapabilityAssessment(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     source_documents: list[str] = Field(default_factory=list)
     registry_version: str | None = None
+    registry_mode: CapabilityRegistryMode = CapabilityRegistryMode.UNAVAILABLE
+    verification_status: str | None = None
+    dimension_results: dict[str, AssessmentResultStatus] = Field(default_factory=dict)
+    matched_approval_routes: list[ApprovalRouteAssessment] = Field(default_factory=list)
 
 
 class ApprovalAssessment(BaseModel):
@@ -156,6 +198,17 @@ class ApprovalAssessment(BaseModel):
     possible_routes: list[str] = Field(default_factory=list)
     blocking_reasons: list[str] = Field(default_factory=list)
     review_items: list[str] = Field(default_factory=list)
+    matched_routes: list[ApprovalRouteAssessment] = Field(default_factory=list)
+
+
+class DocumentaryAssessment(BaseModel):
+    status: DocumentaryAssessmentStatus
+    verification_required: bool
+    requested_case_ids: list[str] = Field(default_factory=list)
+    confirmed_case_ids: list[str] = Field(default_factory=list)
+    usable_evidence_ids: list[str] = Field(default_factory=list)
+    review_items: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class DecisionReason(BaseModel):
@@ -196,6 +249,7 @@ class AssessmentState(BaseModel):
     source: SourceInput = Field(default_factory=SourceInput)
     business_context: BusinessContext = Field(default_factory=BusinessContext)
     confirmed_inputs: ConfirmedInputs = Field(default_factory=ConfirmedInputs)
+    confirmed_additional_data: dict[str, Any] = Field(default_factory=dict)
     ata_impact: dict[str, Any] | None = None
     similar_cases: dict[str, Any] | None = None
     missing_information: list[MissingInformation] = Field(default_factory=list)
@@ -203,6 +257,7 @@ class AssessmentState(BaseModel):
     answers: list[ClarificationAnswer] = Field(default_factory=list)
     selected_similar_cases: list[SelectedSimilarCase] = Field(default_factory=list)
     mro_kb_evidence: list[EvidenceRecord] = Field(default_factory=list)
+    documentary_assessment: DocumentaryAssessment | None = None
     capability_assessment: CapabilityAssessment | None = None
     approval_assessment: ApprovalAssessment | None = None
     decision: DecisionResult | None = None
@@ -212,4 +267,3 @@ class AssessmentState(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     created_at: str | None = None
     updated_at: str | None = None
-

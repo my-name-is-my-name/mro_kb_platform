@@ -15,6 +15,11 @@ Optional configuration:
 - `MRO_ASSESSMENT_CAPABILITY_REGISTRY`, default `config/request_assessment_capabilities.json`
 - `MRO_ASSESSMENT_DB_PATH`, default `data_runtime/request_assessment.sqlite3`
 
+Runtime requirements:
+
+- Python `>=3.12,<3.13`
+- `pydantic>=2,<3`
+
 Run:
 
 ```bash
@@ -33,12 +38,25 @@ Endpoints:
 
 The OpenAI-compatible model id is `mro-request-assessment`. Streaming uses SSE chunks with safe `reasoning_content` operational progress and a final `content` chunk.
 
+Capability registry:
+
+- The default `config/request_assessment_capabilities.json` is intentionally `UNAVAILABLE` and contains no production capability.
+- `examples/request_assessment_capabilities.example.json` is demonstration data only. Do not use it as a production capability source without expert verification and controlled document approval.
+- Registry modes:
+  - `UNAVAILABLE`: capability is `UNKNOWN`; automatic `ACCEPT_FOR_QUOTATION` and `DECLINE` are forbidden.
+  - `ADVISORY`: results are context only; automatic `ACCEPT_FOR_QUOTATION` and `DECLINE` are forbidden.
+  - `CONTROLLED`: deterministic `ACCEPT_FOR_QUOTATION` or `DECLINE` is allowed only when all strict checks pass.
+
 Decision logic is deterministic:
 
-1. confirmed capability or approval hard fail -> `DECLINE`
+1. confirmed CONTROLLED capability or approval hard fail -> `DECLINE`
 2. blocking customer-provided missing information -> `REQUEST_INFORMATION`
-3. unresolved capability, approval or documentary uncertainty -> `EXPERT_REVIEW`
-4. passed mandatory checks -> `ACCEPT_FOR_QUOTATION`
+3. registry mode is not `CONTROLLED` -> `EXPERT_REVIEW`
+4. unresolved capability, approval or documentary uncertainty -> `EXPERT_REVIEW`
+5. passed mandatory controlled checks -> `ACCEPT_FOR_QUOTATION`
 
 Similar cases embedded in the `mro-ata-impact` response are reused. The fallback `/api/similar-cases/search` client runs only when the embedded block is missing, disabled or unavailable and fallback is explicitly enabled.
 
+MRO KB HTTP success is not treated as documentary confirmation. Returned `sources` and `evidence` are normalized and assessed for matching `case_id`, document/chunk identifiers, snippet presence, relevance and applicability. Empty or inconclusive RAG results never imply `DECLINE`; if documentary verification is required, they route the request to `EXPERT_REVIEW`.
+
+OpenWebUI streaming emits safe operational `reasoning_content`, including service names, safe endpoints, query payloads, counts and gate outcomes. Secret-like fields are recursively removed before streaming.

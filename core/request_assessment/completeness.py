@@ -2,19 +2,21 @@ from __future__ import annotations
 
 from typing import Any
 
+from .ata_context import normalize_ata_context
 from .models import AssessmentState, MissingImportance, MissingInformation
 
 
 def assess_completeness(state: AssessmentState) -> list[MissingInformation]:
     result: list[MissingInformation] = []
     ata = state.ata_impact or {}
+    ctx = normalize_ata_context(ata, _fields(state), state.business_context.requested_deliverables, state.source.request_text)
     required = ata.get("required_input_data") if isinstance(ata, dict) else []
     if isinstance(required, list):
         for item in required:
             parsed = _from_required_item(item)
             if parsed:
                 result.append(parsed)
-    uncertainties = (((ata.get("engineering_facts") or {}) if isinstance(ata.get("engineering_facts"), dict) else {}).get("uncertainties") if isinstance(ata, dict) else [])
+    uncertainties = ctx.uncertainties
     if isinstance(uncertainties, list):
         for text in uncertainties:
             lower = str(text).lower()
@@ -32,13 +34,15 @@ def assess_completeness(state: AssessmentState) -> list[MissingInformation]:
                         source="ata_impact",
                     )
                 )
-    if not state.confirmed_inputs.msn:
+    if not state.confirmed_inputs.msn and not ctx.msn:
         text = (state.source.request_text or "").lower()
         required_text = "msn" in text or "effectivity" in text or "эффектив" in text
         if required_text:
             result.append(_msn_missing("business_context", "MSN необходим для проверки effectivity."))
     deduped: dict[tuple[str, str], MissingInformation] = {}
     for item in result:
+        if _is_confirmed(state, item.field):
+            continue
         deduped[(item.code, item.field)] = item
     return list(deduped.values())
 
@@ -92,9 +96,38 @@ def _msn_missing(source: str, reason: str) -> MissingInformation:
 
 
 def _normalize_field(field: str) -> str:
-    return "aircraft.msn" if field.lower() in {"msn", "aircraft_msn", "aircraft.msn"} else field
+    lower = field.lower()
+    if lower in {"msn", "aircraft_msn", "aircraft.msn"}:
+        return "aircraft.msn"
+    if lower in {"damage_dimensions", "dimensions"}:
+        return "damage.dimensions"
+    if lower in {"zone", "location.zone"}:
+        return "zone"
+    return field
 
 
 def _code_from_text(text: str) -> str:
     return "".join(ch if ch.isalnum() else "_" for ch in text.upper()).strip("_")[:64] or "MISSING_INFORMATION"
 
+
+def _fields(state: AssessmentState) -> dict[str, Any]:
+    fields = state.confirmed_inputs.model_dump(mode="json", exclude_none=True)
+    fields.update(state.confirmed_additional_data)
+    return fields
+
+
+def _is_confirmed(state: AssessmentState, field: str) -> bool:
+    mapping = {
+        "aircraft.msn": state.confirmed_inputs.msn,
+        "aircraft.registration": state.confirmed_inputs.registration,
+        "aircraft.model": state.confirmed_inputs.aircraft_model,
+        "aircraft.aircraft_type": state.confirmed_inputs.aircraft_type,
+        "part_number": state.confirmed_inputs.part_number,
+        "component.part_number": state.confirmed_inputs.part_number,
+        "zone": state.confirmed_inputs.zone,
+        "location.zone": state.confirmed_inputs.zone,
+        "requested_deliverables": state.business_context.requested_deliverables,
+        "approval_expectation": state.business_context.approval_expectation,
+    }
+    value = mapping.get(field, state.confirmed_additional_data.get(field))
+    return bool(value)

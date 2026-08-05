@@ -73,7 +73,11 @@ class RequestAssessmentHandler(BaseHTTPRequestHandler):
         except KeyError:
             return self._json({"ok": False, "error": "assessment not found"}, 404)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-            return self._json({"error": {"message": str(exc), "type": "invalid_request_error"}}, 400)
+            param = "messages" if "message" in str(exc).lower() else None
+            error = {"message": str(exc), "type": "invalid_request_error"}
+            if param:
+                error["param"] = param
+            return self._json({"error": error}, 400)
         except Exception:
             return self._json({"error": {"message": "Internal server error", "type": "server_error"}}, 500)
 
@@ -141,14 +145,20 @@ class RequestAssessmentHandler(BaseHTTPRequestHandler):
 
 
 def _assessment_payload_from_chat(payload: dict[str, object]) -> dict[str, object]:
+    if "messages" not in payload or not isinstance(payload.get("messages"), list):
+        raise ValueError("A non-empty user message is required.")
+    if "fields" in payload and not isinstance(payload.get("fields"), dict):
+        raise ValueError("fields must be an object")
+    if "business_context" in payload and not isinstance(payload.get("business_context"), dict):
+        raise ValueError("business_context must be an object")
     messages = payload.get("messages") or []
     text = ""
-    if isinstance(messages, list):
-        for item in reversed(messages):
-            if isinstance(item, dict) and item.get("role") == "user":
-                text = str(item.get("content") or "").strip()
-                if text:
-                    break
+    for item in reversed(messages):
+        if isinstance(item, dict) and item.get("role") == "user":
+            text = str(item.get("content") or "").strip()
+            break
+    if not text:
+        raise ValueError("A non-empty user message is required.")
     return {
         "request": text,
         "fields": payload.get("fields") if isinstance(payload.get("fields"), dict) else {},

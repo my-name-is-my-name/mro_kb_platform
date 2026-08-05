@@ -55,3 +55,12 @@ class AssessmentStore:
             return None
         return AssessmentState.model_validate(json.loads(row[0]))  # type: ignore[return-value]
 
+    def health(self) -> dict[str, str]:
+        try:
+            with sqlite3.connect(self.path) as db:
+                db.execute("CREATE TABLE IF NOT EXISTS assessment_healthcheck (id INTEGER PRIMARY KEY, value TEXT)")
+                db.execute("INSERT OR REPLACE INTO assessment_healthcheck(id, value) VALUES (1, 'ok')")
+                row = db.execute("SELECT value FROM assessment_healthcheck WHERE id=1").fetchone()
+            return {"status": "available" if row and row[0] == "ok" else "unavailable"}
+        except sqlite3.Error as exc:
+            return {"status": "unavailable", "warning": exc.__class__.__name__}

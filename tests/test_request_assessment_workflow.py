@@ -8,10 +8,20 @@ from pathlib import Path
 from types import MethodType
 
 from apps.request_assessment.server import RequestAssessmentHandler
+from apps.request_assessment.server import _assessment_payload_from_chat
 from core.request_assessment.capability import JsonCapabilityProvider
 from core.request_assessment.clients.base import ExternalServiceError
-from core.request_assessment.models import AssessmentResultStatus, CapabilityAssessment, ExternalCallTrace
+from core.request_assessment.models import (
+    ApprovalRouteAssessment,
+    AssessmentResultStatus,
+    CapabilityContext,
+    CapabilityAssessment,
+    CapabilityRegistryMode,
+    DocumentaryAssessmentStatus,
+    ExternalCallTrace,
+)
 from core.request_assessment.service import RequestAssessmentService
+from core.request_assessment.progress import ProgressEvent, event_to_reasoning
 from storage.assessment_store import AssessmentStore
 
 
@@ -40,33 +50,49 @@ class FakeSimilar:
 
     def search(self, request_text: str, context: dict[str, object]) -> tuple[dict[str, object], ExternalCallTrace]:
         self.calls += 1
+        self.last_payload = context
         return _similar("FB-1"), ExternalCallTrace(service="mro-similar-cases", safe_url=self.safe_url, status="success", http_status=200, attempts=1)
 
 
 class FakeMroKb:
     safe_url = "http://127.0.0.1:8121/api/chat"
 
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, fail: bool = False, payload: dict[str, object] | None = None) -> None:
         self.queries: list[str] = []
         self.fail = fail
+        self.payload = payload
 
     def chat(self, query: str) -> tuple[dict[str, object], ExternalCallTrace]:
         self.queries.append(query)
         if self.fail:
             trace = ExternalCallTrace(service="mro-kb", safe_url=self.safe_url, status="timeout", warning="timeout", attempts=2)
             raise ExternalServiceError("timeout", trace)
-        return {"ok": True, "answer": "found", "sources": [{"document_id": "DOC-1", "chunk_id": "C-1", "snippet": "repair"}], "evidence": []}, ExternalCallTrace(service="mro-kb", safe_url=self.safe_url, status="success", http_status=200, attempts=1)
+        payload = self.payload or {"ok": True, "answer": "found", "sources": [{"case_id": "MP-0123", "document_id": "DOC-1", "chunk_id": "C-1", "snippet": "fuselage skin crack ATA 53 repair", "applicability_status": "APPLICABLE"}], "evidence": []}
+        return payload, ExternalCallTrace(service="mro-kb", safe_url=self.safe_url, status="success", http_status=200, attempts=1)
 
 
 class StaticCapability:
-    def __init__(self, status: AssessmentResultStatus) -> None:
+    def __init__(self, status: AssessmentResultStatus, mode: CapabilityRegistryMode = CapabilityRegistryMode.CONTROLLED, routes: bool = True) -> None:
         self.status = status
+        self.mode = mode
+        self.version = "test"
 
     def precheck(self, context):  # type: ignore[no-untyped-def]
         return self.assess(context)
 
     def assess(self, context):  # type: ignore[no-untyped-def]
-        return CapabilityAssessment(status=self.status, matched_capability_ids=["CAP-1"], hard_fail_reasons=["outside scope"] if self.status == AssessmentResultStatus.FAIL else [], review_items=["review"] if self.status in {AssessmentResultStatus.UNKNOWN, AssessmentResultStatus.REVIEW} else [])
+        return CapabilityAssessment(
+            status=self.status,
+            registry_mode=self.mode,
+            registry_version=self.version,
+            matched_capability_ids=["CAP-1"],
+            hard_fail_reasons=["outside scope"] if self.status == AssessmentResultStatus.FAIL else [],
+            review_items=["review"] if self.status in {AssessmentResultStatus.UNKNOWN, AssessmentResultStatus.REVIEW} else [],
+            matched_approval_routes=[ApprovalRouteAssessment(route="EXTERNAL_DOA", status=AssessmentResultStatus.PASS, jurisdictions=["EASA"], deliverables=["damage_assessment", "repair_drawing", "repair_instruction", "stress_substantiation"], source_document="Agreement", source_revision="Rev. 1")] if routes else [],
+        )
+
+    def health(self) -> dict[str, object]:
+        return {"status": "available", "mode": self.mode.value, "version": self.version}
 
 
 class RequestAssessmentWorkflowTests(unittest.TestCase):
@@ -96,6 +122,8 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         state = service.create_assessment(_request_payload())
         self.assertEqual(similar.calls, 1)
         self.assertEqual(state.similar_cases["accepted"][0]["case_id"], "FB-1")  # type: ignore[index]
+        self.assertIn("limits", similar.last_payload)
+        self.assertNotIn("msn", json.dumps(similar.last_payload).lower())
 
     def test_missing_msn_requests_information_and_skips_mro_kb(self) -> None:
         kb = FakeMroKb()
@@ -141,6 +169,13 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         state = service.create_assessment(_request_payload())
         self.assertEqual(state.decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
         self.assertIn("DOCUMENTAL_VERIFICATION_UNAVAILABLE", state.warnings)
+        self.assertEqual(state.documentary_assessment.status, DocumentaryAssessmentStatus.UNAVAILABLE)
+
+    def test_mro_kb_empty_result_is_inconclusive_not_decline(self) -> None:
+        service = self.make_service(kb=FakeMroKb(payload={"ok": True, "answer": "", "sources": [], "evidence": []}))
+        state = service.create_assessment(_request_payload())
+        self.assertEqual(state.documentary_assessment.status, DocumentaryAssessmentStatus.INCONCLUSIVE)
+        self.assertEqual(state.decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
 
     def test_capability_outcomes(self) -> None:
         service = self.make_service(capability=StaticCapability(AssessmentResultStatus.FAIL))
@@ -154,6 +189,70 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         state = service.create_assessment(_request_payload())
         self.assertEqual(state.decision.status.value, "ACCEPT_FOR_QUOTATION")  # type: ignore[union-attr]
         self.assertEqual(kb.queries, [])
+
+    def test_advisory_registry_never_accepts(self) -> None:
+        service = self.make_service(
+            ata=FakeAta([_ata_response(similar_cases={"status": "ok", "similarity_status": "none", "accepted": [], "not_accepted": [], "intermediate": []})]),
+            capability=StaticCapability(AssessmentResultStatus.PASS, mode=CapabilityRegistryMode.ADVISORY),
+        )
+        self.assertEqual(service.create_assessment(_request_payload()).decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
+
+    def test_default_registry_is_unavailable_and_does_not_accept_or_decline(self) -> None:
+        provider = JsonCapabilityProvider("config/request_assessment_capabilities.json")
+        service = self.make_service(
+            ata=FakeAta([_ata_response(similar_cases={"status": "ok", "similarity_status": "none", "accepted": [], "not_accepted": [], "intermediate": []})]),
+            capability=provider,
+        )
+        state = service.create_assessment(_request_payload())
+        self.assertEqual(provider.mode, CapabilityRegistryMode.UNAVAILABLE)
+        self.assertEqual(state.capability_assessment.status, AssessmentResultStatus.UNKNOWN)
+        self.assertEqual(state.decision.status.value, "EXPERT_REVIEW")  # type: ignore[union-attr]
+
+    def test_answers_store_additional_data_and_pass_to_ata(self) -> None:
+        ata = FakeAta([
+            _ata_response(required=[{"field": "damage.dimensions", "importance": "required", "reason": "Need dimensions"}]),
+            _ata_response(required=[]),
+        ])
+        service = self.make_service(ata=ata)
+        first = service.create_assessment(_request_payload())
+        second = service.answer_questions(first.request_id, {"answers": [{"question_id": "Q-001", "answer": {"length": 32, "unit": "mm"}, "attachments": [{"name": "photo.jpg"}]}]})
+        self.assertEqual(second.confirmed_additional_data["damage.dimensions"], {"length": 32, "unit": "mm"})
+        self.assertIn("damage_dimensions", ata.calls[-1][1])
+        self.assertEqual(second.confirmed_additional_data["answer_attachments"][0]["name"], "photo.jpg")
+
+    def test_ata_v2_arrays_reach_mro_kb_query(self) -> None:
+        kb = FakeMroKb()
+        service = self.make_service(kb=kb)
+        service.create_assessment(_request_payload())
+        self.assertIn("fuselage skin", kb.queries[0])
+        self.assertIn("crack", kb.queries[0])
+        self.assertNotIn("объект: не указан", kb.queries[0])
+
+    def test_controlled_registry_scope_dimensions(self) -> None:
+        provider = JsonCapabilityProvider(_registry_file(self, [_capability()]))
+        ctx = service_context()
+        assessment = provider.assess(ctx)
+        self.assertEqual(assessment.status, AssessmentResultStatus.PASS)
+        self.assertEqual(assessment.dimension_results["ata_scope"], AssessmentResultStatus.PASS)
+
+        provider = JsonCapabilityProvider(_registry_file(self, [_capability(ata_scope=["ATA 51"])]))
+        self.assertEqual(provider.assess(ctx).status, AssessmentResultStatus.UNKNOWN)
+
+        provider = JsonCapabilityProvider(_registry_file(self, [_capability(ata_scope=["ATA 53"])]))
+        ctx.potentially_affected_ata = ["ATA 57"]
+        self.assertEqual(provider.assess(ctx).dimension_results["ata_scope"], AssessmentResultStatus.REVIEW)
+
+        ctx = service_context()
+        provider = JsonCapabilityProvider(_registry_file(self, [_capability(disciplines=["structures", "design"])]))
+        self.assertNotEqual(provider.assess(ctx).status, AssessmentResultStatus.PASS)
+
+        provider = JsonCapabilityProvider(_registry_file(self, [_capability(deliverables=["damage_assessment"])]))
+        self.assertNotEqual(provider.assess(ctx).status, AssessmentResultStatus.PASS)
+
+        bad = _capability()
+        bad.pop("source_document")
+        provider = JsonCapabilityProvider(_registry_file(self, [bad]))
+        self.assertNotEqual(provider.assess(ctx).status, AssessmentResultStatus.PASS)
 
     def test_clarification_limit(self) -> None:
         service = self.make_service()
@@ -197,6 +296,27 @@ class SocketlessHandlerTests(unittest.TestCase):
         self.assertIn("content", body)
         self.assertTrue(body.rstrip().endswith("data: [DONE]"))
 
+    def test_openai_payload_validation_rejects_empty_messages(self) -> None:
+        for payload in ({}, {"messages": []}, {"messages": [{"role": "assistant", "content": "x"}]}, {"messages": [{"role": "user", "content": "  "}]}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    _assessment_payload_from_chat({"model": "mro-request-assessment", **payload})
+
+    def test_reasoning_recursively_sanitizes_secrets(self) -> None:
+        text = event_to_reasoning(
+            ProgressEvent(
+                stage="security",
+                message="check",
+                status="completed",
+                request_id="REQ-1",
+                details={"nested": {"Authorization": "Bearer secret", "safe": [{"token": "x", "value": "ok"}]}, "password": "bad"},
+            )
+        )
+        self.assertNotIn("Bearer", text)
+        self.assertNotIn("token", text)
+        self.assertNotIn("password", text)
+        self.assertIn("ok", text)
+
 
 def _request_payload(fields: dict[str, object] | None = None) -> dict[str, object]:
     return {
@@ -211,7 +331,14 @@ def _ata_response(required: list[object] | None = None, similar_cases: dict[str,
         "ok": True,
         "ata_impact": {
             "contract_version": "v2",
-            "engineering_facts": {"object": "fuselage skin", "damage_type": "crack", "uncertainties": []},
+            "engineering_facts": {
+                "physical_objects": [{"name": "fuselage skin"}],
+                "structural_elements": [{"name": "skin panel"}],
+                "damage": [{"type": "crack", "description": "crack from fastener hole"}],
+                "locations": [{"name": "FR35-FR36"}],
+                "event": {"type": "REPAIR_DESIGN", "maintenance_action": "develop structural repair"},
+                "uncertainties": [],
+            },
             "affected_ata": ["ATA 53"],
             "potentially_affected_ata": ["ATA 51"],
             "required_input_data": required or [],
@@ -227,6 +354,47 @@ def _similar(case_id: str) -> dict[str, object]:
 
 def _case(case_id: str) -> dict[str, object]:
     return {"case_id": case_id, "similarity_reason_class": "same_identifier", "similarity_confidence": "high", "structured_score": 0.9, "semantic_score": 0.8, "reasons": ["same component"]}
+
+
+def service_context() -> CapabilityContext:
+    return CapabilityContext(
+        aircraft_family="A320",
+        aircraft_model="A320-214",
+        work_type="REPAIR_DESIGN",
+        affected_ata=["ATA 53"],
+        potentially_affected_ata=["ATA 51"],
+        disciplines=["structures", "stress", "design"],
+        deliverables=["damage_assessment", "repair_drawing", "repair_instruction", "stress_substantiation"],
+        jurisdiction="EASA",
+    )
+
+
+def _capability(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "capability_id": "CAP-1",
+        "aircraft_family": "A320",
+        "aircraft_models": ["A319", "A320", "A321"],
+        "work_type": "REPAIR_DESIGN",
+        "ata_scope": ["ATA 51", "ATA 53"],
+        "disciplines": ["structures", "stress", "design"],
+        "deliverables": ["damage_assessment", "repair_drawing", "repair_instruction", "stress_substantiation"],
+        "approval_routes": ["EXTERNAL_DOA"],
+        "jurisdictions": ["EASA"],
+        "source_document": "Capability List",
+        "source_revision": "Rev. 1",
+        "verification_status": "APPROVED",
+        "active": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _registry_file(test: unittest.TestCase, capabilities: list[dict[str, object]]) -> str:
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    path = Path(tmp.name) / "registry.json"
+    path.write_text(json.dumps({"version": "test", "mode": "CONTROLLED", "verification_status": "APPROVED", "capabilities": capabilities}), encoding="utf-8")
+    return str(path)
 
 
 if __name__ == "__main__":

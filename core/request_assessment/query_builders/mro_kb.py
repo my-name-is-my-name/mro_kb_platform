@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from core.request_assessment.ata_context import normalize_ata_context
 from core.request_assessment.models import AssessmentState, SelectedSimilarCase
 
 
 def build_case_query(case: SelectedSimilarCase, state: AssessmentState) -> str:
     aircraft = state.confirmed_inputs.aircraft_model or state.confirmed_inputs.aircraft_type or "не указан"
-    ata = ", ".join([str(item) for item in (state.ata_impact or {}).get("affected_ata", [])]) or "не указаны"
-    potential = ", ".join([str(item) for item in (state.ata_impact or {}).get("potentially_affected_ata", [])]) or "не указаны"
+    ctx = normalize_ata_context(state.ata_impact, _fields(state), state.business_context.requested_deliverables, state.source.request_text)
+    ata = ", ".join(ctx.affected_ata) or "не указаны"
+    potential = ", ".join(ctx.potentially_affected_ata) or "не указаны"
     deliverables = ", ".join(state.business_context.requested_deliverables) or "не указаны"
     return f"""По заявке {case.case_id} найди документы и подтверждающие разделы,
 которые описывают:
@@ -23,10 +25,10 @@ def build_case_query(case: SelectedSimilarCase, state: AssessmentState) -> str:
 
 Контекст новой заявки:
 - aircraft: {aircraft};
-- работа: {_work_type(state.source.request_text)};
-- объект: {_object(state)};
-- повреждение: {_damage(state)};
-- зона: {state.confirmed_inputs.zone or "не указана"};
+- работа: {ctx.work_type or "не указан"};
+- объект: {_objects(ctx)};
+- повреждение: {_damage(ctx)};
+- зона: {", ".join(ctx.locations) or state.confirmed_inputs.zone or "не указана"};
 - affected ATA: {ata};
 - potentially affected ATA: {potential};
 - требуемые результаты: {deliverables}.
@@ -58,16 +60,17 @@ def build_case_query(case: SelectedSimilarCase, state: AssessmentState) -> str:
 
 
 def build_wide_query(state: AssessmentState) -> str:
-    ata = ", ".join([str(item) for item in (state.ata_impact or {}).get("affected_ata", [])]) or "не указаны"
-    potential = ", ".join([str(item) for item in (state.ata_impact or {}).get("potentially_affected_ata", [])]) or "не указаны"
+    ctx = normalize_ata_context(state.ata_impact, _fields(state), state.business_context.requested_deliverables, state.source.request_text)
+    ata = ", ".join(ctx.affected_ata) or "не указаны"
+    potential = ", ".join(ctx.potentially_affected_ata) or "не указаны"
     return f"""Выполни широкий документальный поиск для предварительной MRO assessment.
 
 Цель поиска: найти контролируемые документы и завершенные MRO-кейсы, которые могут подтвердить технический scope.
 Aircraft: {state.confirmed_inputs.aircraft_model or state.confirmed_inputs.aircraft_type or "не указан"}.
-Work type: {_work_type(state.source.request_text)}.
-Object: {_object(state)}.
-Damage: {_damage(state)}.
-Zone: {state.confirmed_inputs.zone or "не указана"}.
+Work type: {ctx.work_type or "UNKNOWN"}.
+Object: {_objects(ctx)}.
+Damage: {_damage(ctx)}.
+Zone: {", ".join(ctx.locations) or state.confirmed_inputs.zone or "не указана"}.
 Direct ATA: {ata}.
 Potential ATA: {potential}.
 Requested deliverables: {", ".join(state.business_context.requested_deliverables) or "не указаны"}.
@@ -79,24 +82,18 @@ Exclusion criteria: simple ATA mention, different object, different damage type,
 """
 
 
-def _work_type(text: str) -> str:
-    return "repair design" if "repair" in text.lower() or "ремонт" in text.lower() else "не указан"
+def _fields(state: AssessmentState) -> dict[str, object]:
+    fields = state.confirmed_inputs.model_dump(mode="json", exclude_none=True)
+    fields.update(state.confirmed_additional_data)
+    return fields
 
 
-def _object(state: AssessmentState) -> str:
-    facts = ((state.ata_impact or {}).get("engineering_facts") or {})
-    if isinstance(facts, dict):
-        for key in ("object", "component", "damaged_object"):
-            if facts.get(key):
-                return str(facts[key])
-    return "не указан"
+def _objects(ctx: object) -> str:
+    values = list(getattr(ctx, "physical_objects", [])) + list(getattr(ctx, "structural_elements", []))
+    return ", ".join(values) if values else "не указан"
 
 
-def _damage(state: AssessmentState) -> str:
-    facts = ((state.ata_impact or {}).get("engineering_facts") or {})
-    if isinstance(facts, dict):
-        for key in ("damage_type", "defect", "damage"):
-            if facts.get(key):
-                return str(facts[key])
-    return "не указано"
+def _damage(ctx: object) -> str:
+    values = list(getattr(ctx, "damage_types", [])) + list(getattr(ctx, "damage_descriptions", []))
+    return ", ".join(values) if values else "не указано"
 

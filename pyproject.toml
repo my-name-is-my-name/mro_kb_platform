@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mro-kb-platform"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "pydantic>=2,<3",
+]
+
+[tool.setuptools]
+packages = ["apps", "apps.request_assessment", "core", "core.request_assessment", "core.request_assessment.clients", "core.request_assessment.query_builders", "storage"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

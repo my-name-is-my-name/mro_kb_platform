@@ -30,9 +30,17 @@ def event_to_reasoning(event: ProgressEvent) -> str:
 
 def _safe_details(details: dict[str, Any]) -> dict[str, Any]:
     blocked = ("key", "token", "authorization", "password", "secret", "credential")
-    return {
-        key: value
-        for key, value in details.items()
-        if not any(part in key.lower() for part in blocked)
-    }
+    return _sanitize(details, blocked)
 
+
+def _sanitize(value: Any, blocked: tuple[str, ...]) -> Any:
+    if isinstance(value, dict):
+        result = {}
+        for key, item in value.items():
+            if any(part in str(key).lower() for part in blocked):
+                continue
+            result[key] = _sanitize(item, blocked)
+        return result
+    if isinstance(value, list):
+        return [_sanitize(item, blocked) for item in value]
+    return value

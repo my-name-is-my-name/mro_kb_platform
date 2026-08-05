@@ -1,0 +1,30 @@
+{
+  "version": "example-only",
+  "mode": "CONTROLLED",
+  "verification_status": "UNVERIFIED",
+  "capabilities": [
+    {
+      "capability_id": "CAP-STR-A320-001",
+      "aircraft_family": "A320",
+      "aircraft_models": ["A319", "A320", "A321"],
+      "work_type": "REPAIR_DESIGN",
+      "ata_scope": ["ATA 51", "ATA 53", "ATA 57"],
+      "disciplines": ["structures", "stress", "design", "certification"],
+      "deliverables": [
+        "damage_assessment",
+        "repair_drawing",
+        "repair_instruction",
+        "stress_substantiation",
+        "approved_repair_data"
+      ],
+      "approval_routes": ["EXTERNAL_DOA"],
+      "jurisdictions": ["EASA"],
+      "limitations": [],
+      "source_document": "Example Capability List",
+      "source_revision": "Example Rev. 0",
+      "verification_status": "APPROVED",
+      "active": true
+    }
+  ]
+}
+
