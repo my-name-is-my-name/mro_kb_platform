@@ -1,0 +1,24 @@
+{
+  "version": "mvp-2026-08-05",
+  "capabilities": [
+    {
+      "capability_id": "CAP-STR-A320-001",
+      "aircraft_family": "A320",
+      "aircraft_models": ["A319", "A320", "A321"],
+      "work_type": "REPAIR_DESIGN",
+      "ata_scope": ["ATA 51", "ATA 53", "ATA 57"],
+      "disciplines": ["structures", "stress", "design"],
+      "deliverables": [
+        "damage_assessment",
+        "repair_drawing",
+        "repair_instruction",
+        "stress_substantiation"
+      ],
+      "approval_routes": ["INTERNAL_DOA", "EXTERNAL_DOA"],
+      "limitations": [],
+      "source_document": "Capability List Rev. 12",
+      "active": true
+    }
+  ]
+}
+
