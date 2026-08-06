@@ -31,7 +31,7 @@ class SimilarCasesClientConfig:
         return cls(
             enabled=enabled,
             url=os.environ.get("MRO_ATA_SIMILAR_CASES_URL", "http://127.0.0.1:8121/api/similar-cases/search"),
-            timeout_seconds=max(0.5, min(timeout, 60.0)),
+            timeout_seconds=max(0.5, min(timeout, 120.0)),
             retries=max(0, min(retries, 1)),
         )
 

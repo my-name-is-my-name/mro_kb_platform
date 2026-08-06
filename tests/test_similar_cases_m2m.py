@@ -324,6 +324,19 @@ class FakeResponse:
 
 
 class SimilarCasesClientTests(unittest.TestCase):
+    def test_env_timeout_allows_two_minute_similar_cases_call(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "MRO_ATA_SIMILAR_CASES_ENABLED": "1",
+                "MRO_ATA_SIMILAR_CASES_TIMEOUT_SECONDS": "120",
+                "MRO_ATA_SIMILAR_CASES_RETRIES": "0",
+            },
+        ):
+            config = SimilarCasesClientConfig.from_env()
+
+        self.assertEqual(config.timeout_seconds, 120.0)
+
     def test_disabled_integration_makes_no_http_call(self) -> None:
         client = SimilarCasesClient(SimilarCasesClientConfig(enabled=False, url="http://127.0.0.1:8121/api/similar-cases/search", timeout_seconds=1, retries=1))
         with patch("core.ata_impact.similar_cases_client.urllib.request.urlopen") as urlopen:
