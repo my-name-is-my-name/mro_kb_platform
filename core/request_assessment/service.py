@@ -160,18 +160,6 @@ class RequestAssessmentService:
 
         ata_ctx = normalize_ata_context(state.ata_impact, _ata_fields(state), state.business_context.requested_deliverables, state.source.request_text)
         self._emit(progress, state, "ata_context", "Сформирован структурированный технический контекст ATA Impact v2.", "completed", details=ata_ctx.model_dump(mode="json"))
-        state.missing_information = assess_completeness(state)
-        state.questions = build_questions(state.missing_information)
-        if has_blocking_customer_missing(state.missing_information):
-            state.status = AssessmentStatus.WAITING_FOR_INFORMATION
-            state.documentary_assessment = assess_documentary_evidence(False, [], [])
-            state.historical_inference = build_historical_inference(state, [], ["deep_historical_rag_skipped_blocking_customer_data"])
-            state.quotation_readiness = quotation_readiness(state)
-            state.decision = make_decision(state.missing_information, None, None, state.documentary_assessment, _registry_mode(self.capability_provider))
-            self._emit(progress, state, "completeness", "ATA Impact обнаружил блокирующие пробелы. Документальная проверка не выполняется.", "completed", details={"missing_count": len(state.missing_information)})
-            return self.store.save(state)
-
-        context = build_capability_context(state)
         state.selected_similar_cases = select_similar_cases(state.similar_cases)
         self._emit(
             progress,
@@ -182,8 +170,18 @@ class RequestAssessmentService:
             service="mro-similar-cases",
             details={"selected_case_ids": [case.case_id for case in state.selected_similar_cases], "selection_reasons": {case.case_id: case.reasons for case in state.selected_similar_cases}},
         )
+        state.missing_information = assess_completeness(state)
+        state.questions = build_questions(state.missing_information)
         documentary = self._maybe_call_mro_kb(state, progress)
         state.documentary_assessment = documentary
+        if has_blocking_customer_missing(state.missing_information):
+            state.status = AssessmentStatus.WAITING_FOR_INFORMATION
+            state.quotation_readiness = quotation_readiness(state)
+            state.decision = make_decision(state.missing_information, None, None, state.documentary_assessment, _registry_mode(self.capability_provider))
+            self._emit(progress, state, "completeness", "ATA Impact обнаружил блокирующие пробелы. Формальная capability/approval проверка отложена до уточнения данных.", "completed", details={"missing_count": len(state.missing_information)})
+            return self.store.save(state)
+
+        context = build_capability_context(state)
 
         self._emit(progress, state, "capability", "Проверяю базовое соответствие capability.", "started", details={"aircraft_family": context.aircraft_family, "affected_ata": context.affected_ata})
         capability = self.capability_provider.assess(context)
@@ -244,7 +242,10 @@ class RequestAssessmentService:
     def _maybe_call_mro_kb(self, state: AssessmentState, progress: ProgressSink | None):
         if not _mro_kb_needed(state):
             self._emit(progress, state, "mro_kb_search", "Документальная проверка MRO RAG пропущена: результат не влияет на текущую рекомендацию.", "skipped", service="mro-kb")
-            state.historical_inference = build_historical_inference(state, [], ["historical_rag_not_required"])
+            warnings = ["historical_rag_not_required"]
+            if state.selected_similar_cases:
+                warnings.append("HISTORICAL_CANDIDATES_NOT_VERIFIED")
+            state.historical_inference = build_historical_inference(state, [], warnings)
             state.quotation_readiness = quotation_readiness(state)
             return assess_documentary_evidence(False, [], [])
         unavailable = False

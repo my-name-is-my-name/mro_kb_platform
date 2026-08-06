@@ -98,6 +98,8 @@ def build_historical_inference(
     )
     if unavailable:
         inference.historical_support = "UNAVAILABLE"
+    elif selected and not inference.facts and "HISTORICAL_CANDIDATES_NOT_VERIFIED" in inference.warnings:
+        inference.historical_support = "CANDIDATES_ONLY"
     elif _has_direct_support(selected, inference.facts):
         inference.historical_support = "DIRECT"
     elif inference.facts:

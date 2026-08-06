@@ -127,7 +127,7 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         self.assertIn("limits", similar.last_payload)
         self.assertNotIn("msn", json.dumps(similar.last_payload).lower())
 
-    def test_missing_msn_requests_information_and_skips_mro_kb(self) -> None:
+    def test_missing_msn_requests_information_after_mro_kb_candidate_check(self) -> None:
         kb = FakeMroKb()
         ata = FakeAta([_ata_response(required=[{"code": "AIRCRAFT_MSN_MISSING", "field": "msn", "importance": "required", "reason": "MSN needed"}])])
         service = self.make_service(ata=ata, kb=kb)
@@ -135,9 +135,102 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         payload["fields"] = {"aircraft_type": "A320-214"}
         state = service.create_assessment(payload)
         self.assertEqual(state.decision.status.value, "REQUEST_INFORMATION")  # type: ignore[union-attr]
-        self.assertEqual(len(kb.queries), 0)
+        self.assertEqual(len(kb.queries), 1)
+        self.assertIn("По исторической заявке MP-0123", kb.queries[0])
         self.assertEqual(state.quotation_readiness, "NEEDS_INFORMATION")
         self.assertEqual(state.questions[0].field, "aircraft.msn")
+
+    def test_blocking_missing_data_checks_embedded_candidates_with_mro_kb(self) -> None:
+        kb = FakeMroKb()
+        ata = FakeAta([
+            _ata_response(
+                required=[{"code": "AIRCRAFT_TYPE_MISSING", "field": "aircraft.type", "importance": "required", "reason": "Aircraft type needed"}],
+                similar_cases=_similar_many("MP-", 5),
+            )
+        ])
+        service = self.make_service(ata=ata, kb=kb)
+        state = service.create_assessment({"request": "трещина в зоне гермошпангоута FR35"})
+        content = build_final_content(state)
+
+        self.assertEqual(state.decision.status.value, "REQUEST_INFORMATION")  # type: ignore[union-attr]
+        self.assertEqual(state.quotation_readiness, "NEEDS_INFORMATION")
+        self.assertEqual([case.case_id for case in state.selected_similar_cases], ["MP-1", "MP-2", "MP-3"])
+        self.assertEqual(len(kb.queries), 3)
+        self.assertNotEqual(state.historical_inference.historical_support, "CANDIDATES_ONLY")  # type: ignore[union-attr]
+        self.assertNotIn("HISTORICAL_CANDIDATES_NOT_VERIFIED", state.historical_inference.warnings)  # type: ignore[union-attr]
+        self.assertIn("MRO KB был проверен", content)
+        self.assertNotIn("документальная проверка этих заявок через MRO KB пока не выполнялась", content)
+        self.assertNotIn("пока не подтверждают применимость исторического work package", content)
+
+    def test_blocking_missing_data_with_empty_similar_cases_can_report_no_candidates(self) -> None:
+        kb = FakeMroKb()
+        ata = FakeAta([
+            _ata_response(
+                required=[{"code": "AIRCRAFT_TYPE_MISSING", "field": "aircraft.type", "importance": "required", "reason": "Aircraft type needed"}],
+                similar_cases={"status": "ok", "similarity_status": "no_qualified_matches", "accepted": [], "not_accepted": [], "intermediate": []},
+            )
+        ])
+        service = self.make_service(ata=ata, kb=kb)
+        state = service.create_assessment({"request": "трещина в зоне гермошпангоута FR35"})
+        content = build_final_content(state)
+
+        self.assertEqual(state.decision.status.value, "REQUEST_INFORMATION")  # type: ignore[union-attr]
+        self.assertEqual(state.selected_similar_cases, [])
+        self.assertEqual(len(kb.queries), 1)
+        self.assertEqual(state.historical_inference.historical_support, "NONE")  # type: ignore[union-attr]
+        self.assertIn("MRO KB был проверен, но документы не подтвердили", content)
+
+    def test_blocking_missing_data_with_structured_mro_kb_facts_keeps_request_information(self) -> None:
+        payload = {
+            "ok": True,
+            "facts": [
+                {"category": "activity", "value": "damage assessment", "document_id": "DOC-1", "chunk_id": "C-1"},
+                {"category": "document", "value": "repair drawing", "document_id": "DOC-2", "chunk_id": "C-2"},
+            ],
+            "sources": [{"document_id": "DOC-1", "chunk_id": "C-1", "snippet": "skin crack ATA 53 damage assessment", "applicability_status": "APPLICABLE"}],
+            "evidence": [],
+        }
+        kb = FakeMroKb(payload=payload)
+        ata = FakeAta([
+            _ata_response(
+                required=[{"code": "AIRCRAFT_TYPE_MISSING", "field": "aircraft.type", "importance": "required", "reason": "Aircraft type needed"}],
+                similar_cases=_similar("MP-0123"),
+            )
+        ])
+        service = self.make_service(ata=ata, kb=kb)
+        state = service.create_assessment({"request": "трещина в зоне гермошпангоута FR35"})
+        content = build_final_content(state)
+
+        self.assertEqual(state.decision.status.value, "REQUEST_INFORMATION")  # type: ignore[union-attr]
+        self.assertIsNone(state.capability_assessment)
+        self.assertIsNone(state.approval_assessment)
+        self.assertEqual(state.quotation_readiness, "NEEDS_INFORMATION")
+        self.assertEqual(state.historical_inference.historical_support, "DIRECT")  # type: ignore[union-attr]
+        self.assertIn("Историческая основа", content)
+        self.assertIn("Предлагаемый предварительный scope", content)
+        self.assertIn("damage assessment", content)
+
+    def test_empty_mro_kb_result_under_blocking_missing_data_does_not_say_rag_not_performed(self) -> None:
+        kb = FakeMroKb(payload={"ok": True, "answer": "", "sources": [], "evidence": []})
+        ata = FakeAta([
+            _ata_response(
+                required=[{"code": "AIRCRAFT_TYPE_MISSING", "field": "aircraft.type", "importance": "required", "reason": "Aircraft type needed"}],
+                similar_cases=_similar_many("MP-", 5),
+            )
+        ])
+        service = self.make_service(ata=ata, kb=kb)
+        state = service.create_assessment({"request": "трещина в зоне гермошпангоута FR35"})
+        content = build_final_content(state)
+
+        self.assertEqual(len(kb.queries), 3)
+        self.assertEqual(state.historical_inference.historical_support, "NONE")  # type: ignore[union-attr]
+        self.assertIn("MRO KB был проверен, но документы не подтвердили", content)
+        self.assertNotIn("RAG was not performed", content)
+        self.assertNotIn("MRO KB пока не выполнялась", content)
+        self.assertNotIn("По историческим заявкам выполнялись", content)
+        self.assertNotIn("Выпускались:", content)
+        self.assertNotIn("Предлагаемый предварительный scope", content)
+        self.assertNotIn("найдены подтверждающие evidence records", content)
 
     def test_answers_update_fields_rerun_ata_and_replace_similar_cases(self) -> None:
         ata = FakeAta([
@@ -166,6 +259,7 @@ class RequestAssessmentWorkflowTests(unittest.TestCase):
         self.assertEqual([case.case_id for case in state.selected_similar_cases], ["A1", "A2", "A3"])
         self.assertEqual(len(kb.queries), 3)
         self.assertIn("По исторической заявке A1", kb.queries[0])
+        self.assertNotEqual(state.historical_inference.historical_support, "CANDIDATES_ONLY")  # type: ignore[union-attr]
 
     def test_mro_kb_timeout_yields_expert_review_not_no_documents(self) -> None:
         service = self.make_service(kb=FakeMroKb(fail=True))
@@ -417,6 +511,17 @@ def _ata_response(required: list[object] | None = None, similar_cases: dict[str,
 
 def _similar(case_id: str) -> dict[str, object]:
     return {"status": "ok", "similarity_status": "qualified_matches_found", "threshold_version": "similarity-gate-v1", "accepted": [_case(case_id)], "not_accepted": [], "intermediate": []}
+
+
+def _similar_many(prefix: str, count: int) -> dict[str, object]:
+    return {
+        "status": "ok",
+        "similarity_status": "qualified_matches_found",
+        "threshold_version": "similarity-gate-v1",
+        "accepted": [_case(f"{prefix}{idx}") for idx in range(1, count + 1)],
+        "not_accepted": [],
+        "intermediate": [],
+    }
 
 
 def _case(case_id: str, klass: str = "same_identifier") -> dict[str, object]:

@@ -62,9 +62,10 @@ Historical RAG workflow:
 
 1. `mro-ata-impact` structures the new request and may embed Similar Cases.
 2. `mro-request-assessment` selects the top `MRO_ASSESSMENT_MAX_RAG_CASES` technically useful candidates across all Similar Cases groups. Historical accepted/not accepted status does not directly drive the decision.
-3. For every selected `case_id`, `mro-request-assessment` sends an addressed HTTP query to `mro-kb` asking for document-backed facts about prior work. If no qualified analogs are found, it performs one wide MRO KB search for partial historical materials.
-4. The service extracts a universal `HistoricalFact` list using best effort parsing: explicit structured fields first, then a valid JSON block in `answer`, then explicit metadata from `sources`/`evidence`. Invalid JSON is a warning, not a workflow failure.
-5. The service builds `historical_inference` with `historical_support`, `proposed_scope`, `differences`, `assumptions` and `missing_inputs`.
+3. For every selected `case_id`, `mro-request-assessment` sends an addressed HTTP query to `mro-kb` asking for document-backed facts about prior work, even when aircraft type/MSN are still missing. If no qualified analogs are found, it performs one wide MRO KB search for partial historical materials.
+4. Blocking missing customer data keeps the formal decision conservative (`REQUEST_INFORMATION`) and defers capability/approval checks, but it does not discard historical inference returned by MRO KB.
+5. The service extracts a universal `HistoricalFact` list using best effort parsing: explicit structured fields first, then a valid JSON block in `answer`, then explicit metadata from `sources`/`evidence`. Invalid JSON is a warning, not a workflow failure.
+6. The service builds `historical_inference` with `historical_support`, `proposed_scope`, `differences`, `assumptions` and `missing_inputs`.
 
 Supported historical fact categories are intentionally small:
 
@@ -79,6 +80,7 @@ Supported historical fact categories are intentionally small:
 
 Historical support values:
 
+- `CANDIDATES_ONLY`: Similar Cases candidates are available, but MRO KB document verification has not run because the current routing policy determined it is not required or unavailable for that path.
 - `DIRECT`: a strong Similar Case and document-backed facts about prior work are available.
 - `PARTIAL`: partial historical materials are available but do not confirm a full analog work package.
 - `NONE`: no useful document-backed historical facts were extracted.
