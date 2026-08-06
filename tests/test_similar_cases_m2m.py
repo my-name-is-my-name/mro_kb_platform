@@ -76,6 +76,11 @@ class FakeCommercialOffersService(CommercialOffersService):
         return {"usable_for_estimate": False, "score": 0}
 
 
+class FakeLlm:
+    def chat(self, system_prompt: str, prompt: str) -> str:
+        return "### Источники\n\nLLM answer that must not be used"
+
+
 class SimilarCasesM2MTests(unittest.TestCase):
     def test_status_grouping_is_centralized(self) -> None:
         self.assertEqual(similar_case_status_group("accepted"), "accepted")
@@ -143,6 +148,18 @@ class SimilarCasesM2MTests(unittest.TestCase):
         self.assertEqual([item["case_id"] for item in result["similar_cases"]], ["A1"])
         self.assertIn("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Документы |", result["answer"])
         self.assertIn("weak_similar_cases_filtered", result["warnings"])
+        self.assertNotIn("### Источники", result["answer"])
+
+    def test_openwebui_similar_cases_keeps_retrieval_answer_when_llm_is_available(self) -> None:
+        service = FakeCommercialOffersService([candidate("A1", "accepted")])
+        service._llm = FakeLlm()
+
+        result = service.similar_cases("A320 frame crack repair FR27", limit=5)
+
+        self.assertIn("| Заявка | Score | Статус/решение | Описание | Почему похожа | Что проверить | Документы |", result["answer"])
+        self.assertNotIn("LLM answer that must not be used", result["answer"])
+        self.assertNotIn("### Источники", result["answer"])
+        self.assertEqual(result["llm_status"], "retrieval_only")
 
     def test_openwebui_strong_legacy_lexical_match_is_not_labeled_weak(self) -> None:
         service = FakeCommercialOffersService(

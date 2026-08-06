@@ -95,10 +95,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "created": int(time.time()),
                     "model": model,
                     "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-                    "sources": result.get("sources") or [],
+                    "sources": [] if model == "mro-similar-cases" else result.get("sources") or [],
                     "warnings": result.get("warnings") or [],
-                    "triage": result if model == "mro-go-no-go" else None,
-                    "ata_impact": result if model == "mro-ata-impact" else None,
                 }
             )
         self.send_response(200)
@@ -189,12 +187,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                                 "created": now,
                                 "owned_by": "local",
                             },
-                            {
-                                "id": "mro-go-no-go",
-                                "object": "model",
-                                "created": now,
-                                "owned_by": "local",
-                            },
                         ],
                     }
                 )
@@ -259,7 +251,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {"message": "JSON body must be an object", "type": "invalid_request_error"}}, status=400)
             if parsed.path == "/v1/chat/completions":
                 model = str(payload.get("model") or "").strip()
-                if model not in {"mro-kb", "mro-similar-cases", "mro-go-no-go"}:
+                if model not in {"mro-kb", "mro-similar-cases"}:
                     return self._send_json({"error": {"message": f"Unknown model: {model}", "type": "invalid_request_error"}}, status=404)
                 messages = payload.get("messages") or []
                 question = ""
@@ -273,8 +265,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return self._send_json({"error": {"message": "User message is required", "type": "invalid_request_error"}}, status=400)
                 if model == "mro-similar-cases":
                     result = SERVICES.commercial_offers.similar_cases(question)
-                elif model == "mro-go-no-go":
-                    result = SERVICES.go_no_go.triage(question)
                 else:
                     result = SERVICES.retrieval.chat(question)
                 return self._send_openai_completion(

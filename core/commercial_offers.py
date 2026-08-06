@@ -1932,14 +1932,6 @@ class CommercialOffersService:
                 )
         answer = self._build_answer(query, cases, sources)
         llm_status = "retrieval_only"
-        if self._llm is not None and cases:
-            try:
-                llm_answer = self._generate_answer(query, cases)
-                if llm_answer.strip():
-                    answer = f"{llm_answer}\n\n{self._sources_table(sources)}"
-                    llm_status = "openai_compatible"
-            except Exception:
-                llm_status = "retrieval_fallback"
         warnings = list(self._index_status.get("warnings") or [])
         warnings.extend(rewrite_warnings)
         if skipped_weak:
@@ -3247,70 +3239,6 @@ class CommercialOffersService:
         if not parts:
             parts.append("слабый аналог: проверить вручную по описанию и документам")
         return self._markdown_cell("; ".join(parts))
-
-    def _generate_answer(self, query: str, cases: list[dict[str, object]]) -> str:
-        assert self._llm is not None
-        system_prompt = (
-            "Ты помощник по поиску аналогичных коммерческих MRO-заявок. "
-            "Работай только с переданными кандидатами из com_offers/case_registry.csv и evidence layer. "
-            "Не используй знания вне источников и не придумывай цену, часы или решение. "
-            "Ответ всегда должен содержать таблицу: case_id, заказчик, тип ВС, статус, описание, почему похожа, что отличается/что проверить, документы. "
-            "Используй документы как источники только если они переданы с link_status=matched. "
-            "Для ambiguous_match или document_link_mismatch явно пиши, что документы не использованы как источники. "
-            "Для missing_document пиши: документы не найдены, похожесть рассчитана по реестру. "
-            "В конце добавь: это поиск аналогов, не расчет цены и не финальное решение брать/не брать."
-        )
-        lines = [f"Новая заявка или описание:\n{query.strip()}\n", "Кандидаты:"]
-        for case in cases:
-            lines.append(
-                "\n"
-                f"case_id={case.get('case_id')}\n"
-                f"customer={case.get('customer')}\n"
-                f"aircraft_type={case.get('aircraft_type')}\n"
-                f"status={case.get('status_normalized')}\n"
-                f"description={case.get('request_description')}\n"
-                f"reasons={case.get('reasons')}\n"
-                f"check={case.get('check')}\n"
-            )
-            for doc in (case.get("documents") or [])[:2]:
-                if doc.get("source_type") != "commercial_offer_document":
-                    lines.append(
-                        f"document_status={doc.get('link_status')}\n"
-                        f"quality_warning={doc.get('quality_warning')}\n"
-                        f"note={doc.get('snippet')}\n"
-                    )
-                    continue
-                lines.append(
-                    f"document={doc.get('document_id')}\n"
-                    f"link_status={doc.get('link_status')}\n"
-                    f"quality_warning={doc.get('quality_warning')}\n"
-                    f"link={doc.get('link')}\n"
-                    f"snippet={str(doc.get('snippet') or '')[:900]}\n"
-                )
-        return self._llm.chat(system_prompt, "\n".join(lines))
-
-    @staticmethod
-    def _sources_table(sources: list[dict[str, object]]) -> str:
-        if not sources:
-            return ""
-        rows = ["### Источники", "", "| Заявка | Документ | Статус связи | Фрагмент | Ссылка |", "|---|---|---|---|---|"]
-        for source in sources[:10]:
-            descriptor = source.get("source_descriptor") or {}
-            snippet = normalize_spaces(str(source.get("snippet") or ""))
-            if len(snippet) > 220:
-                snippet = snippet[:217] + "..."
-            snippet = snippet.replace("|", "\\|")
-            link = str(descriptor.get("link") or "")
-            title = str(descriptor.get("document_id") or "")
-            status = str(descriptor.get("link_status") or "")
-            warning = str(descriptor.get("quality_warning") or "")
-            if warning:
-                status = f"{status}: {warning}" if status else warning
-            rows.append(
-                f"| {descriptor.get('case_id', '')} | {title} | {status} | {snippet} | "
-                f"{f'[Открыть]({link})' if link else ''} |"
-            )
-        return "\n".join(rows)
 
     def _link_status_counts(self) -> dict[str, int]:
         counts: Counter[str] = Counter()

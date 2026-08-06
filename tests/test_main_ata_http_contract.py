@@ -72,12 +72,24 @@ class MainAtaHttpContractTests(unittest.TestCase):
             models = json.loads(response.read())
         ids = {item["id"] for item in models["data"]}
         self.assertNotIn("mro-ata-impact", ids)
+        self.assertNotIn("mro-go-no-go", ids)
 
     def test_openai_ata_model_is_unknown_on_main_api(self) -> None:
         status, payload = self.request(
             "/v1/chat/completions",
             {
                 "model": "mro-ata-impact",
+                "messages": [{"role": "user", "content": "damage"}],
+            },
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+
+    def test_openai_go_no_go_model_is_unknown_on_main_api(self) -> None:
+        status, payload = self.request(
+            "/v1/chat/completions",
+            {
+                "model": "mro-go-no-go",
                 "messages": [{"role": "user", "content": "damage"}],
             },
         )
@@ -191,6 +203,27 @@ class SocketlessAtaHandlerTests(unittest.TestCase):
         )
         self.assertEqual(status, 404)
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
+
+    def test_main_openwebui_similar_cases_does_not_emit_sources(self) -> None:
+        class FakeCommercialOffers:
+            def similar_cases(self, question: str) -> dict[str, object]:
+                return {
+                    "answer": "| Заявка | Score |\n|---|---:|\n| MP-1 | 1.0 |",
+                    "sources": [{"title": "hidden document"}],
+                    "warnings": [],
+                }
+
+        main_server.SERVICES = SimpleNamespace(commercial_offers=FakeCommercialOffers())  # type: ignore[assignment]
+        status, payload = self.invoke(
+            main_server.RequestHandler,
+            "/v1/chat/completions",
+            {"model": "mro-similar-cases", "messages": [{"role": "user", "content": "frame crack"}]},
+            "_send_json",
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["sources"], [])
+        self.assertIn("MP-1", payload["choices"][0]["message"]["content"])
 
     def test_main_similar_cases_search_endpoint_is_machine_contract(self) -> None:
         class FakeCommercialOffers:

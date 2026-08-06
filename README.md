@@ -4,7 +4,6 @@
 
 - `mro-kb`: RAG over completed MRO case documents and engineering evidence.
 - `mro-similar-cases`: analogue search over commercial MRO requests from `com_offers`.
-- `mro-go-no-go`: first-line recommendation whether a new request can proceed to engineering assessment, needs more information, is out of scope, or requires expert review.
 
 The two models are intentionally separate. `mro-kb` answers from the engineering/document knowledge base. `mro-similar-cases` searches commercial analogues and uses documents only as evidence, not as the primary similarity source.
 
