@@ -1,0 +1,42 @@
+[
+  {
+    "requested_case_id": "MRO-842",
+    "expected_resolution": "EXACT_INTERNAL_ID",
+    "expected_internal_case_id": "MRO-842",
+    "expected_status": "FOUND",
+    "expected_facts": [
+      {
+        "category": "problem",
+        "value_contains": "трещина",
+        "allowed_chunk_ids": [
+          "MRO-842::doc::46607eb9e31d::chunk::8371ac76605a",
+          "MRO-842::doc::cf3bb194ae99::chunk::7720e0294ea7",
+          "MRO-842::doc::81048ab672af::chunk::4889289bc3e0"
+        ]
+      },
+      {
+        "category": "calculation",
+        "value_contains": "статическая прочность",
+        "allowed_chunk_ids": [
+          "MRO-842::doc::81048ab672af::chunk::a13bd5930d07",
+          "MRO-842::doc::cf3bb194ae99::chunk::61e5dcf91d08",
+          "MRO-842::doc::81048ab672af::chunk::6379fe72c13d"
+        ]
+      },
+      {
+        "category": "activity",
+        "value_contains": "защитное покрытие",
+        "allowed_chunk_ids": [
+          "MRO-842::doc::81048ab672af::chunk::7ed3040eb1ce",
+          "MRO-842::doc::81048ab672af::chunk::612359742504"
+        ]
+      }
+    ],
+    "expected_references": [
+      {
+        "document_number_contains": "SRM",
+        "usage": "DIRECTLY_CITED"
+      }
+    ]
+  }
+]

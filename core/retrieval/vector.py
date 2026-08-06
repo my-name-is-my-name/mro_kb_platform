@@ -20,12 +20,15 @@ from storage.sqlite.store import SQLiteStore
 
 try:
     from qdrant_client import QdrantClient
-    from qdrant_client.models import Distance, PointStruct, VectorParams
+    from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 except Exception:  # pragma: no cover - exercised when optional dependency is absent
     QdrantClient = None  # type: ignore[assignment]
     Distance = None  # type: ignore[assignment]
     PointStruct = None  # type: ignore[assignment]
     VectorParams = None  # type: ignore[assignment]
+    FieldCondition = None  # type: ignore[assignment]
+    Filter = None  # type: ignore[assignment]
+    MatchValue = None  # type: ignore[assignment]
 
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9.-]{3,}")
@@ -294,11 +297,21 @@ class RestQdrantClient:
         points = result.get("points") if isinstance(result.get("points"), list) else []
         return [SimpleNamespace(payload=dict(item.get("payload") or {})) for item in points if isinstance(item, dict)], result.get("next_page_offset")
 
-    def search(self, collection_name: str, query_vector: list[float], limit: int, with_payload: bool = True) -> list[object]:
+    def search(
+        self,
+        collection_name: str,
+        query_vector: list[float],
+        limit: int,
+        with_payload: bool = True,
+        query_filter: dict[str, object] | None = None,
+    ) -> list[object]:
+        payload: dict[str, object] = {"vector": query_vector, "limit": limit, "with_payload": with_payload}
+        if query_filter:
+            payload["filter"] = query_filter
         body = self._request(
             "POST",
             f"/collections/{collection_name}/points/search",
-            {"vector": query_vector, "limit": limit, "with_payload": with_payload},
+            payload,
         )
         result = body.get("result") if isinstance(body.get("result"), list) else []
         return [
@@ -478,20 +491,23 @@ class MroQdrantIndex:
             query_vector = self.embedding_client.embed(question)
             qdrant = self._client()
             search_limit = max(limit, self.settings.retrieval_top_k)
-            hits = self._vector_search(qdrant, query_vector, search_limit)
+            hits = self._vector_search(qdrant, query_vector, search_limit, explicit_case_id=explicit_case_id)
         except Exception as exc:
             return [], [f"mro_kb_vector_search_fallback: {exc!r}"]
         rows: list[dict[str, object]] = []
+        warnings: list[str] = []
         for rank, hit in enumerate(hits, start=1):
             payload = dict(getattr(hit, "payload", None) or {})
             if explicit_case_id and payload.get("case_id") != explicit_case_id:
+                if "CROSS_CASE_HIT_DROPPED" not in warnings:
+                    warnings.append("CROSS_CASE_HIT_DROPPED")
                 continue
             payload["vector_rank"] = rank
             payload["vector_score"] = float(getattr(hit, "score", 0.0))
             payload["rrf_score"] = 1 / (self.settings.rrf_k + rank)
             payload["retrieval_mode"] = qdrant_mode
             rows.append(payload)
-        return rows, []
+        return rows, warnings
 
     def hybrid_merge(
         self,
@@ -667,7 +683,23 @@ class MroQdrantIndex:
             )
             return list(points), next_offset
 
-    def _vector_search(self, qdrant: Any, query_vector: list[float], limit: int) -> list[Any]:
+    def _vector_search(
+        self,
+        qdrant: Any,
+        query_vector: list[float],
+        limit: int,
+        explicit_case_id: str | None = None,
+    ) -> list[Any]:
+        query_filter: object | None = None
+        if explicit_case_id:
+            if Filter is not None and FieldCondition is not None and MatchValue is not None and not isinstance(qdrant, RestQdrantClient):
+                query_filter = Filter(
+                    must=[FieldCondition(key="case_id", match=MatchValue(value=explicit_case_id))]
+                )
+            else:
+                query_filter = {
+                    "must": [{"key": "case_id", "match": {"value": explicit_case_id}}]
+                }
         try:
             return list(
                 qdrant.search(
@@ -675,14 +707,16 @@ class MroQdrantIndex:
                     query_vector=query_vector,
                     limit=limit,
                     with_payload=True,
+                    query_filter=query_filter,
                 )
             )
-        except AttributeError:
+        except (AttributeError, TypeError):
             result = qdrant.query_points(
                 collection_name=self.settings.collection,
                 query=query_vector,
                 limit=limit,
                 with_payload=True,
+                query_filter=query_filter,
             )
             return list(result.points)
 

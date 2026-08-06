@@ -24,6 +24,8 @@ from core.ata_impact.http_contract import (
 from core.ata_impact.modes import validate_ata_runtime_mode
 from core.commercial_offers import CommercialOffersService
 from core.go_no_go import AtaImpactAgent, GoNoGoService
+from core.models.entities import CaseFactsRequest
+from core.retrieval.case_facts import CaseFactsService
 from core.retrieval.service import RetrievalService
 from ingest.mro_docs.import_documents import import_mro_documents
 from ingest.publish_obsidian.publish import publish_obsidian_vault
@@ -36,6 +38,11 @@ class RuntimeServices:
         self.store = SQLiteStore(self.paths.sqlite_path)
         self.store.initialize()
         self.retrieval = RetrievalService(self.store)
+        self.case_facts = CaseFactsService(
+            self.store,
+            vector_index=self.retrieval._vector_index,
+            llm=self.retrieval._llm,
+        )
         self.commercial_offers = CommercialOffersService()
         self.go_no_go = GoNoGoService(self.store, self.commercial_offers)
         self.ata_impact = AtaImpactAgent(self.go_no_go.certificate, self.go_no_go.ata_catalog, self.go_no_go.retriever)
@@ -249,6 +256,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict):
                 return self._send_json({"error": {"message": "JSON body must be an object", "type": "invalid_request_error"}}, status=400)
+            if parsed.path == "/api/case-facts":
+                request = CaseFactsRequest.model_validate(payload)
+                response = SERVICES.case_facts.case_facts(request)
+                return self._send_json(response.model_dump(mode="json"))
             if parsed.path == "/v1/chat/completions":
                 model = str(payload.get("model") or "").strip()
                 if model not in {"mro-kb", "mro-similar-cases"}:

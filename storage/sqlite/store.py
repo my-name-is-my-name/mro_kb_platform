@@ -10,7 +10,7 @@ import re
 import threading
 from typing import Iterator
 
-from core.models.entities import CaseSummary, DocumentChunk, DocumentReference
+from core.models.entities import CaseResolution, CaseSummary, CorpusSummary, DocumentChunk, DocumentReference
 from storage.sqlite.schema import SCHEMA_SQL
 
 
@@ -136,6 +136,44 @@ class SQLiteStore:
                         for item in items
                     ],
                 )
+
+    def resolve_case_id(self, requested_case_id: str) -> CaseResolution:
+        requested = (requested_case_id or "").strip()
+        with self.connect() as conn:
+            exact = conn.execute(
+                "SELECT case_id FROM cases WHERE case_id = ?",
+                (requested,),
+            ).fetchall()
+            exact_ids = sorted({str(row["case_id"]) for row in exact})
+            if len(exact_ids) == 1:
+                return CaseResolution(
+                    requested_case_id=requested,
+                    resolved_case_id=exact_ids[0],
+                    resolution_method="EXACT_INTERNAL_ID",
+                    resolution_evidence="exact match to cases.case_id",
+                )
+            return CaseResolution(
+                requested_case_id=requested,
+                resolution_method="UNRESOLVED",
+                resolution_evidence="requested ID does not exactly match cases.case_id",
+            )
+
+    def fetch_case_corpus_summary(self, case_id: str) -> CorpusSummary:
+        with self.connect() as conn:
+            case_found = conn.execute("SELECT 1 FROM cases WHERE case_id = ?", (case_id,)).fetchone() is not None
+            if not case_found:
+                return CorpusSummary()
+            document_count = int(conn.execute("SELECT COUNT(*) FROM documents WHERE case_id = ?", (case_id,)).fetchone()[0])
+            chunk_count = int(conn.execute("SELECT COUNT(*) FROM chunks WHERE case_id = ?", (case_id,)).fetchone()[0])
+            reference_count = int(
+                conn.execute("SELECT COUNT(*) FROM document_references WHERE case_id = ?", (case_id,)).fetchone()[0]
+            )
+            return CorpusSummary(
+                case_found=True,
+                document_count=document_count,
+                chunk_count=chunk_count,
+                reference_count=reference_count,
+            )
 
     def replace_documents_and_chunks(
         self,
@@ -679,6 +717,42 @@ class SQLiteStore:
                 (document_id,),
             ).fetchall()
             return [self._decode_reference_row(dict(row)) for row in rows]
+
+    def fetch_case_references(self, case_id: str) -> list[dict[str, object]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM document_references
+                WHERE case_id = ?
+                ORDER BY document_id, CAST(ref_id AS INTEGER), ref_id
+                """,
+                (case_id,),
+            ).fetchall()
+            return [self._decode_reference_row(dict(row)) for row in rows]
+
+    def fetch_case_chunks(self, case_id: str, limit: int = 200) -> list[dict[str, object]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT c.case_id, c.subject, c.problem_summary, c.aircraft_type, c.msn,
+                       d.document_id, d.source_document_id, d.title AS document_title, d.document_family,
+                       h.chunk_id, h.chunk_kind, h.unit_kind, h.chunk_level, h.section_label,
+                       h.section_title, h.heading_path_json, h.text, h.search_text,
+                       h.table_refs_json, h.citation_refs_json, h.metadata_json, h.source_file,
+                       h.vault_note_path, h.block_id, h.page_image_path
+                FROM chunks h
+                JOIN documents d ON d.document_id = h.document_id
+                JOIN cases c ON c.case_id = h.case_id
+                WHERE h.case_id = ?
+                ORDER BY CASE WHEN length(trim(h.text)) >= 40 THEN 0 ELSE 1 END,
+                         length(h.text) DESC,
+                         h.chunk_id
+                LIMIT ?
+                """,
+                (case_id, limit),
+            ).fetchall()
+            return [self._decode_chunk_row(dict(row)) for row in rows]
 
     def resolve_document_reference(self, document_id: str, ref_id: str) -> dict[str, object] | None:
         normalized_ref_id = str(int(ref_id)) if str(ref_id).isdigit() else str(ref_id)
