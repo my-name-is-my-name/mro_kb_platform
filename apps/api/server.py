@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -30,6 +31,104 @@ from core.retrieval.service import RetrievalService
 from ingest.mro_docs.import_documents import import_mro_documents
 from ingest.publish_obsidian.publish import publish_obsidian_vault
 from storage.sqlite.store import SQLiteStore
+
+
+CHAT_CASE_ID_RE = re.compile(r"\b(?:MRO|MP|WO|МР)-\d+\b", flags=re.IGNORECASE)
+
+
+def _case_facts_request_from_chat(question: str) -> CaseFactsRequest | None:
+    text = (question or "").strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return CaseFactsRequest.model_validate(parsed)
+    match = CHAT_CASE_ID_RE.search(text)
+    if not match:
+        return None
+    return CaseFactsRequest(case_id=match.group(0).upper().replace("МР-", "MRO-"))
+
+
+def _format_case_facts_for_chat(response: object) -> str:
+    payload = response.model_dump(mode="json") if hasattr(response, "model_dump") else dict(response)  # type: ignore[arg-type]
+    lines = [
+        f"Статус: {payload.get('status')}",
+        f"Запрошенный ID: {payload.get('requested_case_id')}",
+        f"Внутренний ID: {payload.get('resolved_case_id') or '-'}",
+        f"Метод разрешения ID: {payload.get('resolution_method')}",
+        f"Доказательство разрешения ID: {payload.get('resolution_evidence')}",
+    ]
+    corpus = payload.get("corpus") if isinstance(payload.get("corpus"), dict) else {}
+    lines.extend(
+        [
+            "",
+            "Корпус:",
+            f"- case_found: {corpus.get('case_found', False)}",
+            f"- documents: {corpus.get('document_count', 0)}",
+            f"- chunks: {corpus.get('chunk_count', 0)}",
+            f"- references: {corpus.get('reference_count', 0)}",
+        ]
+    )
+    facts = payload.get("facts") if isinstance(payload.get("facts"), list) else []
+    if facts:
+        lines.extend(["", "Подтвержденные historical facts:"])
+        for idx, fact in enumerate(facts, start=1):
+            if not isinstance(fact, dict):
+                continue
+            lines.extend(
+                [
+                    f"{idx}. [{fact.get('category')}] {fact.get('value')}",
+                    f"   document_id: {fact.get('document_id')}",
+                    f"   chunk_id: {fact.get('chunk_id')}",
+                    f"   evidence: {fact.get('evidence_text')}",
+                ]
+            )
+            references = fact.get("references") if isinstance(fact.get("references"), list) else []
+            for reference in references:
+                if isinstance(reference, dict):
+                    lines.append(
+                        "   reference: "
+                        f"[{reference.get('ref_id')}] {reference.get('document_number') or reference.get('title') or reference.get('raw_text')} "
+                        f"({reference.get('usage')}, {reference.get('role')})"
+                    )
+    else:
+        lines.extend(["", "Подтвержденные historical facts: нет."])
+    listed_references = payload.get("listed_references") if isinstance(payload.get("listed_references"), list) else []
+    if listed_references:
+        lines.extend(["", "References только из reference list:"])
+        for reference in listed_references[:20]:
+            if isinstance(reference, dict):
+                lines.append(
+                    f"- [{reference.get('ref_id')}] {reference.get('document_number') or reference.get('title') or reference.get('raw_text')} "
+                    f"({reference.get('usage')}, {reference.get('role')})"
+                )
+    warnings = payload.get("warnings") if isinstance(payload.get("warnings"), list) else []
+    if warnings:
+        lines.extend(["", "Warnings:", *[f"- {warning}" for warning in warnings]])
+    return "\n".join(str(line) for line in lines)
+
+
+def _mro_kb_case_facts_chat(question: str) -> dict[str, object]:
+    request = _case_facts_request_from_chat(question)
+    if request is None:
+        return {
+            "answer": (
+                "Новый mro-kb в OpenWebUI работает как case facts endpoint и требует точный "
+                "внутренний ID исторической заявки, например `MRO-395`, либо JSON вида "
+                "`{\"case_id\":\"MRO-395\",\"categories\":[\"problem\",\"activity\",\"calculation\",\"document\"]}`. "
+                "Свободный поиск по описанию повреждения не используется для подтвержденных facts."
+            ),
+            "sources": [],
+            "warnings": ["CASE_ID_REQUIRED"],
+        }
+    response = SERVICES.case_facts.case_facts(request)
+    return {
+        "answer": _format_case_facts_for_chat(response),
+        "sources": [],
+        "warnings": response.warnings,
+        "case_facts": response.model_dump(mode="json"),
+    }
 
 
 class RuntimeServices:
@@ -277,7 +376,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if model == "mro-similar-cases":
                     result = SERVICES.commercial_offers.similar_cases(question)
                 else:
-                    result = SERVICES.retrieval.chat(question)
+                    result = _mro_kb_case_facts_chat(question)
                 return self._send_openai_completion(
                     model,
                     result,
