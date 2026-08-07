@@ -35,11 +35,25 @@ class Pipe:
         if request_payload is None:
             match = CASE_ID_RE.search(question)
             if not match:
-                return (
-                    "Новый mro-kb требует точный внутренний ID исторической заявки, например `MRO-395`, "
-                    "либо JSON с `case_id`. Свободный поиск по описанию повреждения не используется "
-                    "для подтвержденных facts."
+                payload = json.dumps({"q": question}).encode("utf-8")
+                request = urllib.request.Request(
+                    f"{self.api_base_url}/api/chat",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
                 )
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                if not data.get("ok"):
+                    return str(data.get("error") or "Ошибка MRO KB")
+                answer = str(data.get("answer") or "")
+                sources = data.get("sources") or []
+                if not sources:
+                    return answer
+                lines = [answer, "", "Источники:"]
+                for source in sources[:5]:
+                    lines.append(f"- {source.get('title')}")
+                return "\n".join(lines)
             request_payload = {"case_id": match.group(0).upper().replace("МР-", "MRO-")}
         request_payload.setdefault("categories", ["problem", "activity", "calculation", "document"])
         request_payload.setdefault("max_evidence_per_category", 5)

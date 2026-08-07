@@ -112,16 +112,7 @@ def _format_case_facts_for_chat(response: object) -> str:
 def _mro_kb_case_facts_chat(question: str) -> dict[str, object]:
     request = _case_facts_request_from_chat(question)
     if request is None:
-        return {
-            "answer": (
-                "Новый mro-kb в OpenWebUI работает как case facts endpoint и требует точный "
-                "внутренний ID исторической заявки, например `MRO-395`, либо JSON вида "
-                "`{\"case_id\":\"MRO-395\",\"categories\":[\"problem\",\"activity\",\"calculation\",\"document\"]}`. "
-                "Свободный поиск по описанию повреждения не используется для подтвержденных facts."
-            ),
-            "sources": [],
-            "warnings": ["CASE_ID_REQUIRED"],
-        }
+        return SERVICES.retrieval.chat(question)
     response = SERVICES.case_facts.case_facts(request)
     return {
         "answer": _format_case_facts_for_chat(response),
